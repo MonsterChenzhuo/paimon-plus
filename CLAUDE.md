@@ -21,6 +21,24 @@
 
 ## 构建与测试
 
+测试、打包都使用同一个镜像：
+
+```text
+monster830/paimon-plus:spark344-java8
+```
+
+推荐从仓库根目录执行：
+
+```bash
+docker run --rm -it \
+  -v "$PWD":/workspace \
+  -w /workspace \
+  monster830/paimon-plus:spark344-java8 \
+  bash
+```
+
+进入容器后再运行 Maven 命令。不要在宿主机上混用其他 JDK、Scala 或 Spark 环境做最终验证。
+
 优先运行最小范围测试：
 
 ```bash
@@ -36,6 +54,12 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
 ```
 
 本地快速迭代可用 `-Pfast-build` 跳过 checkstyle、spotless、enforcer 和 rat；最终验证时不要只依赖 fast-build。
+
+打包也必须在 `monster830/paimon-plus:spark344-java8` 镜像内执行，例如：
+
+```bash
+mvn -Pfast-build -DskipTests package
+```
 
 ## Native IO 设计注意事项
 
