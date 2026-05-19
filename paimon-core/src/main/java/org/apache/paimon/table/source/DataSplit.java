@@ -1,0 +1,575 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.source;
+
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.InternalArray;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFileMeta08Serializer;
+import org.apache.paimon.io.DataFileMeta09Serializer;
+import org.apache.paimon.io.DataFileMeta10LegacySerializer;
+import org.apache.paimon.io.DataFileMeta12LegacySerializer;
+import org.apache.paimon.io.DataFileMetaFirstRowIdLegacySerializer;
+import org.apache.paimon.io.DataFileMetaSerializer;
+import org.apache.paimon.io.DataInputView;
+import org.apache.paimon.io.DataInputViewStreamWrapper;
+import org.apache.paimon.io.DataOutputView;
+import org.apache.paimon.io.DataOutputViewStreamWrapper;
+import org.apache.paimon.predicate.CompareUtils;
+import org.apache.paimon.stats.SimpleStatsEvolution;
+import org.apache.paimon.stats.SimpleStatsEvolutions;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.FunctionWithIOException;
+import org.apache.paimon.utils.InternalRowUtils;
+import org.apache.paimon.utils.RangeHelper;
+import org.apache.paimon.utils.SerializationUtils;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.io.DataFilePathFactory.INDEX_PATH_SUFFIX;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
+/** Input splits. Needed by most batch computation engines. */
+public class DataSplit implements Split {
+
+    private static final long serialVersionUID = 7L;
+    private static final long MAGIC = -2394839472490812314L;
+    private static final int VERSION = 8;
+
+    private long snapshotId = 0;
+    private BinaryRow partition;
+    private int bucket = -1;
+    private String bucketPath;
+    @Nullable private Integer totalBuckets;
+
+    private List<DataFileMeta> dataFiles;
+    @Nullable private List<DeletionFile> dataDeletionFiles;
+
+    private boolean isStreaming = false;
+    private boolean rawConvertible;
+
+    public DataSplit() {}
+
+    public long snapshotId() {
+        return snapshotId;
+    }
+
+    public BinaryRow partition() {
+        return partition;
+    }
+
+    public int bucket() {
+        return bucket;
+    }
+
+    public String bucketPath() {
+        return bucketPath;
+    }
+
+    public @Nullable Integer totalBuckets() {
+        return totalBuckets;
+    }
+
+    public List<DataFileMeta> dataFiles() {
+        return dataFiles;
+    }
+
+    @Override
+    public Optional<List<DeletionFile>> deletionFiles() {
+        return Optional.ofNullable(dataDeletionFiles);
+    }
+
+    public boolean isStreaming() {
+        return isStreaming;
+    }
+
+    public boolean rawConvertible() {
+        return rawConvertible;
+    }
+
+    public OptionalLong earliestFileCreationEpochMillis() {
+        return this.dataFiles.stream().mapToLong(DataFileMeta::creationTimeEpochMillis).min();
+    }
+
+    @Override
+    public long rowCount() {
+        long rowCount = 0;
+        for (DataFileMeta file : dataFiles) {
+            rowCount += file.rowCount();
+        }
+        return rowCount;
+    }
+
+    @Override
+    public OptionalLong mergedRowCount() {
+        if (rawMergedRowCountAvailable()) {
+            return OptionalLong.of(rawMergedRowCount());
+        }
+        if (dataEvolutionRowCountAvailable()) {
+            return OptionalLong.of(dataEvolutionMergedRowCount());
+        }
+        return OptionalLong.empty();
+    }
+
+    private boolean rawMergedRowCountAvailable() {
+        return rawConvertible
+                && (dataDeletionFiles == null
+                        || dataDeletionFiles.stream()
+                                .allMatch(f -> f == null || f.cardinality() != null));
+    }
+
+    private long rawMergedRowCount() {
+        long sum = 0L;
+        for (int i = 0; i < dataFiles.size(); i++) {
+            DataFileMeta file = dataFiles.get(i);
+            DeletionFile deletionFile = dataDeletionFiles == null ? null : dataDeletionFiles.get(i);
+            Long cardinality = deletionFile == null ? null : deletionFile.cardinality();
+            if (deletionFile == null) {
+                sum += file.rowCount();
+            } else if (cardinality != null) {
+                sum += file.rowCount() - cardinality;
+            }
+        }
+        return sum;
+    }
+
+    private boolean dataEvolutionRowCountAvailable() {
+        for (DataFileMeta file : dataFiles) {
+            if (file.firstRowId() == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private long dataEvolutionMergedRowCount() {
+        long sum = 0L;
+        RangeHelper<DataFileMeta> rangeHelper = new RangeHelper<>(DataFileMeta::nonNullRowIdRange);
+        List<List<DataFileMeta>> ranges = rangeHelper.mergeOverlappingRanges(dataFiles);
+        for (List<DataFileMeta> group : ranges) {
+            long maxCount = 0;
+            for (DataFileMeta file : group) {
+                maxCount = Math.max(maxCount, file.rowCount());
+            }
+            sum += maxCount;
+        }
+        return sum;
+    }
+
+    public Object minValue(int fieldIndex, DataField dataField, SimpleStatsEvolutions evolutions) {
+        Object minValue = null;
+        for (DataFileMeta dataFile : dataFiles) {
+            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            InternalRow minValues =
+                    evolution.evolution(
+                            dataFile.valueStats().minValues(), dataFile.valueStatsCols());
+            Object other = InternalRowUtils.get(minValues, fieldIndex, dataField.type());
+            if (minValue == null) {
+                minValue = other;
+            } else if (other != null) {
+                if (CompareUtils.compareLiteral(dataField.type(), minValue, other) > 0) {
+                    minValue = other;
+                }
+            }
+        }
+        return minValue;
+    }
+
+    public Object maxValue(int fieldIndex, DataField dataField, SimpleStatsEvolutions evolutions) {
+        Object maxValue = null;
+        for (DataFileMeta dataFile : dataFiles) {
+            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            InternalRow maxValues =
+                    evolution.evolution(
+                            dataFile.valueStats().maxValues(), dataFile.valueStatsCols());
+            Object other = InternalRowUtils.get(maxValues, fieldIndex, dataField.type());
+            if (maxValue == null) {
+                maxValue = other;
+            } else if (other != null) {
+                if (CompareUtils.compareLiteral(dataField.type(), maxValue, other) < 0) {
+                    maxValue = other;
+                }
+            }
+        }
+        return maxValue;
+    }
+
+    public Long nullCount(int fieldIndex, SimpleStatsEvolutions evolutions) {
+        Long sum = null;
+        for (DataFileMeta dataFile : dataFiles) {
+            SimpleStatsEvolution evolution = evolutions.getOrCreate(dataFile.schemaId());
+            InternalArray nullCounts =
+                    evolution.evolution(
+                            dataFile.valueStats().nullCounts(),
+                            dataFile.rowCount(),
+                            dataFile.valueStatsCols());
+            Long nullCount =
+                    (Long) InternalRowUtils.get(nullCounts, fieldIndex, DataTypes.BIGINT());
+            if (sum == null) {
+                sum = nullCount;
+            } else if (nullCount != null) {
+                sum += nullCount;
+            }
+        }
+        return sum;
+    }
+
+    @Override
+    public Optional<List<RawFile>> convertToRawFiles() {
+        if (rawConvertible) {
+            return Optional.of(
+                    dataFiles.stream()
+                            .map(f -> makeRawTableFile(bucketPath, f))
+                            .collect(Collectors.toList()));
+        } else {
+            return Optional.empty();
+        }
+    }
+
+    private RawFile makeRawTableFile(String bucketPath, DataFileMeta file) {
+        return new RawFile(
+                file.externalPath().orElse(bucketPath + "/" + file.fileName()),
+                file.fileSize(),
+                0,
+                file.fileSize(),
+                file.fileFormat(),
+                file.schemaId(),
+                file.rowCount());
+    }
+
+    @Override
+    @Nullable
+    public Optional<List<IndexFile>> indexFiles() {
+        List<IndexFile> indexFiles = new ArrayList<>();
+        boolean hasIndexFile = false;
+        for (DataFileMeta file : dataFiles) {
+            List<String> exFiles =
+                    file.extraFiles().stream()
+                            .filter(s -> s.endsWith(INDEX_PATH_SUFFIX))
+                            .collect(Collectors.toList());
+            if (exFiles.isEmpty()) {
+                indexFiles.add(null);
+            } else if (exFiles.size() == 1) {
+                hasIndexFile = true;
+                indexFiles.add(new IndexFile(bucketPath + "/" + exFiles.get(0)));
+            } else {
+                throw new RuntimeException(
+                        "Wrong number of file index for file "
+                                + file.fileName()
+                                + " index files: "
+                                + String.join(",", exFiles));
+            }
+        }
+
+        return hasIndexFile ? Optional.of(indexFiles) : Optional.empty();
+    }
+
+    public Optional<DataSplit> filterDataFile(Predicate<DataFileMeta> filter) {
+        List<DataFileMeta> filtered = new ArrayList<>();
+        List<DeletionFile> filteredDeletion = dataDeletionFiles == null ? null : new ArrayList<>();
+        for (int i = 0; i < dataFiles.size(); i++) {
+            DataFileMeta file = dataFiles.get(i);
+            if (filter.test(file)) {
+                filtered.add(file);
+                if (filteredDeletion != null) {
+                    filteredDeletion.add(dataDeletionFiles.get(i));
+                }
+            }
+        }
+        if (filtered.isEmpty()) {
+            return Optional.empty();
+        }
+        DataSplit split = new DataSplit();
+        split.assign(this);
+        split.dataFiles = filtered;
+        split.dataDeletionFiles = filteredDeletion;
+        return Optional.of(split);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        DataSplit dataSplit = (DataSplit) o;
+        return snapshotId == dataSplit.snapshotId
+                && bucket == dataSplit.bucket
+                && isStreaming == dataSplit.isStreaming
+                && rawConvertible == dataSplit.rawConvertible
+                && Objects.equals(partition, dataSplit.partition)
+                && Objects.equals(bucketPath, dataSplit.bucketPath)
+                && Objects.equals(totalBuckets, dataSplit.totalBuckets)
+                && Objects.equals(dataFiles, dataSplit.dataFiles)
+                && Objects.equals(dataDeletionFiles, dataSplit.dataDeletionFiles);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(
+                snapshotId,
+                partition,
+                bucket,
+                bucketPath,
+                totalBuckets,
+                dataFiles,
+                dataDeletionFiles,
+                isStreaming,
+                rawConvertible);
+    }
+
+    @Override
+    public String toString() {
+        return "{"
+                + "snapshotId="
+                + snapshotId
+                + ", partition=hash-"
+                + partition.hashCode()
+                + ", bucket="
+                + bucket
+                + ", rawConvertible="
+                + rawConvertible
+                + '}'
+                + "@"
+                + Integer.toHexString(hashCode());
+    }
+
+    private void writeObject(ObjectOutputStream out) throws IOException {
+        serialize(new DataOutputViewStreamWrapper(out));
+    }
+
+    private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+        assign(deserialize(new DataInputViewStreamWrapper(in)));
+    }
+
+    protected void assign(DataSplit other) {
+        this.snapshotId = other.snapshotId;
+        this.partition = other.partition;
+        this.bucket = other.bucket;
+        this.bucketPath = other.bucketPath;
+        this.totalBuckets = other.totalBuckets;
+        this.dataFiles = other.dataFiles;
+        this.dataDeletionFiles = other.dataDeletionFiles;
+        this.isStreaming = other.isStreaming;
+        this.rawConvertible = other.rawConvertible;
+    }
+
+    public void serialize(DataOutputView out) throws IOException {
+        out.writeLong(MAGIC);
+        out.writeInt(VERSION);
+        out.writeLong(snapshotId);
+        SerializationUtils.serializeBinaryRow(partition, out);
+        out.writeInt(bucket);
+        out.writeUTF(bucketPath);
+        if (totalBuckets != null) {
+            out.writeBoolean(true);
+            out.writeInt(totalBuckets);
+        } else {
+            out.writeBoolean(false);
+        }
+
+        DataFileMetaSerializer dataFileSer = new DataFileMetaSerializer();
+
+        // compatible with old beforeFiles
+        out.writeInt(0);
+        DeletionFile.serializeList(out, null);
+
+        out.writeInt(dataFiles.size());
+        for (DataFileMeta file : dataFiles) {
+            dataFileSer.serialize(file, out);
+        }
+
+        DeletionFile.serializeList(out, dataDeletionFiles);
+
+        out.writeBoolean(isStreaming);
+
+        out.writeBoolean(rawConvertible);
+    }
+
+    public static DataSplit deserialize(DataInputView in) throws IOException {
+        long magic = in.readLong();
+        int version = magic == MAGIC ? in.readInt() : 1;
+        // version 1 does not write magic number in, so the first long is snapshot id.
+        long snapshotId = version == 1 ? magic : in.readLong();
+        BinaryRow partition = SerializationUtils.deserializeBinaryRow(in);
+        int bucket = in.readInt();
+        String bucketPath = in.readUTF();
+        Integer totalBuckets = version >= 6 && in.readBoolean() ? in.readInt() : null;
+
+        FunctionWithIOException<DataInputView, DataFileMeta> dataFileSer =
+                getFileMetaSerde(version);
+        FunctionWithIOException<DataInputView, DeletionFile> deletionFileSerde =
+                getDeletionFileSerde(version);
+        int beforeNumber = in.readInt();
+        if (beforeNumber > 0) {
+            throw new RuntimeException("Cannot deserialize data split with before files.");
+        }
+
+        List<DeletionFile> beforeDeletionFiles =
+                DeletionFile.deserializeList(in, deletionFileSerde);
+        if (beforeDeletionFiles != null) {
+            throw new RuntimeException("Cannot deserialize data split with before deletion files.");
+        }
+
+        int fileNumber = in.readInt();
+        List<DataFileMeta> dataFiles = new ArrayList<>(fileNumber);
+        for (int i = 0; i < fileNumber; i++) {
+            dataFiles.add(dataFileSer.apply(in));
+        }
+
+        List<DeletionFile> dataDeletionFiles = DeletionFile.deserializeList(in, deletionFileSerde);
+
+        boolean isStreaming = in.readBoolean();
+        boolean rawConvertible = in.readBoolean();
+
+        DataSplit.Builder builder =
+                builder()
+                        .withSnapshot(snapshotId)
+                        .withPartition(partition)
+                        .withBucket(bucket)
+                        .withBucketPath(bucketPath)
+                        .withTotalBuckets(totalBuckets)
+                        .withDataFiles(dataFiles)
+                        .isStreaming(isStreaming)
+                        .rawConvertible(rawConvertible);
+
+        if (dataDeletionFiles != null) {
+            builder.withDataDeletionFiles(dataDeletionFiles);
+        }
+        return builder.build();
+    }
+
+    private static FunctionWithIOException<DataInputView, DataFileMeta> getFileMetaSerde(
+            int version) {
+        if (version == 1) {
+            DataFileMeta08Serializer serializer = new DataFileMeta08Serializer();
+            return serializer::deserialize;
+        } else if (version == 2) {
+            DataFileMeta09Serializer serializer = new DataFileMeta09Serializer();
+            return serializer::deserialize;
+        } else if (version == 3 || version == 4) {
+            DataFileMeta10LegacySerializer serializer = new DataFileMeta10LegacySerializer();
+            return serializer::deserialize;
+        } else if (version == 5 || version == 6) {
+            DataFileMeta12LegacySerializer serializer = new DataFileMeta12LegacySerializer();
+            return serializer::deserialize;
+        } else if (version == 7) {
+            DataFileMetaFirstRowIdLegacySerializer serializer =
+                    new DataFileMetaFirstRowIdLegacySerializer();
+            return serializer::deserialize;
+        } else if (version == 8) {
+            DataFileMetaSerializer serializer = new DataFileMetaSerializer();
+            return serializer::deserialize;
+        } else {
+            throw new UnsupportedOperationException("Unsupported version: " + version);
+        }
+    }
+
+    private static FunctionWithIOException<DataInputView, DeletionFile> getDeletionFileSerde(
+            int version) {
+        if (version >= 1 && version <= 3) {
+            return DeletionFile::deserializeV3;
+        } else if (version >= 4) {
+            return DeletionFile::deserialize;
+        } else {
+            throw new UnsupportedOperationException("Unsupported version: " + version);
+        }
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /** Builder for {@link DataSplit}. */
+    public static class Builder {
+
+        private final DataSplit split = new DataSplit();
+
+        public Builder withSnapshot(long snapshot) {
+            this.split.snapshotId = snapshot;
+            return this;
+        }
+
+        public Builder withPartition(BinaryRow partition) {
+            this.split.partition = partition;
+            return this;
+        }
+
+        public Builder withBucket(int bucket) {
+            this.split.bucket = bucket;
+            return this;
+        }
+
+        public Builder withBucketPath(String bucketPath) {
+            this.split.bucketPath = bucketPath;
+            return this;
+        }
+
+        public Builder withTotalBuckets(Integer totalBuckets) {
+            this.split.totalBuckets = totalBuckets;
+            return this;
+        }
+
+        public Builder withDataFiles(List<DataFileMeta> dataFiles) {
+            this.split.dataFiles = new ArrayList<>(dataFiles);
+            return this;
+        }
+
+        public Builder withDataDeletionFiles(List<DeletionFile> dataDeletionFiles) {
+            this.split.dataDeletionFiles = new ArrayList<>(dataDeletionFiles);
+            return this;
+        }
+
+        public Builder isStreaming(boolean isStreaming) {
+            this.split.isStreaming = isStreaming;
+            return this;
+        }
+
+        public Builder rawConvertible(boolean rawConvertible) {
+            this.split.rawConvertible = rawConvertible;
+            return this;
+        }
+
+        public DataSplit build() {
+            checkArgument(split.partition != null);
+            checkArgument(split.bucket != -1);
+            checkArgument(split.bucketPath != null);
+            checkArgument(split.dataFiles != null);
+
+            DataSplit split = new DataSplit();
+            split.assign(this.split);
+            return split;
+        }
+    }
+}

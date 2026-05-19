@@ -1,0 +1,983 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink;
+
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.utils.BlockingIterator;
+import org.apache.paimon.utils.SnapshotManager;
+
+import org.apache.paimon.shade.org.apache.commons.lang3.StringUtils;
+
+import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
+import org.apache.flink.util.CloseableIterator;
+import org.assertj.core.api.AssertionsForInterfaceTypes;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.apache.paimon.testutils.assertj.PaimonAssertions.anyCauseMatches;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** IT cases for table with branches using SQL. */
+public class BranchSqlITCase extends CatalogITCaseBase {
+
+    @Test
+    public void testDefaultValue() throws Exception {
+        sql("CREATE TABLE T (a INT, b INT)");
+        sql("CALL sys.alter_column_default_value('default.T', 'b', '5')");
+        sql("INSERT INTO T (a) VALUES (1), (2)");
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder("+I[1, 5]", "+I[2, 5]");
+    }
+
+    @Test
+    public void testUnsupportedDefaultValue() {
+        sql("CREATE TABLE T (a INT, b INT)");
+        assertThatThrownBy(
+                        () -> sql("CALL sys.alter_column_default_value('default.T', 'b', 'ddd')"))
+                .hasMessageContaining("Unsupported default value `ddd` for type INT");
+    }
+
+    @Test
+    public void testArrayDefaultValue() throws Exception {
+        sql("CREATE TABLE T_ARRAY (id INT, tags ARRAY<STRING>, numbers ARRAY<INT>)");
+        sql("CALL sys.alter_column_default_value('default.T_ARRAY', 'tags', '[tag1, tag2]')");
+        sql("CALL sys.alter_column_default_value('default.T_ARRAY', 'numbers', '[1, 2, 3]')");
+
+        sql("INSERT INTO T_ARRAY (id) VALUES (1), (2)");
+        assertThat(collectResult("SELECT * FROM T_ARRAY"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, [tag1, tag2], [1, 2, 3]]", "+I[2, [tag1, tag2], [1, 2, 3]]");
+
+        sql("CREATE TABLE T_EMPTY_ARRAY (id INT, empty_tags ARRAY<STRING>)");
+        sql("CALL sys.alter_column_default_value('default.T_EMPTY_ARRAY', 'empty_tags', '[]')");
+        sql("INSERT INTO T_EMPTY_ARRAY (id) VALUES (1)");
+        assertThat(collectResult("SELECT * FROM T_EMPTY_ARRAY"))
+                .containsExactlyInAnyOrder("+I[1, []]");
+    }
+
+    @Test
+    public void testMapDefaultValue() throws Exception {
+        sql("CREATE TABLE T_MAP (id INT, properties MAP<STRING, STRING>)");
+        sql(
+                "CALL sys.alter_column_default_value('default.T_MAP', 'properties', '{key1 -> value1, key2 -> value2}')");
+
+        sql("INSERT INTO T_MAP (id) VALUES (1), (2)");
+        assertThat(collectResult("SELECT * FROM T_MAP"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, {key1=value1, key2=value2}]", "+I[2, {key1=value1, key2=value2}]");
+
+        sql("CREATE TABLE T_EMPTY_MAP (id INT, empty_map MAP<STRING, INT>)");
+        sql("CALL sys.alter_column_default_value('default.T_EMPTY_MAP', 'empty_map', '{}')");
+        sql("INSERT INTO T_EMPTY_MAP (id) VALUES (1)");
+        assertThat(collectResult("SELECT * FROM T_EMPTY_MAP"))
+                .containsExactlyInAnyOrder("+I[1, {}]");
+    }
+
+    @Test
+    public void testRowDefaultValue() throws Exception {
+        sql("CREATE TABLE T_STRUCT (id INT, nested ROW<x INT, y STRING>)");
+        sql(
+                "CALL sys.alter_column_default_value('default.T_STRUCT', 'nested', '{42, default_value}')");
+
+        sql("INSERT INTO T_STRUCT (id) VALUES (1), (2)");
+        assertThat(collectResult("SELECT * FROM T_STRUCT"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, +I[42, default_value]]", "+I[2, +I[42, default_value]]");
+
+        sql(
+                "CREATE TABLE T_COMPLEX_STRUCT (id INT, config ROW<enabled BOOLEAN, timeout INT, name STRING>)");
+        sql(
+                "CALL sys.alter_column_default_value('default.T_COMPLEX_STRUCT', 'config', '{true, 30, config_name}')");
+        sql("INSERT INTO T_COMPLEX_STRUCT (id) VALUES (1)");
+        assertThat(collectResult("SELECT * FROM T_COMPLEX_STRUCT"))
+                .containsExactlyInAnyOrder("+I[1, +I[true, 30, config_name]]");
+    }
+
+    @Test
+    public void testMixedComplexDefaultValue() throws Exception {
+        sql(
+                "CREATE TABLE T_MIXED (id INT, name STRING, tags ARRAY<STRING>, metadata MAP<STRING, STRING>, config ROW<enabled BOOLEAN, timeout INT>)");
+        sql("CALL sys.alter_column_default_value('default.T_MIXED', 'name', 'default_name')");
+        sql("CALL sys.alter_column_default_value('default.T_MIXED', 'tags', '[default_tag]')");
+        sql(
+                "CALL sys.alter_column_default_value('default.T_MIXED', 'metadata', '{created_by -> system}')");
+        sql("CALL sys.alter_column_default_value('default.T_MIXED', 'config', '{true, 30}')");
+
+        sql("INSERT INTO T_MIXED (id) VALUES (1)");
+        assertThat(collectResult("SELECT * FROM T_MIXED"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, default_name, [default_tag], {created_by=system}, +I[true, 30]]");
+
+        sql("INSERT INTO T_MIXED (id, name) VALUES (2, 'custom_name')");
+        assertThat(collectResult("SELECT * FROM T_MIXED WHERE id = 2"))
+                .containsExactlyInAnyOrder(
+                        "+I[2, custom_name, [default_tag], {created_by=system}, +I[true, 30]]");
+    }
+
+    @Test
+    public void testNestedComplexDefaultValue() throws Exception {
+        sql(
+                "CREATE TABLE T_NESTED ("
+                        + "id INT, "
+                        + "nested_array ARRAY<ROW<name STRING, val INT>>, "
+                        + "nested_struct ROW<info ROW<x INT, y STRING>, enabled BOOLEAN>"
+                        + ")");
+
+        sql(
+                "CALL sys.alter_column_default_value('default.T_NESTED', 'nested_array', '[{item1, 10}, {item2, 20}]')");
+        sql(
+                "CALL sys.alter_column_default_value('default.T_NESTED', 'nested_struct', '{{42, nested_value}, true}')");
+
+        sql("INSERT INTO T_NESTED (id) VALUES (1)");
+        assertThat(collectResult("SELECT * FROM T_NESTED"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, [+I[item1, 10], +I[item2, 20]], +I[+I[42, nested_value], true]]");
+
+        sql("INSERT INTO T_NESTED (id, nested_array) VALUES (2, ARRAY[ROW('custom', 99)])");
+        assertThat(collectResult("SELECT * FROM T_NESTED WHERE id = 2"))
+                .containsExactlyInAnyOrder(
+                        "+I[2, [+I[custom, 99]], +I[+I[42, nested_value], true]]");
+    }
+
+    @Test
+    public void testDefaultValueForPkTableDynamicBucket() throws Exception {
+        sql("CREATE TABLE T (a INT PRIMARY KEY NOT ENFORCED, b INT)");
+        sql("CALL sys.alter_column_default_value('default.T', 'b', '5')");
+        sql("INSERT INTO T (a) VALUES (1), (2)");
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder("+I[1, 5]", "+I[2, 5]");
+    }
+
+    @Test
+    public void testAlterBranchTable() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        sql(
+                "INSERT INTO T VALUES"
+                        + " (1, 10, 'apple'),"
+                        + " (1, 20, 'banana'),"
+                        + " (2, 10, 'cat'),"
+                        + " (2, 20, 'dog')");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+
+        FileStoreTable branchTable = paimonTable("T$branch_test");
+        assertThat(branchTable.schema().fields().size()).isEqualTo(3);
+
+        sql(
+                "INSERT INTO T VALUES"
+                        + " (1, 10, 'APPLE'),"
+                        + " (2, 20, 'DOG'),"
+                        + " (2, 30, 'horse')");
+
+        // Add v2 column for branch table.
+        sql("ALTER TABLE `T$branch_test` ADD (v2 INT)");
+
+        branchTable = paimonTable("T$branch_test");
+        assertThat(branchTable.schema().fields().size()).isEqualTo(4);
+
+        sql(
+                "INSERT INTO `T$branch_test` VALUES "
+                        + "(1, 10, 'cherry', 100)"
+                        + ", (2, 20, 'bird', 200)"
+                        + ", (2, 40, 'wolf', 400)");
+
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 10, APPLE]",
+                        "+I[1, 20, banana]",
+                        "+I[2, 30, horse]",
+                        "+I[2, 10, cat]",
+                        "+I[2, 20, DOG]");
+
+        assertThat(collectResult("SELECT * FROM T$branch_test"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 10, cherry, 100]",
+                        "+I[1, 20, banana, null]",
+                        "+I[2, 10, cat, null]",
+                        "+I[2, 20, bird, 200]",
+                        "+I[2, 40, wolf, 400]");
+    }
+
+    @Test
+    public void testCreateBranchFromTag() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES" + " (1, 10, 'apple')," + " (1, 20, 'banana')");
+        // snapshot 2.
+        sql("INSERT INTO T VALUES" + " (2, 10, 'cat')," + " (2, 20, 'dog')");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+        sql("CALL sys.create_tag('default.T', 'tag2', 2)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+        sql("CALL sys.create_branch('default.T', 'test2', 'tag2')");
+
+        FileStoreTable branchTable = paimonTable("T$branch_test");
+        assertThat(branchTable.tagManager().tagExists("tag1")).isEqualTo(true);
+
+        assertThat(collectResult("SELECT * FROM T$branch_test"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, banana]");
+
+        FileStoreTable branchTable2 = paimonTable("T$branch_test2");
+        assertThat(branchTable2.tagManager().tagExists("tag2")).isEqualTo(true);
+
+        assertThat(collectResult("SELECT * FROM T$branch_test2"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 10, apple]",
+                        "+I[1, 20, banana]",
+                        "+I[2, 10, cat]",
+                        "+I[2, 20, dog]");
+    }
+
+    @Test
+    public void testCreateBranchFromAnotherBranch() throws Exception {
+
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES" + " (1, 10, 'apple')," + " (1, 20, 'banana')");
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        sql("CALL sys.create_branch('default.T', 'branch_A', 'tag1')");
+        FileStoreTable branchTable = paimonTable("T$branch_branch_A");
+        assertThat(branchTable.tagManager().tagExists("tag1")).isEqualTo(true);
+        assertThat(collectResult("SELECT * FROM T$branch_branch_A"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, banana]");
+
+        // Create branch_B from branch_A.
+        sql("CALL sys.create_branch('default.T$branch_branch_A', 'branch_B', 'tag1')");
+        FileStoreTable branchTableB = paimonTable("T$branch_branch_B");
+        assertThat(branchTableB.tagManager().tagExists("tag1")).isEqualTo(true);
+        assertThat(collectResult("SELECT * FROM T$branch_branch_B"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, banana]");
+    }
+
+    @Test
+    public void testCreateEmptyBranch() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES(1, 10, 'apple')");
+
+        // snapshot 2.
+        sql("INSERT INTO T VALUES(1, 20, 'dog')");
+
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, dog]");
+
+        // create en empty branch.
+        sql("CALL sys.create_branch('default.T', 'empty_branch')");
+
+        sql("INSERT INTO `T$branch_empty_branch` VALUES (3, 30, 'banana')");
+
+        assertThat(collectResult("SELECT * FROM T$branch_empty_branch"))
+                .containsExactlyInAnyOrder("+I[3, 30, banana]");
+    }
+
+    @Test
+    public void testDeleteBranchTable() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES(1, 10, 'apple')");
+
+        // snapshot 2.
+        sql("INSERT INTO T VALUES(1, 20, 'dog')");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        sql("CALL sys.create_tag('default.T', 'tag2', 2)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+        sql("CALL sys.create_branch('default.T', 'test2', 'tag2')");
+
+        assertThat(collectResult("SELECT branch_name FROM `T$branches`"))
+                .containsExactlyInAnyOrder("+I[test]", "+I[test2]");
+
+        sql("CALL sys.delete_branch('default.T', 'test')");
+
+        assertThat(collectResult("SELECT branch_name FROM `T$branches`"))
+                .containsExactlyInAnyOrder("+I[test2]");
+    }
+
+    @Test
+    public void testBranchFastForward() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        FileStoreTable table = paimonTable("T");
+        SnapshotManager snapshotManager = table.snapshotManager();
+
+        sql("INSERT INTO T VALUES (1, 10, 'hunter')");
+        sql("INSERT INTO T VALUES (1, 20, 'hunter')");
+        sql("INSERT INTO T VALUES (1, 30, 'hunter')");
+
+        checkSnapshots(snapshotManager, 1, 3);
+
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 10, hunter]", "+I[1, 20, hunter]", "+I[1, 30, hunter]");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+
+        sql("INSERT INTO `T$branch_test` VALUES (2, 10, 'hunterX')");
+
+        checkSnapshots(paimonTable("T$branch_test").snapshotManager(), 1, 2);
+
+        // query branch data.
+        assertThat(collectResult("SELECT * FROM T$branch_test"))
+                .containsExactlyInAnyOrder("+I[1, 10, hunter]", "+I[2, 10, hunterX]");
+
+        sql("CALL sys.fast_forward('default.T', 'test')");
+
+        // Branch `test` replaces the main branch.
+        assertThat(collectResult("SELECT * FROM T"))
+                .containsExactlyInAnyOrder("+I[1, 10, hunter]", "+I[2, 10, hunterX]");
+
+        checkSnapshots(snapshotManager, 1, 2);
+
+        sql("alter table T set ('branch'='test')");
+
+        assertThatThrownBy(() -> sql("CALL sys.fast_forward('default.T', 'test')"))
+                .hasMessageContaining(
+                        "Fast-forward from the current branch 'test' is not allowed.");
+    }
+
+    @Test
+    public void testFallbackBranchBatchRead() throws Exception {
+        sql(
+                "CREATE TABLE t ( pt INT NOT NULL, k INT NOT NULL, v STRING ) PARTITIONED BY (pt) WITH ( 'bucket' = '-1' )");
+        sql("INSERT INTO t VALUES (1, 10, 'apple'), (1, 20, 'banana')");
+
+        sql("CALL sys.create_branch('default.t', 'pk')");
+        sql("ALTER TABLE `t$branch_pk` SET ( 'primary-key' = 'pt, k', 'bucket' = '2' )");
+        sql("ALTER TABLE t SET ( 'scan.fallback-branch' = 'pk' )");
+
+        sql("INSERT INTO `t$branch_pk` VALUES (1, 20, 'cat'), (1, 30, 'dog')");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder("+I[apple, 10]", "+I[banana, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder("+I[cat, 20]", "+I[dog, 30]");
+
+        sql("INSERT INTO `t$branch_pk` VALUES (2, 10, 'tiger'), (2, 20, 'wolf')");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[apple, 10]", "+I[banana, 20]", "+I[tiger, 10]", "+I[wolf, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder(
+                        "+I[cat, 20]", "+I[dog, 30]", "+I[tiger, 10]", "+I[wolf, 20]");
+        assertThat(collectResult("SELECT v, k FROM t WHERE pt = 1"))
+                .containsExactlyInAnyOrder("+I[apple, 10]", "+I[banana, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk` WHERE pt = 1"))
+                .containsExactlyInAnyOrder("+I[cat, 20]", "+I[dog, 30]");
+        assertThat(collectResult("SELECT v, k FROM t WHERE pt = 2"))
+                .containsExactlyInAnyOrder("+I[tiger, 10]", "+I[wolf, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk` WHERE pt = 2"))
+                .containsExactlyInAnyOrder("+I[tiger, 10]", "+I[wolf, 20]");
+
+        sql("INSERT INTO `t$branch_pk` VALUES (2, 10, 'lion')");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[apple, 10]", "+I[banana, 20]", "+I[lion, 10]", "+I[wolf, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder(
+                        "+I[cat, 20]", "+I[dog, 30]", "+I[lion, 10]", "+I[wolf, 20]");
+
+        sql("INSERT OVERWRITE t PARTITION (pt = 1) VALUES (10, 'pear'), (20, 'mango')");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[pear, 10]", "+I[mango, 20]", "+I[lion, 10]", "+I[wolf, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder(
+                        "+I[cat, 20]", "+I[dog, 30]", "+I[lion, 10]", "+I[wolf, 20]");
+
+        sql("ALTER TABLE t RESET ( 'scan.fallback-branch' )");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder("+I[pear, 10]", "+I[mango, 20]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder(
+                        "+I[cat, 20]", "+I[dog, 30]", "+I[lion, 10]", "+I[wolf, 20]");
+    }
+
+    @Test
+    public void testFallbackBranchStreamRead() throws Exception {
+        sql(
+                "CREATE TABLE t ( pt INT NOT NULL, k INT NOT NULL, v STRING ) PARTITIONED BY (pt) WITH ( 'bucket' = '-1' )");
+        sql("INSERT INTO t VALUES (1, 10, 'apple'), (1, 20, 'banana')");
+
+        sql("CALL sys.create_branch('default.t', 'pk')");
+        sql("ALTER TABLE `t$branch_pk` SET ( 'primary-key' = 'pt, k', 'bucket' = '2' )");
+        sql("ALTER TABLE t SET ( 'scan.fallback-branch' = 'pk' )");
+
+        sql("INSERT INTO `t$branch_pk` VALUES (2, 20, 'cat'), (2, 30, 'dog')");
+
+        // read main branch in batch
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[apple, 10]", "+I[banana, 20]", "+I[cat, 20]", "+I[dog, 30]");
+
+        // read main branch streamingly
+        try (BlockingIterator<Row, Row> iter = streamSqlBlockIter("SELECT * FROM t")) {
+            AssertionsForInterfaceTypes.assertThat(iter.collect(2))
+                    .containsExactlyInAnyOrder(
+                            Row.ofKind(RowKind.INSERT, 1, 10, "apple"),
+                            Row.ofKind(RowKind.INSERT, 1, 20, "banana"));
+        }
+    }
+
+    @Test
+    public void testCrossPartitionFallbackBranchBatchRead() throws Exception {
+        sql(
+                "CREATE TABLE t ( pk INT PRIMARY KEY NOT ENFORCED, name STRING, dt STRING ) PARTITIONED BY (dt) WITH ( 'bucket' = '-1' )");
+        sql("CALL sys.create_branch('default.t', 'stream')");
+        sql("ALTER TABLE t SET ( 'scan.fallback-branch' = 'stream' )");
+
+        sql(
+                "INSERT INTO t VALUES (1, 'Jack', '20250227'), (1, 'Jackson', '20250227'), (2, 'Sam', '20250228')");
+        sql(
+                "INSERT INTO `t$branch_stream` VALUES (1, 'John Stream', '20250228'), (3, 'Rick Stream', '20250301')");
+        assertThat(collectResult("SELECT pk, name, dt FROM t order by dt"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, Jackson, 20250227]",
+                        "+I[2, Sam, 20250228]",
+                        "+I[3, Rick Stream, 20250301]");
+        assertThat(collectResult("SELECT pk, name, dt FROM `t$branch_stream` order by dt"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, John Stream, 20250228]", "+I[3, Rick Stream, 20250301]");
+    }
+
+    @Test
+    public void testDifferentRowTypes() throws Exception {
+        sql(
+                "CREATE TABLE t ( pt INT NOT NULL, k INT NOT NULL, v STRING ) PARTITIONED BY (pt) WITH ( 'bucket' = '-1' )");
+        sql("CALL sys.create_branch('default.t', 'pk')");
+        sql("ALTER TABLE `t$branch_pk` SET ( 'primary-key' = 'pt, k', 'bucket' = '2' )");
+        sql("ALTER TABLE `t$branch_pk` ADD (v2 INT)");
+        sql("INSERT INTO t VALUES (1, 10, 'apple')");
+        sql("INSERT INTO `t$branch_pk` VALUES (1, 10, 'cat', 100)");
+
+        sql("ALTER TABLE t SET ( 'scan.fallback-branch' = 'pk' )");
+        assertThatThrownBy(() -> sql("SELECT * FROM t"))
+                .hasMessageContaining("Branch main and pk does not have the same row type");
+
+        sql("ALTER TABLE t RESET ( 'scan.fallback-branch' )");
+        assertThat(collectResult("SELECT v, k FROM t")).containsExactlyInAnyOrder("+I[apple, 10]");
+        assertThat(collectResult("SELECT v, v2, k FROM `t$branch_pk`"))
+                .containsExactlyInAnyOrder("+I[cat, 100, 10]");
+    }
+
+    @Test
+    public void testBranchOptionsTable() throws Exception {
+        sql(
+                "CREATE TABLE t ( pt INT, k INT, v STRING, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) WITH ( 'bucket' = '2' )");
+
+        sql("CALL sys.create_branch('default.t', 'test')");
+
+        sql("ALTER TABLE t SET ('snapshot.time-retained' = '5 h')");
+        sql("ALTER TABLE t$branch_test SET ('snapshot.time-retained' = '1 h')");
+
+        assertThat(collectResult("SELECT * FROM t$options"))
+                .containsExactlyInAnyOrder(
+                        "+I[bucket, 2]",
+                        "+I[snapshot.time-retained, 5 h]",
+                        "+I[scan.infer-parallelism, false]");
+        assertThat(collectResult("SELECT * FROM t$branch_test$options"))
+                .containsExactlyInAnyOrder(
+                        "+I[bucket, 2]",
+                        "+I[snapshot.time-retained, 1 h]",
+                        "+I[scan.infer-parallelism, false]");
+        assertThat(collectResult("SELECT * FROM t$options /*+ OPTIONS('branch'='test') */"))
+                .containsExactlyInAnyOrder(
+                        "+I[bucket, 2]",
+                        "+I[snapshot.time-retained, 1 h]",
+                        "+I[scan.infer-parallelism, false]");
+    }
+
+    @Test
+    public void testBranchSchemasTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        assertThat(collectResult("SELECT schema_id FROM t$branch_b1$schemas order by schema_id"))
+                .containsExactlyInAnyOrder("+I[0]");
+
+        sql("ALTER TABLE t$branch_b1 SET ('snapshot.time-retained' = '5 h')");
+        assertThat(collectResult("SELECT schema_id FROM t$branch_b1$schemas order by schema_id"))
+                .containsExactlyInAnyOrder("+I[0]", "+I[1]");
+        assertThat(
+                        collectResult(
+                                "SELECT schema_id FROM t$schemas /*+ OPTIONS('branch'='b1') */ order by schema_id"))
+                .containsExactlyInAnyOrder("+I[0]", "+I[1]");
+    }
+
+    @Test
+    public void testBranchAuditLogTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+        assertThat(collectResult("SELECT * FROM t$audit_log"))
+                .containsExactlyInAnyOrder("+I[+I, 1, 2]");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        assertThat(collectResult("SELECT * FROM t$branch_b1$audit_log"))
+                .containsExactlyInAnyOrder("+I[+I, 3, 4]");
+        assertThat(collectResult("SELECT * FROM t$audit_log /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[+I, 3, 4]");
+    }
+
+    @Test
+    public void testBranchReadOptimizedTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+        assertThat(collectResult("SELECT * FROM t$ro")).containsExactlyInAnyOrder("+I[1, 2]");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        assertThat(collectResult("SELECT * FROM t$branch_b1$ro"))
+                .containsExactlyInAnyOrder("+I[3, 4]");
+        assertThat(collectResult("SELECT * FROM t$ro /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[3, 4]");
+    }
+
+    @Test
+    public void testBranchFilesTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        sql("INSERT INTO t$branch_b1 VALUES (5, 6)");
+
+        assertThat(collectResult("SELECT min_value_stats FROM t$files"))
+                .containsExactlyInAnyOrder("+I[{a=1, b=2}]");
+        assertThat(collectResult("SELECT min_value_stats FROM t$branch_b1$files"))
+                .containsExactlyInAnyOrder("+I[{a=3, b=4}]", "+I[{a=5, b=6}]");
+        assertThat(
+                        collectResult(
+                                "SELECT min_value_stats FROM t$files /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[{a=3, b=4}]", "+I[{a=5, b=6}]");
+    }
+
+    @Test
+    public void testBranchTagsTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+        paimonTable("t").createTag("tag1", 1);
+
+        sql("CALL sys.create_branch('default.t', 'b1','tag1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        paimonTable("t$branch_b1").createTag("tag2", 2);
+
+        assertThat(collectResult("SELECT tag_name,snapshot_id,record_count FROM t$tags"))
+                .containsExactlyInAnyOrder("+I[tag1, 1, 1]");
+        assertThat(collectResult("SELECT tag_name,snapshot_id,record_count FROM t$branch_b1$tags"))
+                .containsExactlyInAnyOrder("+I[tag1, 1, 1]", "+I[tag2, 2, 2]");
+        assertThat(
+                        collectResult(
+                                "SELECT tag_name,snapshot_id,record_count FROM t$tags /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[tag1, 1, 1]", "+I[tag2, 2, 2]");
+    }
+
+    @Test
+    @Timeout(60)
+    public void testBranchConsumersTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2), (3,4)");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        BlockingIterator<Row, Row> iterator =
+                BlockingIterator.of(
+                        streamSqlIter(
+                                "SELECT * FROM t$branch_b1 /*+ OPTIONS('consumer-id'='id1','consumer.expiration-time'='3h') */"));
+        sql("INSERT INTO t$branch_b1 VALUES (5, 6), (7, 8)");
+        assertThat(iterator.collect(2)).containsExactlyInAnyOrder(Row.of(5, 6), Row.of(7, 8));
+        List<String> branchResult;
+        do {
+            branchResult = collectResult("SELECT * FROM t$branch_b1$consumers");
+            if (!branchResult.isEmpty()) {
+                break;
+            }
+            Thread.sleep(1000);
+        } while (true);
+        iterator.close();
+
+        assertThat(collectResult("SELECT * FROM t$consumers")).isEmpty();
+        assertThat(branchResult).containsExactlyInAnyOrder("+I[id1, 2]");
+        assertThat(collectResult("SELECT * FROM t$consumers /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[id1, 2]");
+    }
+
+    @Test
+    public void testBranchManifestsTable() {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        sql("INSERT INTO t$branch_b1 VALUES (5, 6)");
+
+        List<Row> res = sql("SELECT schema_id, file_name, file_size FROM t$manifests");
+        assertThat(res).hasSize(1);
+
+        res = sql("SELECT schema_id, file_name, file_size FROM t$branch_b1$manifests");
+        assertThat(res).hasSize(2);
+        res.forEach(
+                row -> {
+                    assertThat((long) row.getField(0)).isEqualTo(0L);
+                    assertThat(StringUtils.startsWith((String) row.getField(1), "manifest"))
+                            .isTrue();
+                    assertThat((long) row.getField(2)).isGreaterThan(0L);
+                });
+        List<Row> dynamicOptionRes =
+                sql(
+                        "SELECT schema_id, file_name, file_size FROM t$manifests /*+ OPTIONS('branch'='b1') */");
+        assertThat(dynamicOptionRes).containsExactlyInAnyOrderElementsOf(res);
+    }
+
+    @Test
+    public void testBranchSnapshotsTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT)");
+        sql("INSERT INTO t VALUES (1, 2)");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (3, 4)");
+        sql("INSERT INTO t$branch_b1 VALUES (5, 6)");
+
+        assertThat(collectResult("SELECT snapshot_id, schema_id, commit_kind FROM t$snapshots"))
+                .containsExactlyInAnyOrder("+I[1, 0, APPEND]");
+        assertThat(
+                        collectResult(
+                                "SELECT snapshot_id, schema_id, commit_kind FROM t$branch_b1$snapshots"))
+                .containsExactlyInAnyOrder("+I[1, 0, APPEND]", "+I[2, 0, APPEND]");
+        assertThat(
+                        collectResult(
+                                "SELECT snapshot_id, schema_id, commit_kind FROM t$snapshots /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[1, 0, APPEND]", "+I[2, 0, APPEND]");
+    }
+
+    @Test
+    public void testBranchPartitionsTable() throws Exception {
+        sql("CREATE TABLE t (a INT, b INT,c STRING) PARTITIONED BY (a)");
+        assertThat(sql("SELECT * FROM t$partitions")).isEmpty();
+
+        sql("INSERT INTO t VALUES (1, 2, 'x')");
+        sql("INSERT INTO t VALUES (1, 4, 'S2'), (2, 2, 'S1'), (2, 2, 'S1')");
+        sql("INSERT INTO t VALUES (1, 4, 'S3'), (2, 2, 'S4')");
+
+        sql("CALL sys.create_branch('default.t', 'b1')");
+        sql("INSERT INTO t$branch_b1 VALUES (1, 4, 'S2'), (2, 2, 'S1'), (2, 2, 'S5')");
+        sql("INSERT INTO t$branch_b1 VALUES (1, 4, 'S3'), (2, 2, 'S4')");
+
+        assertThat(collectResult("SELECT `partition`, record_count, file_count FROM t$partitions"))
+                .containsExactlyInAnyOrder("+I[a=1, 3, 3]", "+I[a=2, 3, 2]");
+        assertThat(
+                        collectResult(
+                                "SELECT `partition`, record_count, file_count FROM t$branch_b1$partitions"))
+                .containsExactlyInAnyOrder("+I[a=1, 2, 2]", "+I[a=2, 3, 2]");
+        assertThat(
+                        collectResult(
+                                "SELECT `partition`, record_count, file_count FROM t$partitions /*+ OPTIONS('branch'='b1') */"))
+                .containsExactlyInAnyOrder("+I[a=1, 2, 2]", "+I[a=2, 3, 2]");
+    }
+
+    @Test
+    public void testCannotSetEmptyFallbackBranch() {
+        String errMsg =
+                "Cannot set 'scan.fallback-branch' = 'test' because the branch 'test' does not exist.";
+        assertThatThrownBy(
+                        () ->
+                                sql(
+                                        "CREATE TABLE t1 (a INT, b INT) WITH ('scan.fallback-branch' = 'test')"))
+                .satisfies(anyCauseMatches(IllegalArgumentException.class, errMsg));
+
+        assertThatThrownBy(
+                        () -> {
+                            sql("CREATE TABLE t2 (a INT, b INT)");
+                            sql("ALTER TABLE t2 SET ('scan.fallback-branch' = 'test')");
+                        })
+                .satisfies(anyCauseMatches(IllegalArgumentException.class, errMsg));
+    }
+
+    @Test
+    public void testReadBranchTableWithMultiSchemaIds() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        sql("INSERT INTO T VALUES" + " (1, 10, 'apple')," + " (1, 20, 'banana')");
+
+        sql("ALTER TABLE `T` ADD (v2 INT)");
+
+        sql("INSERT INTO T VALUES" + " (2, 10, 'cat', 2)," + " (2, 20, 'dog', 2)");
+
+        sql("ALTER TABLE `T` ADD (v3 INT)");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 2)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+
+        FileStoreTable table = paimonTable("T");
+        SchemaManager schemaManager = new SchemaManager(table.fileIO(), table.location(), "test");
+        List<Long> schemaIds = schemaManager.listAllIds();
+        assertThat(schemaIds.size()).isEqualTo(2);
+
+        assertThat(collectResult("SELECT * FROM T$branch_test"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 10, apple, null]",
+                        "+I[1, 20, banana, null]",
+                        "+I[2, 10, cat, 2]",
+                        "+I[2, 20, dog, 2]");
+    }
+
+    @Test
+    public void testMainAndFallbackNoPrimaryKeys() throws Exception {
+        sql("CREATE TABLE t ( pt INT, v INT ) PARTITIONED BY (pt) WITH ( 'bucket' = '-1' )");
+        sql("INSERT INTO t VALUES (1, 110)");
+        sql("CALL sys.create_branch('default.t', 'test')");
+        sql("ALTER TABLE t SET ( 'scan.fallback-branch' = 'test' )");
+        sql("INSERT INTO `t$branch_test` VALUES (2, 210)");
+        assertThat(collectResult("SELECT * FROM t"))
+                .containsExactlyInAnyOrder("+I[1, 110]", "+I[2, 210]");
+
+        sql("ALTER TABLE t ADD v2 INT");
+        sql("ALTER TABLE `t$branch_test` ADD v2 INT");
+        sql("INSERT INTO t VALUES (1, 120, 1200)");
+        sql("INSERT INTO `t$branch_test` VALUES (2, 220, 2200)");
+        assertThat(collectResult("SELECT * FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[1, 110, null]",
+                        "+I[2, 210, null]",
+                        "+I[1, 120, 1200]",
+                        "+I[2, 220, 2200]");
+    }
+
+    @Test
+    public void testBranchesTableFilter() throws Exception {
+        sql("CREATE TABLE T (a INT, b INT)");
+        sql("INSERT INTO T VALUES (1, 1)");
+        sql("CALL sys.create_branch('default.T', 'b1')");
+        sql("CALL sys.create_branch('default.T', 'b2')");
+        sql("CALL sys.create_branch('default.T', 'b3')");
+
+        // no filter
+        assertThat(collectResult("SELECT branch_name FROM `T$branches`"))
+                .containsExactlyInAnyOrder("+I[b1]", "+I[b2]", "+I[b3]");
+
+        // equals
+        assertThat(collectResult("SELECT branch_name FROM `T$branches` WHERE branch_name = 'b2'"))
+                .containsExactlyInAnyOrder("+I[b2]");
+
+        // in
+        assertThat(
+                        collectResult(
+                                "SELECT branch_name FROM `T$branches` WHERE branch_name IN ('b1', 'b3')"))
+                .containsExactlyInAnyOrder("+I[b1]", "+I[b3]");
+
+        // in with non-existent branch
+        assertThat(
+                        collectResult(
+                                "SELECT branch_name FROM `T$branches` WHERE branch_name IN ('b1', 'non_existent')"))
+                .containsExactlyInAnyOrder("+I[b1]");
+
+        // equals with non-existent branch
+        assertThat(
+                        collectResult(
+                                "SELECT branch_name FROM `T$branches` WHERE branch_name = 'non_existent'"))
+                .isEmpty();
+    }
+
+    @Test
+    public void testRenameBranch() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES (1, 10, 'apple'), (1, 20, 'banana')");
+        // snapshot 2.
+        sql("INSERT INTO T VALUES (2, 10, 'cat'), (2, 20, 'dog')");
+
+        // create tag
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        // create branch from tag
+        sql("CALL sys.create_branch('default.T', 'branch1', 'tag1')");
+
+        // verify branch exists
+        FileStoreTable table = paimonTable("T");
+        assertThat(table.branchManager().branchExists("branch1")).isTrue();
+
+        // rename branch
+        sql("CALL sys.rename_branch('default.T', 'branch1', 'branch2')");
+
+        // verify old branch does not exist
+        table = paimonTable("T");
+        assertThat(table.branchManager().branchExists("branch1")).isFalse();
+
+        // verify new branch exists
+        assertThat(table.branchManager().branchExists("branch2")).isTrue();
+
+        // verify data in renamed branch
+        assertThat(collectResult("SELECT * FROM T$branch_branch2"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, banana]");
+
+        // rename non-existent branch should fail
+        assertThatThrownBy(
+                        () ->
+                                sql(
+                                        "CALL sys.rename_branch('default.T', 'nonexistent', 'new_branch')"))
+                .hasMessageContaining("Branch");
+
+        // rename to existing branch should fail
+        sql("CALL sys.create_branch('default.T', 'branch3')");
+        assertThatThrownBy(() -> sql("CALL sys.rename_branch('default.T', 'branch2', 'branch3')"))
+                .hasMessageContaining("Branch");
+    }
+
+    @Test
+    public void testPrimaryBranchBatchRead() throws Exception {
+        // Create non-PK table, then create branch, then ALTER main to add PKs.
+        // This results in main = PK table, branch = non-PK table.
+        sql(
+                "CREATE TABLE t ( pt INT NOT NULL, k INT NOT NULL, v STRING ) "
+                        + "PARTITIONED BY (pt) WITH ( 'bucket' = '-1' )");
+
+        sql("CALL sys.create_branch('default.t', 'nb')");
+        sql("ALTER TABLE t SET ( 'primary-key' = 'pt, k', 'bucket' = '2' )");
+        sql("ALTER TABLE t SET ( 'scan.primary-branch' = 'nb' )");
+
+        // Insert into non-PK branch (primary, has priority)
+        sql("INSERT INTO `t$branch_nb` VALUES (1, 20, 'cat'), (1, 30, 'dog')");
+        // Insert overlapping partition into PK main (fallback)
+        sql("INSERT INTO t VALUES (1, 10, 'apple'), (1, 20, 'banana')");
+
+        // pt=1 exists in primary branch → read from branch
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder("+I[cat, 20]", "+I[dog, 30]");
+        assertThat(collectResult("SELECT v, k FROM `t$branch_nb`"))
+                .containsExactlyInAnyOrder("+I[cat, 20]", "+I[dog, 30]");
+
+        // Insert pt=2 into primary branch, pt=3 only into main
+        sql("INSERT INTO `t$branch_nb` VALUES (2, 10, 'tiger'), (2, 20, 'wolf')");
+        sql("INSERT INTO t VALUES (3, 10, 'horse')");
+
+        // pt=1,2 from primary branch; pt=3 from main (fallback)
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder(
+                        "+I[cat, 20]",
+                        "+I[dog, 30]",
+                        "+I[tiger, 10]",
+                        "+I[wolf, 20]",
+                        "+I[horse, 10]");
+
+        // Unset scan.primary-branch, main table should show its own data
+        sql("ALTER TABLE t RESET ( 'scan.primary-branch' )");
+        assertThat(collectResult("SELECT v, k FROM t"))
+                .containsExactlyInAnyOrder("+I[apple, 10]", "+I[banana, 20]", "+I[horse, 10]");
+    }
+
+    private List<String> collectResult(String sql) throws Exception {
+        List<String> result = new ArrayList<>();
+        try (CloseableIterator<Row> it = tEnv.executeSql(sql).collect()) {
+            while (it.hasNext()) {
+                result.add(it.next().toString());
+            }
+        }
+        return result;
+    }
+
+    private void checkSnapshots(SnapshotManager sm, int earliest, int latest) throws IOException {
+        assertThat(sm.snapshotCount()).isEqualTo(latest - earliest + 1);
+        assertThat(sm.earliestSnapshotId()).isEqualTo(earliest);
+        assertThat(sm.latestSnapshotId()).isEqualTo(latest);
+    }
+}

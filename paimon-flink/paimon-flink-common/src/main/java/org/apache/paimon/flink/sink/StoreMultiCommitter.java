@@ -1,0 +1,274 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.sink;
+
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.manifest.WrappedManifestCommittable;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.CommitMessage;
+
+import org.apache.flink.api.java.tuple.Tuple2;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * {@link StoreMultiCommitter} for multiple dynamic store. During the commit process, it will group
+ * the WrappedManifestCommittables by their table identifier and use different committers to commit
+ * to different tables.
+ */
+public class StoreMultiCommitter
+        implements Committer<MultiTableCommittable, WrappedManifestCommittable> {
+
+    private final Catalog catalog;
+    private final Context context;
+
+    // To make the commit behavior consistent with that of Committer,
+    //    StoreMultiCommitter manages multiple committers which are
+    //    referenced by table id.
+    private final Map<Identifier, StoreCommitter> tableCommitters;
+
+    // Currently, only compact_database job needs to ignore empty commit and set dynamic options
+    private final boolean ignoreEmptyCommit;
+    private final Map<String, String> dynamicOptions;
+    @Nullable private final Map<Identifier, Map<String, String>> dynamicOptionsPerTable;
+
+    private final TableFilter tableFilter;
+
+    public StoreMultiCommitter(CatalogLoader catalogLoader, Context context) {
+        this(catalogLoader, context, false, Collections.emptyMap());
+    }
+
+    public StoreMultiCommitter(
+            CatalogLoader catalogLoader,
+            Context context,
+            boolean ignoreEmptyCommit,
+            Map<String, String> dynamicOptions) {
+        this(catalogLoader, context, ignoreEmptyCommit, dynamicOptions, null, false, null);
+    }
+
+    public StoreMultiCommitter(
+            CatalogLoader catalogLoader,
+            Context context,
+            boolean ignoreEmptyCommit,
+            Map<String, String> dynamicOptions,
+            @Nullable Map<Identifier, Map<String, String>> dynamicOptionsPerTable,
+            boolean eagerInit,
+            TableFilter tableFilter) {
+        this.catalog = catalogLoader.load();
+        this.context = context;
+        this.ignoreEmptyCommit = ignoreEmptyCommit;
+        this.dynamicOptions = dynamicOptions;
+        this.dynamicOptionsPerTable = dynamicOptionsPerTable;
+        this.tableCommitters = new HashMap<>();
+
+        this.tableFilter = tableFilter;
+        int parallelism = context.getParallelism();
+        int index = context.getSubtaskIndex();
+
+        if (eagerInit) {
+            List<Identifier> tableIds =
+                    filterTables().stream()
+                            .filter(
+                                    identifier ->
+                                            MultiTableCommittableChannelComputer.computeChannel(
+                                                            identifier.getDatabaseName(),
+                                                            identifier.getTableName(),
+                                                            parallelism)
+                                                    == index)
+                            .collect(Collectors.toList());
+
+            tableIds.stream().forEach(this::getStoreCommitter);
+        }
+    }
+
+    @Override
+    public boolean forceCreatingSnapshot() {
+        return true;
+    }
+
+    @Override
+    public WrappedManifestCommittable combine(
+            long checkpointId, long watermark, List<MultiTableCommittable> committables) {
+        WrappedManifestCommittable wrappedManifestCommittable =
+                new WrappedManifestCommittable(checkpointId, watermark);
+        return combine(checkpointId, watermark, wrappedManifestCommittable, committables);
+    }
+
+    @Override
+    public WrappedManifestCommittable combine(
+            long checkpointId,
+            long watermark,
+            WrappedManifestCommittable wrappedManifestCommittable,
+            List<MultiTableCommittable> committables) {
+        for (MultiTableCommittable committable : committables) {
+            Identifier identifier =
+                    Identifier.create(committable.getDatabase(), committable.getTable());
+            ManifestCommittable manifestCommittable =
+                    wrappedManifestCommittable.computeCommittableIfAbsent(
+                            identifier, checkpointId, watermark);
+            CommitMessage file = committable.commitMessage();
+            manifestCommittable.addFileCommittable(file);
+        }
+        return wrappedManifestCommittable;
+    }
+
+    @Override
+    public void commit(List<WrappedManifestCommittable> committables)
+            throws IOException, InterruptedException {
+        if (committables.isEmpty()) {
+            return;
+        }
+
+        // key by table id
+        Map<Identifier, List<ManifestCommittable>> committableMap = groupByTable(committables);
+        committableMap.keySet().forEach(this::getStoreCommitter);
+
+        long checkpointId = committables.get(0).checkpointId();
+        long watermark = committables.get(0).watermark();
+        for (Map.Entry<Identifier, StoreCommitter> entry : tableCommitters.entrySet()) {
+            List<ManifestCommittable> committableList = committableMap.get(entry.getKey());
+            StoreCommitter committer = entry.getValue();
+            if (committableList != null) {
+                committer.commit(committableList);
+            } else {
+                // try best to commit empty snapshot, but tableCommitters may not contain all tables
+                if (committer.forceCreatingSnapshot()) {
+                    ManifestCommittable combine =
+                            committer.combine(checkpointId, watermark, Collections.emptyList());
+                    committer.commit(Collections.singletonList(combine));
+                }
+            }
+        }
+    }
+
+    @Override
+    public int filterAndCommit(
+            List<WrappedManifestCommittable> globalCommittables,
+            boolean checkAppendFiles,
+            boolean partitionMarkDoneRecoverFromState) {
+        int result = 0;
+        for (Map.Entry<Identifier, List<ManifestCommittable>> entry :
+                groupByTable(globalCommittables).entrySet()) {
+            result +=
+                    getStoreCommitter(entry.getKey())
+                            .filterAndCommit(
+                                    entry.getValue(),
+                                    checkAppendFiles,
+                                    partitionMarkDoneRecoverFromState);
+        }
+        return result;
+    }
+
+    private Map<Identifier, List<ManifestCommittable>> groupByTable(
+            List<WrappedManifestCommittable> committables) {
+        return committables.stream()
+                .flatMap(
+                        wrapped -> {
+                            Map<Identifier, ManifestCommittable> manifestCommittables =
+                                    wrapped.manifestCommittables();
+                            return manifestCommittables.entrySet().stream()
+                                    .map(entry -> Tuple2.of(entry.getKey(), entry.getValue()));
+                        })
+                .collect(
+                        Collectors.groupingBy(
+                                t -> t.f0, Collectors.mapping(t -> t.f1, Collectors.toList())));
+    }
+
+    @Override
+    public Map<Long, List<MultiTableCommittable>> groupByCheckpoint(
+            Collection<MultiTableCommittable> committables) {
+        Map<Long, List<MultiTableCommittable>> grouped = new HashMap<>();
+        for (MultiTableCommittable c : committables) {
+            grouped.computeIfAbsent(c.checkpointId(), k -> new ArrayList<>()).add(c);
+        }
+        return grouped;
+    }
+
+    private StoreCommitter getStoreCommitter(Identifier tableId) {
+        StoreCommitter committer = tableCommitters.get(tableId);
+
+        if (committer == null) {
+            FileStoreTable table;
+            try {
+                table = (FileStoreTable) catalog.getTable(tableId).copy(getDynamicOptions(tableId));
+            } catch (Catalog.TableNotExistException e) {
+                throw new RuntimeException(
+                        String.format(
+                                "Failed to get committer for table %s", tableId.getFullName()),
+                        e);
+            }
+            committer =
+                    new StoreCommitter(
+                            table,
+                            table.newCommit(context.commitUser())
+                                    .ignoreEmptyCommit(ignoreEmptyCommit),
+                            context);
+            tableCommitters.put(tableId, committer);
+        }
+
+        return committer;
+    }
+
+    private Map<String, String> getDynamicOptions(Identifier identifier) {
+        if (dynamicOptionsPerTable != null) {
+            Map<String, String> dynamicOptions = dynamicOptionsPerTable.get(identifier);
+            if (dynamicOptions != null) {
+                return dynamicOptions;
+            }
+        }
+        return this.dynamicOptions;
+    }
+
+    @Override
+    public void close() throws Exception {
+        for (StoreCommitter committer : tableCommitters.values()) {
+            committer.close();
+        }
+        if (catalog != null) {
+            catalog.close();
+        }
+    }
+
+    private List<Identifier> filterTables() {
+        // Get all tables in the catalog
+        List<String> allTables = null;
+        try {
+            allTables = catalog.listTables(this.tableFilter.getDbName());
+        } catch (Catalog.DatabaseNotExistException e) {
+            allTables = Collections.emptyList();
+        }
+
+        List<String> tblList = tableFilter.filterTables(allTables);
+        return tblList.stream()
+                .map(t -> Identifier.create(tableFilter.getDbName(), t))
+                .collect(Collectors.toList());
+    }
+}

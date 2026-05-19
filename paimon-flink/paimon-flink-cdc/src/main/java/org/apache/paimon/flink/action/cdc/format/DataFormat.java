@@ -1,0 +1,70 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.action.cdc.format;
+
+import org.apache.paimon.flink.action.cdc.CdcMetadataConverter;
+import org.apache.paimon.flink.action.cdc.CdcSourceRecord;
+import org.apache.paimon.flink.action.cdc.ComputedColumn;
+import org.apache.paimon.flink.action.cdc.TypeMapping;
+
+import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+
+import java.util.List;
+
+/**
+ * Supports the message queue's data format and provides definitions for the message queue's record
+ * deserialization class and parsing class {@link AbstractRecordParser}.
+ */
+public interface DataFormat {
+
+    /**
+     * Creates a new instance of {@link AbstractRecordParser} for this data format with the
+     * specified configurations.
+     *
+     * @param typeMapping Type mapping configuration
+     * @param computedColumns List of computed columns to be considered by the parser.
+     * @return A new instance of {@link AbstractRecordParser}.
+     */
+    AbstractRecordParser createParser(
+            TypeMapping typeMapping, List<ComputedColumn> computedColumns);
+
+    /**
+     * Creates a new instance of {@link AbstractRecordParser} for this data format with the
+     * specified configurations including metadata converters.
+     *
+     * @param typeMapping Type mapping configuration
+     * @param computedColumns List of computed columns to be considered by the parser.
+     * @param metadataConverters Array of metadata converters for extracting CDC metadata
+     * @return A new instance of {@link AbstractRecordParser}.
+     */
+    default AbstractRecordParser createParser(
+            TypeMapping typeMapping,
+            List<ComputedColumn> computedColumns,
+            CdcMetadataConverter[] metadataConverters) {
+        return createParser(typeMapping, computedColumns)
+                .withMetadataConverters(metadataConverters);
+    }
+
+    KafkaRecordDeserializationSchema<CdcSourceRecord> createKafkaDeserializer(
+            Configuration cdcSourceConfig);
+
+    DeserializationSchema<CdcSourceRecord> createPulsarDeserializer(Configuration cdcSourceConfig);
+}

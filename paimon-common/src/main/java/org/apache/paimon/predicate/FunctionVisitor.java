@@ -1,0 +1,100 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.predicate;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+/** A {@link PredicateVisitor} to visit functions. */
+public interface FunctionVisitor<T> extends PredicateVisitor<T> {
+
+    @Override
+    default T visit(LeafPredicate predicate) {
+        Optional<FieldRef> fieldRef = predicate.fieldRefOptional();
+        if (!fieldRef.isPresent()) {
+            return visitNonFieldLeaf(predicate);
+        }
+        return predicate.function().visit(this, fieldRef.get(), predicate.literals());
+    }
+
+    T visitNonFieldLeaf(LeafPredicate leafPredicate);
+
+    @Override
+    default T visit(CompoundPredicate predicate) {
+        return predicate
+                .function()
+                .visit(
+                        this,
+                        predicate.children().stream()
+                                .map(p -> p.visit(this))
+                                .collect(Collectors.toList()));
+    }
+
+    // ----------------- Unary functions ------------------------
+
+    T visitIsNotNull(FieldRef fieldRef);
+
+    T visitIsNull(FieldRef fieldRef);
+
+    // ----------------- Binary functions ------------------------
+
+    T visitStartsWith(FieldRef fieldRef, Object literal);
+
+    T visitEndsWith(FieldRef fieldRef, Object literal);
+
+    T visitContains(FieldRef fieldRef, Object literal);
+
+    T visitLike(FieldRef fieldRef, Object literal);
+
+    T visitLessThan(FieldRef fieldRef, Object literal);
+
+    T visitGreaterOrEqual(FieldRef fieldRef, Object literal);
+
+    T visitNotEqual(FieldRef fieldRef, Object literal);
+
+    T visitLessOrEqual(FieldRef fieldRef, Object literal);
+
+    T visitEqual(FieldRef fieldRef, Object literal);
+
+    T visitGreaterThan(FieldRef fieldRef, Object literal);
+
+    // ----------------- Other functions ------------------------
+
+    T visitIn(FieldRef fieldRef, List<Object> literals);
+
+    T visitNotIn(FieldRef fieldRef, List<Object> literals);
+
+    default T visitBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitAnd(
+                Arrays.asList(visitGreaterOrEqual(fieldRef, from), visitLessOrEqual(fieldRef, to)));
+    }
+
+    default T visitNotBetween(FieldRef fieldRef, Object from, Object to) {
+        return visitOr(
+                Arrays.asList(visitLessThan(fieldRef, from), visitGreaterThan(fieldRef, to)));
+    }
+
+    // ----------------- Compound functions ------------------------
+
+    T visitAnd(List<T> children);
+
+    T visitOr(List<T> children);
+}

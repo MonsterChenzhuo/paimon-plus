@@ -1,0 +1,114 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.commands
+
+import org.apache.paimon.spark.catalyst.analysis.expressions.ExpressionHelper
+import org.apache.paimon.spark.schema.SparkSystemColumns.ROW_KIND_COL
+import org.apache.paimon.table.FileStoreTable
+import org.apache.paimon.table.PrimaryKeyTableUtils.validatePKUpsertDeletable
+import org.apache.paimon.table.sink.CommitMessage
+import org.apache.paimon.types.RowKind
+
+import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.PaimonUtils.createDataset
+import org.apache.spark.sql.catalyst.expressions.{EqualNullSafe, Expression, Literal, Not}
+import org.apache.spark.sql.catalyst.plans.logical.{Filter, SupportsSubquery}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.functions.lit
+
+case class DeleteFromPaimonTableCommand(
+    relation: DataSourceV2Relation,
+    override val table: FileStoreTable,
+    condition: Expression)
+  extends PaimonRowLevelCommand
+  with ExpressionHelper
+  with SupportsSubquery {
+
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    val commitMessages = if (usePKUpsertDelete()) {
+      performPrimaryKeyDelete(sparkSession)
+    } else {
+      performNonPrimaryKeyDelete(sparkSession)
+    }
+    writer.commit(commitMessages)
+    Seq.empty[Row]
+  }
+
+  private def usePKUpsertDelete(): Boolean = {
+    try {
+      validatePKUpsertDeletable(table)
+      true
+    } catch {
+      case _: UnsupportedOperationException => false
+    }
+  }
+
+  private def performPrimaryKeyDelete(sparkSession: SparkSession): Seq[CommitMessage] = {
+    val df = createDataset(sparkSession, Filter(condition, relation))
+      .withColumn(ROW_KIND_COL, lit(RowKind.DELETE.toByteValue))
+    writer.write(df)
+  }
+
+  private def performNonPrimaryKeyDelete(sparkSession: SparkSession): Seq[CommitMessage] = {
+    val readSnapshot = table.snapshotManager().latestSnapshot()
+    // Step1: the candidate data splits which are filtered by Paimon Predicate.
+    val candidateDataSplits = findCandidateDataSplits(condition, relation.output)
+    val dataFilePathToMeta = candidateFileMap(candidateDataSplits)
+
+    if (deletionVectorsEnabled) {
+      // Step2: collect all the deletion vectors that marks the deleted rows.
+      val deletionVectors = collectDeletionVectors(
+        candidateDataSplits,
+        dataFilePathToMeta,
+        condition,
+        relation,
+        sparkSession)
+
+      // Step3: update the touched deletion vectors and index files
+      writer.persistDeletionVectors(deletionVectors, readSnapshot)
+    } else {
+      // Step2: extract out the exactly files, which must have at least one record to be updated.
+      val touchedFilePaths =
+        findTouchedFiles(candidateDataSplits, condition, relation, sparkSession)
+
+      // Step3: the smallest range of data files that need to be rewritten.
+      val (touchedFiles, newRelation) =
+        extractFilesAndCreateNewScan(touchedFilePaths, dataFilePathToMeta, relation)
+
+      // Step4: build a dataframe that contains the unchanged data, and write out them.
+      // Use Not(EqualNullSafe(condition, true)) instead of Not(condition) to correctly
+      // handle NULL values. Not(NULL) evaluates to NULL (filtered out), which would
+      // incorrectly delete rows where the condition column is NULL.
+      val toRewriteScanRelation =
+        Filter(Not(EqualNullSafe(condition, Literal.TrueLiteral)), newRelation)
+      var data = createDataset(sparkSession, toRewriteScanRelation)
+      if (coreOptions.rowTrackingEnabled()) {
+        data = selectWithRowTracking(data)
+      }
+
+      // only write new files, should have no compaction
+      val addCommitMessage = writer.writeOnly().withRowTracking().write(data)
+
+      // Step5: convert the deleted files that need to be written to commit message.
+      val deletedCommitMessage = buildDeletedCommitMessage(touchedFiles)
+
+      addCommitMessage ++ deletedCommitMessage
+    }
+  }
+}

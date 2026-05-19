@@ -1,0 +1,313 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.operation;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.ApplyDeletionVectorReader;
+import org.apache.paimon.deletionvectors.DeletionVector;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.fileindex.FileIndexResult;
+import org.apache.paimon.fileindex.bitmap.ApplyBitmapIndexRecordReader;
+import org.apache.paimon.fileindex.bitmap.BitmapIndexResult;
+import org.apache.paimon.format.FileFormatDiscover;
+import org.apache.paimon.format.FormatKey;
+import org.apache.paimon.format.FormatReaderContext;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.io.DataFileRecordReader;
+import org.apache.paimon.io.FileIndexEvaluator;
+import org.apache.paimon.mergetree.compact.ConcatRecordReader;
+import org.apache.paimon.partition.PartitionUtils;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.reader.EmptyFileRecordReader;
+import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.reader.ReaderSupplier;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.DeletionFile;
+import org.apache.paimon.table.source.IncrementalSplit;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.FormatReaderMapping;
+import org.apache.paimon.utils.FormatReaderMapping.Builder;
+import org.apache.paimon.utils.IOExceptionSupplier;
+import org.apache.paimon.utils.RoaringBitmap32;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.apache.paimon.predicate.PredicateBuilder.splitAnd;
+import static org.apache.paimon.table.SpecialFields.rowTypeWithRowTracking;
+
+/** A {@link SplitRead} to read raw file directly from {@link DataSplit}. */
+public class RawFileSplitRead implements SplitRead<InternalRow> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(RawFileSplitRead.class);
+
+    private final FileIO fileIO;
+    private final SchemaManager schemaManager;
+    private final TableSchema schema;
+    private final FileFormatDiscover formatDiscover;
+    private final FileStorePathFactory pathFactory;
+    private final Map<FormatKey, FormatReaderMapping> formatReaderMappings;
+    private final boolean fileIndexReadEnabled;
+    private final boolean rowTrackingEnabled;
+    private final boolean ignoreCorruptFiles;
+    private final boolean ignoreLostFiles;
+
+    private RowType readRowType;
+    @Nullable private List<Predicate> filters;
+    @Nullable private TopN topN;
+    @Nullable private Integer limit;
+
+    public RawFileSplitRead(
+            FileIO fileIO,
+            SchemaManager schemaManager,
+            TableSchema schema,
+            RowType rowType,
+            FileFormatDiscover formatDiscover,
+            FileStorePathFactory pathFactory,
+            CoreOptions coreOptions) {
+        this.fileIO = fileIO;
+        this.schemaManager = schemaManager;
+        this.schema = schema;
+        this.formatDiscover = formatDiscover;
+        this.pathFactory = pathFactory;
+        this.formatReaderMappings = new HashMap<>();
+        this.fileIndexReadEnabled = coreOptions.fileIndexReadEnabled();
+        this.ignoreCorruptFiles = coreOptions.scanIgnoreCorruptFile();
+        this.ignoreLostFiles = coreOptions.scanIgnoreLostFile();
+        this.rowTrackingEnabled = coreOptions.rowTrackingEnabled();
+        this.readRowType = rowType;
+    }
+
+    @Override
+    public SplitRead<InternalRow> forceKeepDelete() {
+        return this;
+    }
+
+    @Override
+    public SplitRead<InternalRow> withIOManager(@Nullable IOManager ioManager) {
+        return this;
+    }
+
+    @Override
+    public SplitRead<InternalRow> withReadType(RowType readRowType) {
+        this.readRowType = readRowType;
+        return this;
+    }
+
+    @Override
+    public RawFileSplitRead withFilter(Predicate predicate) {
+        if (predicate != null) {
+            this.filters = splitAnd(predicate);
+        }
+        return this;
+    }
+
+    @Override
+    public SplitRead<InternalRow> withTopN(@Nullable TopN topN) {
+        this.topN = topN;
+        return this;
+    }
+
+    @Override
+    public SplitRead<InternalRow> withLimit(@Nullable Integer limit) {
+        this.limit = limit;
+        return this;
+    }
+
+    @Override
+    public RecordReader<InternalRow> createReader(Split s) throws IOException {
+        if (s instanceof DataSplit) {
+            DataSplit split = (DataSplit) s;
+            return createReader(
+                    split.partition(),
+                    split.bucket(),
+                    split.dataFiles(),
+                    split.deletionFiles().orElse(null));
+        } else {
+            IncrementalSplit split = (IncrementalSplit) s;
+            if (!split.beforeFiles().isEmpty()) {
+                LOG.info("Ignore split before files: {}", split.beforeFiles());
+            }
+            return createReader(
+                    split.partition(),
+                    split.bucket(),
+                    split.afterFiles(),
+                    split.afterDeletionFiles());
+        }
+    }
+
+    public RecordReader<InternalRow> createReader(
+            BinaryRow partition,
+            int bucket,
+            List<DataFileMeta> files,
+            List<DeletionFile> deletionFiles)
+            throws IOException {
+        DeletionVector.Factory dvFactory = DeletionVector.factory(fileIO, files, deletionFiles);
+        Map<String, IOExceptionSupplier<DeletionVector>> dvFactories = new HashMap<>();
+        for (DataFileMeta file : files) {
+            dvFactories.put(file.fileName(), () -> dvFactory.create(file.fileName()).orElse(null));
+        }
+        return createReader(partition, bucket, files, dvFactories);
+    }
+
+    public RecordReader<InternalRow> createReader(
+            BinaryRow partition,
+            int bucket,
+            List<DataFileMeta> files,
+            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories)
+            throws IOException {
+        DataFilePathFactory dataFilePathFactory =
+                pathFactory.createDataFilePathFactory(partition, bucket);
+        List<ReaderSupplier<InternalRow>> suppliers = new ArrayList<>();
+
+        Builder formatReaderMappingBuilder =
+                new Builder(
+                        formatDiscover,
+                        readRowType.getFields(),
+                        schema -> {
+                            if (rowTrackingEnabled) {
+                                // maybe file has no row id and sequence number, but in manifest
+                                // entry
+                                return rowTypeWithRowTracking(schema.logicalRowType(), true, true)
+                                        .getFields();
+                            }
+                            return schema.fields();
+                        },
+                        filters,
+                        topN,
+                        limit);
+
+        for (DataFileMeta file : files) {
+            suppliers.add(
+                    createFileReader(
+                            partition,
+                            dataFilePathFactory,
+                            file,
+                            formatReaderMappingBuilder,
+                            dvFactories));
+        }
+
+        return ConcatRecordReader.create(suppliers);
+    }
+
+    private ReaderSupplier<InternalRow> createFileReader(
+            BinaryRow partition,
+            DataFilePathFactory dataFilePathFactory,
+            DataFileMeta file,
+            Builder formatBuilder,
+            @Nullable Map<String, IOExceptionSupplier<DeletionVector>> dvFactories) {
+        String formatIdentifier = DataFilePathFactory.formatIdentifier(file.fileName());
+        long schemaId = file.schemaId();
+
+        FormatReaderMapping formatReaderMapping =
+                formatReaderMappings.computeIfAbsent(
+                        new FormatKey(file.schemaId(), formatIdentifier),
+                        key ->
+                                formatBuilder.build(
+                                        formatIdentifier,
+                                        schema,
+                                        schemaId == schema.id()
+                                                ? schema
+                                                : schemaManager.schema(schemaId)));
+
+        IOExceptionSupplier<DeletionVector> dvFactory =
+                dvFactories == null ? null : dvFactories.get(file.fileName());
+        return () ->
+                createFileReader(
+                        partition, file, dataFilePathFactory, formatReaderMapping, dvFactory);
+    }
+
+    private FileRecordReader<InternalRow> createFileReader(
+            BinaryRow partition,
+            DataFileMeta file,
+            DataFilePathFactory dataFilePathFactory,
+            FormatReaderMapping formatReaderMapping,
+            IOExceptionSupplier<DeletionVector> dvFactory)
+            throws IOException {
+        FileIndexResult fileIndexResult = null;
+        DeletionVector deletionVector = dvFactory == null ? null : dvFactory.get();
+        if (fileIndexReadEnabled) {
+            fileIndexResult =
+                    FileIndexEvaluator.evaluate(
+                            fileIO,
+                            formatReaderMapping.getDataSchema(),
+                            formatReaderMapping.getDataFilters(),
+                            formatReaderMapping.getTopN(),
+                            formatReaderMapping.getLimit(),
+                            dataFilePathFactory,
+                            file,
+                            deletionVector);
+            if (!fileIndexResult.remain()) {
+                return new EmptyFileRecordReader<>();
+            }
+        }
+
+        RoaringBitmap32 selection = null;
+        if (fileIndexResult instanceof BitmapIndexResult) {
+            selection = ((BitmapIndexResult) fileIndexResult).get();
+        }
+
+        FormatReaderContext formatReaderContext =
+                new FormatReaderContext(
+                        fileIO, dataFilePathFactory.toPath(file), file.fileSize(), selection);
+        FileRecordReader<InternalRow> fileRecordReader =
+                new DataFileRecordReader(
+                        schema.logicalRowType(),
+                        formatReaderMapping.getReaderFactory(),
+                        formatReaderContext,
+                        ignoreCorruptFiles,
+                        ignoreLostFiles,
+                        formatReaderMapping.getIndexMapping(),
+                        formatReaderMapping.getCastMapping(),
+                        PartitionUtils.create(formatReaderMapping.getPartitionPair(), partition),
+                        rowTrackingEnabled,
+                        file.firstRowId(),
+                        file.maxSequenceNumber(),
+                        formatReaderMapping.getSystemFields());
+
+        if (fileIndexResult instanceof BitmapIndexResult) {
+            fileRecordReader =
+                    new ApplyBitmapIndexRecordReader(
+                            fileRecordReader, (BitmapIndexResult) fileIndexResult);
+        }
+
+        if (deletionVector != null && !deletionVector.isEmpty()) {
+            return new ApplyDeletionVectorReader(fileRecordReader, deletionVector);
+        }
+        return fileRecordReader;
+    }
+}

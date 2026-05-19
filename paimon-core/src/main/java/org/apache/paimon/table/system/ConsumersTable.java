@@ -1,0 +1,273 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.system;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.consumer.ConsumerManager;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.predicate.And;
+import org.apache.paimon.predicate.CompoundPredicate;
+import org.apache.paimon.predicate.Equal;
+import org.apache.paimon.predicate.InPredicateVisitor;
+import org.apache.paimon.predicate.LeafPredicate;
+import org.apache.paimon.predicate.LeafPredicateExtractor;
+import org.apache.paimon.predicate.Or;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.ReadonlyTable;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.InnerTableRead;
+import org.apache.paimon.table.source.InnerTableScan;
+import org.apache.paimon.table.source.ReadOnceTableScan;
+import org.apache.paimon.table.source.SingletonSplit;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.types.BigIntType;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.IteratorRecordReader;
+import org.apache.paimon.utils.ProjectedRow;
+import org.apache.paimon.utils.SerializationUtils;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.Iterators;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalLong;
+
+import static org.apache.paimon.catalog.Identifier.SYSTEM_TABLE_SPLITTER;
+
+/** A {@link Table} for showing consumers of table. */
+public class ConsumersTable implements ReadonlyTable {
+
+    private static final long serialVersionUID = 1L;
+
+    public static final String CONSUMERS = "consumers";
+
+    public static final RowType TABLE_TYPE =
+            new RowType(
+                    Arrays.asList(
+                            new DataField(
+                                    0, "consumer_id", SerializationUtils.newStringType(false)),
+                            new DataField(1, "next_snapshot_id", new BigIntType(false))));
+
+    private final FileIO fileIO;
+    private final Path location;
+    private final String branch;
+
+    private final FileStoreTable dataTable;
+
+    public ConsumersTable(FileStoreTable dataTable) {
+        this.fileIO = dataTable.fileIO();
+        this.location = dataTable.location();
+        this.branch = CoreOptions.branch(dataTable.schema().options());
+        this.dataTable = dataTable;
+    }
+
+    @Override
+    public String name() {
+        return location.getName() + SYSTEM_TABLE_SPLITTER + CONSUMERS;
+    }
+
+    @Override
+    public RowType rowType() {
+        return TABLE_TYPE;
+    }
+
+    @Override
+    public List<String> primaryKeys() {
+        return Collections.singletonList("consumer_id");
+    }
+
+    @Override
+    public FileIO fileIO() {
+        return dataTable.fileIO();
+    }
+
+    @Override
+    public InnerTableScan newScan() {
+        return new ConsumersTable.ConsumersScan();
+    }
+
+    @Override
+    public InnerTableRead newRead() {
+        return new ConsumersTable.ConsumersRead(fileIO);
+    }
+
+    @Override
+    public Table copy(Map<String, String> dynamicOptions) {
+        return new ConsumersTable(dataTable.copy(dynamicOptions));
+    }
+
+    private class ConsumersScan extends ReadOnceTableScan {
+
+        @Override
+        public InnerTableScan withFilter(Predicate predicate) {
+            return this;
+        }
+
+        @Override
+        public Plan innerPlan() {
+            return () -> Collections.singletonList(new ConsumersTable.ConsumersSplit(location));
+        }
+    }
+
+    /** {@link Split} implementation for {@link ConsumersTable}. */
+    private static class ConsumersSplit extends SingletonSplit {
+
+        private static final long serialVersionUID = 1L;
+
+        private final Path location;
+
+        private ConsumersSplit(Path location) {
+            this.location = location;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ConsumersTable.ConsumersSplit that = (ConsumersTable.ConsumersSplit) o;
+            return Objects.equals(location, that.location);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(location);
+        }
+
+        @Override
+        public OptionalLong mergedRowCount() {
+            return OptionalLong.empty();
+        }
+    }
+
+    /** {@link TableRead} implementation for {@link ConsumersTable}. */
+    private class ConsumersRead implements InnerTableRead {
+
+        private final FileIO fileIO;
+        private RowType readType;
+        private final List<String> consumerIds = new ArrayList<>();
+
+        public ConsumersRead(FileIO fileIO) {
+            this.fileIO = fileIO;
+        }
+
+        @Override
+        public InnerTableRead withFilter(Predicate predicate) {
+            if (predicate == null) {
+                return this;
+            }
+
+            String leafName = "consumer_id";
+            if (predicate instanceof CompoundPredicate) {
+                CompoundPredicate compoundPredicate = (CompoundPredicate) predicate;
+                if ((compoundPredicate.function()) instanceof Or) {
+                    // optimize for IN filter
+                    InPredicateVisitor.extractInElements(predicate, leafName)
+                            .ifPresent(
+                                    leafs ->
+                                            leafs.forEach(
+                                                    leaf -> consumerIds.add(leaf.toString())));
+                } else if ((compoundPredicate.function()) instanceof And) {
+                    List<Predicate> children = compoundPredicate.children();
+                    for (Predicate leaf : children) {
+                        handleLeafPredicate(leaf, leafName);
+                    }
+                }
+            } else {
+                handleLeafPredicate(predicate, leafName);
+            }
+
+            return this;
+        }
+
+        public void handleLeafPredicate(Predicate predicate, String leafName) {
+            LeafPredicate consumerPred =
+                    predicate.visit(LeafPredicateExtractor.INSTANCE).get(leafName);
+            if (consumerPred != null && consumerPred.function() instanceof Equal) {
+                consumerIds.add(consumerPred.literals().get(0).toString());
+            }
+        }
+
+        @Override
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
+            return this;
+        }
+
+        @Override
+        public TableRead withIOManager(IOManager ioManager) {
+            return this;
+        }
+
+        @Override
+        public RecordReader<InternalRow> createReader(Split split) throws IOException {
+            if (!(split instanceof ConsumersTable.ConsumersSplit)) {
+                throw new IllegalArgumentException("Unsupported split: " + split.getClass());
+            }
+            Path location = ((ConsumersTable.ConsumersSplit) split).location;
+            Map<String, Long> consumers;
+            if (!consumerIds.isEmpty()) {
+                consumers = new HashMap<>();
+                ConsumerManager consumerManager = new ConsumerManager(fileIO, location, branch);
+                for (String consumerId : consumerIds) {
+                    consumerManager
+                            .consumer(consumerId)
+                            .ifPresent(
+                                    consumer -> consumers.put(consumerId, consumer.nextSnapshot()));
+                }
+            } else {
+                consumers = new ConsumerManager(fileIO, location, branch).consumers();
+            }
+            Iterator<InternalRow> rows =
+                    Iterators.transform(consumers.entrySet().iterator(), this::toRow);
+            if (readType != null) {
+                rows =
+                        Iterators.transform(
+                                rows,
+                                row ->
+                                        ProjectedRow.from(readType, ConsumersTable.TABLE_TYPE)
+                                                .replaceRow(row));
+            }
+            return new IteratorRecordReader<>(rows);
+        }
+
+        private InternalRow toRow(Map.Entry<String, Long> consumer) {
+            return GenericRow.of(BinaryString.fromString(consumer.getKey()), consumer.getValue());
+        }
+    }
+}

@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <artifactId>paimon-parent</artifactId>
+        <groupId>org.apache.paimon</groupId>
+        <version>1.4-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>paimon-native-io</artifactId>
+    <name>Paimon : Native IO</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.github.jnr</groupId>
+            <artifactId>jnr-ffi</artifactId>
+            <version>2.2.17</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-format</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-arrow</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <profile>
+            <id>native-io</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>shade-paimon</id>
+                                <configuration>
+                                    <artifactSet>
+                                        <includes combine.children="append">
+                                            <include>com.github.jnr:jnr-ffi</include>
+                                            <include>com.github.jnr:jffi</include>
+                                            <include>org.ow2.asm:asm</include>
+                                            <include>org.ow2.asm:asm-commons</include>
+                                            <include>org.ow2.asm:asm-analysis</include>
+                                            <include>org.ow2.asm:asm-tree</include>
+                                            <include>org.ow2.asm:asm-util</include>
+                                            <include>com.github.jnr:jnr-a64asm</include>
+                                            <include>com.github.jnr:jnr-x86asm</include>
+                                            <include>org.apache.paimon:paimon-arrow</include>
+                                            <include>org.apache.arrow:arrow-vector</include>
+                                            <include>org.apache.arrow:arrow-format</include>
+                                            <include>org.apache.arrow:arrow-c-data</include>
+                                            <include>org.apache.arrow:arrow-memory-core</include>
+                                            <include>org.apache.arrow:arrow-memory-unsafe</include>
+                                            <include>com.google.flatbuffers:flatbuffers-java</include>
+                                            <include>org.eclipse.collections:eclipse-collections</include>
+                                            <include>org.eclipse.collections:eclipse-collections-api</include>
+                                        </includes>
+                                    </artifactSet>
+                                    <relocations>
+                                        <relocation>
+                                            <pattern>org.objectweb.asm</pattern>
+                                            <shadedPattern>org.apache.paimon.shade.nativeio.org.objectweb.asm</shadedPattern>
+                                        </relocation>
+                                    </relocations>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>build-native-io</id>
+                                <phase>generate-resources</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>bash</executable>
+                                    <arguments>
+                                        <argument>-c</argument>
+                                        <argument>
+                                            set -euo pipefail;
+                                            cargo build --release --manifest-path rust/Cargo.toml;
+                                            os="$(uname -s | tr '[:upper:]' '[:lower:]')";
+                                            case "$os" in darwin*) os="darwin" ;; linux*) os="linux" ;; *) echo "Unsupported native-io OS: $os" >&amp;2; exit 1 ;; esac;
+                                            arch="$(uname -m)";
+                                            case "$arch" in arm64|aarch64) arch="aarch64" ;; x86_64|amd64) arch="x86_64" ;; *) echo "Unsupported native-io arch: $arch" >&amp;2; exit 1 ;; esac;
+                                            mkdir -p "${project.build.outputDirectory}/paimon-native-io/${os}/${arch}";
+                                            if [ "$os" = "darwin" ]; then lib="rust/target/release/libpaimon_native_io.dylib"; else lib="rust/target/release/libpaimon_native_io.so"; fi;
+                                            cp "$lib" "${project.build.outputDirectory}/paimon-native-io/${os}/${arch}/";
+                                        </argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

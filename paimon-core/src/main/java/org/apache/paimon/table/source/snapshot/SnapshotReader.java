@@ -1,0 +1,165 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.source.snapshot;
+
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.consumer.ConsumerManager;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.manifest.BucketEntry;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.operation.ManifestsReader;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.ScanMode;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.SplitGenerator;
+import org.apache.paimon.table.source.TableScan;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.BiFilter;
+import org.apache.paimon.utils.ChangelogManager;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.RowRangeIndex;
+import org.apache.paimon.utils.SnapshotManager;
+
+import javax.annotation.Nullable;
+
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
+/** Read splits from specified {@link Snapshot} with given configuration. */
+public interface SnapshotReader {
+
+    @Nullable
+    Integer parallelism();
+
+    SnapshotManager snapshotManager();
+
+    ChangelogManager changelogManager();
+
+    ManifestsReader manifestsReader();
+
+    List<ManifestEntry> readManifest(ManifestFileMeta manifest);
+
+    ConsumerManager consumerManager();
+
+    SplitGenerator splitGenerator();
+
+    FileStorePathFactory pathFactory();
+
+    SnapshotReader withSnapshot(long snapshotId);
+
+    SnapshotReader withSnapshot(Snapshot snapshot);
+
+    SnapshotReader withFilter(Predicate predicate);
+
+    SnapshotReader withPartitionFilter(Map<String, String> partitionSpec);
+
+    SnapshotReader withPartitionFilter(Predicate predicate);
+
+    SnapshotReader withPartitionFilter(List<BinaryRow> partitions);
+
+    SnapshotReader withPartitionFilter(PartitionPredicate partitionPredicate);
+
+    SnapshotReader withPartitionsFilter(List<Map<String, String>> partitions);
+
+    SnapshotReader withMode(ScanMode scanMode);
+
+    SnapshotReader withLevel(int level);
+
+    SnapshotReader withLevelFilter(Filter<Integer> levelFilter);
+
+    SnapshotReader withLevelMinMaxFilter(BiFilter<Integer, Integer> minMaxFilter);
+
+    SnapshotReader enableValueFilter();
+
+    SnapshotReader withManifestEntryFilter(Filter<ManifestEntry> filter);
+
+    SnapshotReader withBucket(int bucket);
+
+    SnapshotReader onlyReadRealBuckets();
+
+    SnapshotReader withBucketFilter(Filter<Integer> bucketFilter);
+
+    SnapshotReader withDataFileNameFilter(Filter<String> fileNameFilter);
+
+    SnapshotReader dropStats();
+
+    SnapshotReader keepStats();
+
+    SnapshotReader withShard(int indexOfThisSubtask, int numberOfParallelSubtasks);
+
+    SnapshotReader withMetricRegistry(MetricRegistry registry);
+
+    SnapshotReader withRowRanges(List<Range> rowRanges);
+
+    SnapshotReader withRowRangeIndex(RowRangeIndex rowRangeIndex);
+
+    SnapshotReader withReadType(RowType readType);
+
+    SnapshotReader withLimit(int limit);
+
+    /** Whether the pushed filter still contains non-partition predicates. */
+    boolean hasNonPartitionFilter();
+
+    /** Get splits plan from snapshot. */
+    Plan read();
+
+    /** Get splits plan from file changes. */
+    Plan readChanges();
+
+    Plan readIncrementalDiff(Snapshot before);
+
+    /** List partitions. */
+    List<BinaryRow> partitions();
+
+    List<PartitionEntry> partitionEntries();
+
+    List<BucketEntry> bucketEntries();
+
+    Iterator<ManifestEntry> readFileIterator();
+
+    /** Result plan of this scan. */
+    interface Plan extends TableScan.Plan {
+
+        @Nullable
+        Long watermark();
+
+        /**
+         * Snapshot id of this plan, return null if the table is empty or the manifest list is
+         * specified.
+         */
+        @Nullable
+        Long snapshotId();
+
+        /** Result splits. */
+        List<Split> splits();
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        default List<DataSplit> dataSplits() {
+            return (List) splits();
+        }
+    }
+}

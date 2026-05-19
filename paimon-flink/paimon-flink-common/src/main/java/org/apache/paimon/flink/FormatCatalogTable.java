@@ -1,0 +1,126 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink;
+
+import org.apache.paimon.table.FormatTable;
+
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.catalog.CatalogTable;
+import org.apache.flink.table.types.logical.RowType;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.apache.flink.connector.file.table.FileSystemConnectorOptions.PATH;
+import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
+import static org.apache.flink.table.factories.FactoryUtil.FORMAT;
+import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
+import static org.apache.paimon.flink.LogicalTypeConversion.toLogicalType;
+
+/** A {@link CatalogTable} to represent format table. */
+public class FormatCatalogTable implements CatalogTable {
+
+    private final FormatTable table;
+
+    private Map<String, String> cachedOptions;
+
+    public FormatCatalogTable(FormatTable table) {
+        this.table = table;
+    }
+
+    public FormatTable table() {
+        return table;
+    }
+
+    @Override
+    public Schema getUnresolvedSchema() {
+        final Schema.Builder builder = Schema.newBuilder();
+        RowType logicalType = toLogicalType(table.rowType());
+        logicalType
+                .getFields()
+                .forEach(
+                        field -> {
+                            builder.column(field.getName(), fromLogicalToDataType(field.getType()));
+                            if (field.getDescription().isPresent()) {
+                                builder.withComment(field.getDescription().get());
+                            }
+                        });
+        return builder.build();
+    }
+
+    @Override
+    public boolean isPartitioned() {
+        return !table.partitionKeys().isEmpty();
+    }
+
+    @Override
+    public List<String> getPartitionKeys() {
+        return table.partitionKeys();
+    }
+
+    @Override
+    public CatalogTable copy(Map<String, String> map) {
+        return new FormatCatalogTable(table.copy(map));
+    }
+
+    @Override
+    public Map<String, String> getOptions() {
+        if (cachedOptions == null) {
+            cachedOptions = new HashMap<>();
+            String format = table.format().name().toLowerCase();
+            Map<String, String> options = table.options();
+            options.forEach(
+                    (k, v) -> {
+                        if (k.startsWith(format + ".")) {
+                            cachedOptions.put(k, v);
+                        }
+                    });
+            if (options.containsKey("field-delimiter")) {
+                cachedOptions.put("csv.field-delimiter", options.get("field-delimiter"));
+            }
+            cachedOptions.put(CONNECTOR.key(), "filesystem");
+            cachedOptions.put(PATH.key(), table.location());
+            cachedOptions.put(FORMAT.key(), format);
+        }
+        return cachedOptions;
+    }
+
+    @Override
+    public String getComment() {
+        return table.comment().orElse("");
+    }
+
+    @Override
+    public CatalogTable copy() {
+        return copy(Collections.emptyMap());
+    }
+
+    @Override
+    public Optional<String> getDescription() {
+        return table.comment();
+    }
+
+    @Override
+    public Optional<String> getDetailedDescription() {
+        return getDescription();
+    }
+}

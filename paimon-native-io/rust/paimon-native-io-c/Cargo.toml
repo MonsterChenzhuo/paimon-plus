@@ -1,0 +1,20 @@
+[package]
+name = "paimon-native-io-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "paimon_native_io"
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+futures.workspace = true
+huaweicloud-sdk-rust-obs.workspace = true
+parquet.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true

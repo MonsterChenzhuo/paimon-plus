@@ -1,0 +1,19 @@
+[workspace]
+members = ["paimon-native-io-c"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "1.4.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+arrow-array = { version = "57", features = ["ffi"] }
+arrow-schema = "57"
+bytes = "1"
+futures = "0.3"
+parquet = { version = "57", default-features = true, features = ["arrow"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
+huaweicloud-sdk-rust-obs = { path = "../../../obs-rust-sdk" }

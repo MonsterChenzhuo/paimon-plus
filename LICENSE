@@ -199,3 +199,113 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+------------------------------------------------------------------------------------
+This product bundles various third-party components under other open source licenses.
+This section summarizes those components and their licenses. See licenses/
+for text of these licenses.
+
+Apache Software Foundation License 2.0
+--------------------------------------
+
+paimon-common/src/main/java/org/apache/paimon/fs/Path.java
+paimon-common/src/main/java/org/apache/paimon/fs/FileRange.java
+paimon-common/src/main/java/org/apache/paimon/fs/VectoredReadUtils.java
+from http://hadoop.apache.org/ version 2.10.2
+
+paimon-common/src/main/java/org/apache/paimon/utils/VarLengthIntUtils.java
+from https://github.com/linkedin/PalDB version 1.2.0
+
+paimon-filesystems/paimon-s3-impl/src/main/java/com/amazonaws/services/s3/model/transform/XmlResponsesSaxParser.java
+from https://github.com/aws/aws-sdk-java version 1.12.319
+
+paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/mysql/MySqlTypeUtils.java
+paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/mongodb/MongoDBContainer.java
+paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/postgres/PostgresTypeUtils.java
+from https://ververica.github.io/flink-cdc-connectors/ version 2.4.2
+
+paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/mysql/MySqlRecordParser.java
+paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/postgres/PostgresRecordParser.java
+from https://github.com/apache/doris-flink-connector/ version 1.4.0
+
+docs/static/js/flink.js
+paimon-common/src/main/java/org/apache/paimon/data/InternalRow.java
+paimon-common/src/main/java/org/apache/paimon/memory/MemorySegment.java
+paimon-common/src/main/java/org/apache/paimon/types/DataType.java
+paimon-common/src/main/java/org/apache/paimon/options/ConfigOption.java
+paimon-service/paimon-service-client/src/main/java/org/apache/paimon/service/network/NetworkClient.java
+paimon-service/paimon-service-client/src/main/java/org/apache/paimon/service/network/NetworkServer.java
+from http://flink.apache.org/ version 1.17.0
+
+paimon-common/src/main/java/org/apache/paimon/client/ClientPool.java
+paimon-core/src/main/java/org/apache/paimon/jdbc/JdbcCatalog.java
+paimon-core/src/main/java/org/apache/paimon/utils/ZOrderByteUtils.java
+paimon-core/src/test/java/org/apache/paimon/utils/TestZOrderByteUtil.java
+paimon-hive/paimon-hive-common/src/test/java/org/apache/paimon/hive/TestHiveMetastore.java
+paimon-hive/paimon-hive-connector-common/src/main/java/org/apache/paimon/hive/mapred/TezUtil.java
+paimon-spark/paimon-spark-common/src/main/antlr4/org.apache.spark.sql.catalyst.parser.extensions/PaimonSqlExtensions.g4
+paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/SparkGenericCatalog.java
+paimon-spark/paimon-spark-common/src/main/scala/org/apache/spark/sql/catalyst/analysis/CoerceArguments.scala
+paimon-spark/paimon-spark-common/src/main/scala/org/apache/spark/sql/catalyst/analysis/ResolveProcedures.scala
+paimon-spark/paimon-spark-common/src/main/scala/org/apache/spark/sql/catalyst/parser/extensions/PaimonSparkSqlExtensionsParser.scala
+paimon-spark/paimon-spark-common/src/main/scala/org/apache/spark/sql/catalyst/parser/extensions/PaimonSqlExtensionsAstBuilder.scala
+paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/sort/SparkZOrderUDF.java
+from http://iceberg.apache.org/ version 1.3.0
+
+paimon-common/src/main/java/org/apache/paimon/utils/OptimizedRoaringBitmap64.java
+paimon-core/src/main/java/org/apache/paimon/deletionvectors/Bitmap64DeletionVector.java
+from http://iceberg.apache.org/ version 1.8.1
+
+paimon-hive/paimon-hive-common/src/test/resources/hive-schema-3.1.0.derby.sql
+from https://hive.apache.org/ version 3.1.0
+
+paimon-format/src/main/java/org/apache/orc/impl/PhysicalFsWriter.java
+paimon-format/src/main/java/org/apache/orc/impl/WriterImpl.java
+paimon-format/src/main/java/org/apache/orc/impl/ZstdCodec.java
+paimon-format/src/main/java/org/apache/orc/impl/RecordReaderUtils.java
+paimon-format/src/main/java/org/apache/orc/CompressionKind.java
+paimon-format/src/main/java/org/apache/orc/OrcConf.java
+paimon-format/src/main/java/org/apache/orc/OrcFile.java
+from https://orc.apache.org/ version 2.0
+
+paimon-format/src/main/java/org/apache/parquet/hadoop/ParquetFileReader.java
+paimon-format/src/main/java/org/apache/parquet/hadoop/ParquetWriter.java
+from https://parquet.apache.org/ version 1.14.0
+
+paimon-common/src/main/java/org/apache/paimon/data/variant/GenericVariant.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/GenericVariantBuilder.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/GenericVariantUtil.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/ParquetColumnVector.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/ParquetReadState.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/ParquetVectorUpdater.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/ParquetVectorUpdaterFactory.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/RowIndexGenerator.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedColumnReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedDeltaBinaryPackedReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedDeltaByteArrayReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedDeltaLengthByteArrayReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedParquetRecordReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedPlainValuesReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedReaderBase.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedRleValuesReader.java
+paimon-format/src/main/java/org/apache/paimon/format/parquet/newReader/VectorizedValuesReader.java
+paimon-format/test/main/java/org/apache/paimon/format/parquet/newReader/DeltaByteArrayEncodingTest.java
+paimon-format/test/main/java/org/apache/paimon/format/parquet/newReader/DeltaEncodingTest.java
+paimon-format/test/main/java/org/apache/paimon/format/parquet/newReader/DeltaLengthByteArrayEncodingTest.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/ShreddingUtils.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/VariantSchema.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/VariantShreddingWriter.java
+paimon-common/src/main/java/org/apache/paimon/data/variant/BaseVariantReader.java
+from https://spark.apache.org/ version 4.0.0-preview2
+
+MIT License
+-----------
+
+docs/assets/github.css (css generated by Hugo) from https://github.com/alecthomas/chroma version 2
+docs/static/js/anchor.min.js from https://github.com/bryanbraun/anchorjs version 5.0
+docs/static/js/redoc.standalone.js from https://github.com/Redocly/redoc version 2.0.0
+
+BSD License
+------------
+
+paimon-common/src/main/antlr4/* from https://github.com/antlr/grammars-v4 version 1.0

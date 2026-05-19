@@ -1,0 +1,45 @@
+### OS ###
+.DS_Store
+
+### IDE ###
+# IntelliJ IDEA
+.idea/*
+!.idea/vcs.xml
+!.idea/icon.png
+*.iml
+*.ipr
+*.iws
+paimon-python/.idea/
+# VS Code
+.vscode/
+# Eclipse
+.classpath
+.metadata
+.project
+.settings
+
+### AI Assistants ###
+.claude
+.cursor
+.qoder
+
+### Java / Maven ###
+target
+dependency-reduced-pom.xml
+metastore_db/
+*.class
+*.jar
+!**/resources/**/*.jar
+*.log
+.java-version
+.version.properties
+
+### Python ###
+*.pyc
+paimon-python/dist/
+paimon-python/*.egg-info/
+paimon-python/dev/log
+
+### Misc ###
+*.swp
+.cache

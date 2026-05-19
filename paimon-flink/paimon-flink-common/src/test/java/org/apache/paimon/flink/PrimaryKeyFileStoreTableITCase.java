@@ -1,0 +1,1789 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.FileSystemCatalog;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.flink.action.CompactAction;
+import org.apache.paimon.flink.util.AbstractTestBase;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.fs.local.LocalFileIOLoader;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.utils.FailingFileIO;
+import org.apache.paimon.utils.StringUtils;
+import org.apache.paimon.utils.TraceableFileIO;
+
+import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.configuration.ExecutionOptions;
+import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.TableResult;
+import org.apache.flink.table.api.config.ExecutionConfigOptions;
+import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
+import org.apache.flink.util.CloseableIterator;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_WRITER_COORDINATOR_ENABLED;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+
+/** Tests for changelog table with primary keys. */
+public class PrimaryKeyFileStoreTableITCase extends AbstractTestBase {
+
+    // This test is to discover unknown consistency bugs.
+    // When this test fails, look carefully into its core reason.
+    // Do not simply increase the timeout and pretend that everything is OK.
+    private static final int TIMEOUT = 180;
+    private static final Logger LOG = LoggerFactory.getLogger(PrimaryKeyFileStoreTableITCase.class);
+
+    // ------------------------------------------------------------------------
+    //  Test Utilities
+    // ------------------------------------------------------------------------
+    private String path;
+    private Map<String, String> tableDefaultProperties;
+    private String externalPath1;
+    private String externalPath2;
+
+    @BeforeEach
+    public void before() throws IOException {
+        path = getTempDirPath();
+        externalPath1 = getTempDirPath();
+        externalPath2 = getTempDirPath();
+
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        tableDefaultProperties = new HashMap<>();
+        if (random.nextBoolean()) {
+            tableDefaultProperties.put(CoreOptions.LOCAL_MERGE_BUFFER_SIZE.key(), "5m");
+        }
+        if (random.nextBoolean()) {
+            tableDefaultProperties.put(SINK_WRITER_COORDINATOR_ENABLED.key(), "true");
+        }
+    }
+
+    private String createCatalogSql(String catalogName, String warehouse) {
+
+        return createCatalogSql(catalogName, warehouse, "");
+    }
+
+    private String createCatalogSql(String catalogName, String warehouse, String catalogOptions) {
+        String defaultPropertyString = "";
+        if (!tableDefaultProperties.isEmpty()) {
+            defaultPropertyString = ", ";
+            defaultPropertyString +=
+                    tableDefaultProperties.entrySet().stream()
+                            .map(
+                                    e ->
+                                            String.format(
+                                                    "'table-default.%s' = '%s'",
+                                                    e.getKey(), e.getValue()))
+                            .collect(Collectors.joining(", "));
+        }
+        if (!StringUtils.isNullOrWhitespaceOnly(catalogOptions)) {
+            return String.format(
+                    "CREATE CATALOG `%s` WITH ( 'type' = 'paimon', 'warehouse' = '%s' %s, %s )",
+                    catalogName, warehouse, defaultPropertyString, catalogOptions);
+        }
+
+        return String.format(
+                "CREATE CATALOG `%s` WITH ( 'type' = 'paimon', 'warehouse' = '%s' %s )",
+                catalogName, warehouse, defaultPropertyString);
+    }
+
+    private CloseableIterator<Row> collect(TableResult result) {
+        return collect(result, TIMEOUT);
+    }
+
+    private CloseableIterator<Row> collect(TableResult result, int timeout) {
+        JobClient client = result.getJobClient().get();
+        Thread timeoutThread =
+                new Thread(
+                        () -> {
+                            for (int i = 0; i < timeout; i++) {
+                                try {
+                                    Thread.sleep(1000);
+                                    if (client.getJobStatus().get().isGloballyTerminalState()) {
+                                        return;
+                                    }
+                                } catch (Exception e) {
+                                    // If we can't get job status, assume the job has terminated.
+                                    // This handles cases where MiniCluster has already shut down.
+                                    // Similar to Flink's CollectResultFetcher behavior.
+                                    return;
+                                }
+                            }
+                            // Only cancel if job is not already terminated
+                            try {
+                                if (!client.getJobStatus().get().isGloballyTerminalState()) {
+                                    client.cancel();
+                                }
+                            } catch (Exception e) {
+                                // If we can't check status or cancel, assume job has terminated.
+                                // This handles IllegalStateException when MiniCluster is shut down.
+                            }
+                        });
+        timeoutThread.start();
+        return result.collect();
+    }
+
+    // ------------------------------------------------------------------------
+    //  Constructed Tests
+    // ------------------------------------------------------------------------
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testFullCompactionTriggerInterval() throws Exception {
+        innerTestChangelogProducing(
+                Arrays.asList(
+                        "'changelog-producer' = 'full-compaction'",
+                        "'full-compaction.delta-commits' = '3'"));
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testFullCompactionWithLongCheckpointInterval() throws Exception {
+        // create table
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().parallelism(1).build();
+        bEnv.executeSql(createCatalogSql("testCatalog", path));
+        bEnv.executeSql("USE CATALOG testCatalog");
+        bEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "  k INT,"
+                        + "  v INT,"
+                        + "  PRIMARY KEY (k) NOT ENFORCED"
+                        + ") WITH ("
+                        + "  'bucket' = '1',"
+                        + "  'changelog-producer' = 'full-compaction',"
+                        + "  'write-only' = 'true'"
+                        + ")");
+
+        // run select job
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(100)
+                        .parallelism(1)
+                        .build();
+        sEnv.executeSql(createCatalogSql("testCatalog", path));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T"));
+
+        // run compact job
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(2000)
+                        .build();
+        env.setParallelism(1);
+        new CompactAction(
+                        "default",
+                        "T",
+                        Collections.singletonMap("warehouse", path),
+                        Collections.emptyMap())
+                .withStreamExecutionEnvironment(env)
+                .build();
+        JobClient client = env.executeAsync();
+
+        // write records for a while
+        long startMs = System.currentTimeMillis();
+        int currentKey = 0;
+        while (System.currentTimeMillis() - startMs <= 10000) {
+            currentKey++;
+            bEnv.executeSql(
+                            String.format(
+                                    "INSERT INTO T VALUES (%d, %d)", currentKey, currentKey * 100))
+                    .await();
+        }
+
+        assertThat(client.getJobStatus().get()).isEqualTo(JobStatus.RUNNING);
+
+        for (int i = 1; i <= currentKey; i++) {
+            assertThat(it.hasNext()).isTrue();
+            assertThat(it.next().toString()).isEqualTo(String.format("+I[%d, %d]", i, i * 100));
+        }
+        it.close();
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testLookupChangelog() throws Exception {
+        innerTestChangelogProducing(Collections.singletonList("'changelog-producer' = 'lookup'"));
+    }
+
+    @Test
+    public void testTableReadWriteWithExternalPathRoundRobin() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths =
+                TraceableFileIO.SCHEME
+                        + "://"
+                        + externalPath1.toString()
+                        + ","
+                        + LocalFileIOLoader.SCHEME
+                        + "://"
+                        + externalPath2.toString();
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'round-robin'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (1, 'A')").await();
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (2, 'B')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (3, 'C')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+    }
+
+    @Test
+    public void testTableReadWriteWithExternalPathWeightRobin() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths =
+                TraceableFileIO.SCHEME
+                        + "://"
+                        + externalPath1.toString()
+                        + ","
+                        + LocalFileIOLoader.SCHEME
+                        + "://"
+                        + externalPath2.toString();
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'write-only' = 'true',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'weight-robin',"
+                        + "'data-file.external-paths.weights' = '10,5'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        int fileNum = 30;
+        for (int i = 1; i <= fileNum; i++) {
+            sEnv.executeSql("INSERT INTO T2 VALUES (" + i + ", 'data" + i + "')").await();
+        }
+
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < fileNum; i++) {
+            actual.add(it.next().toString());
+        }
+        // Verify all data is readable
+        assertThat(actual).hasSize(fileNum);
+
+        long filesInPath1 = 0;
+        long filesInPath2 = 0;
+        try {
+            filesInPath1 = Files.list(Paths.get(externalPath1.toString() + "/bucket-0")).count();
+            filesInPath2 = Files.list(Paths.get(externalPath2.toString() + "/bucket-0")).count();
+
+        } catch (NoSuchFileException ignored) {
+        }
+        long totalFiles = filesInPath1 + filesInPath2;
+
+        // Since the file sample size is small in IT case, we only verify the writing and reading
+        // For tests on file distribution by weights, see WeightedExternalPathProviderTest
+        assertThat(totalFiles).isEqualTo(fileNum);
+    }
+
+    @Test
+    public void testDropTableWithExternalPaths() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths =
+                TraceableFileIO.SCHEME
+                        + "://"
+                        + externalPath1
+                        + ","
+                        + LocalFileIOLoader.SCHEME
+                        + "://"
+                        + externalPath2;
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'round-robin'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (1, 'A')").await();
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (2, 'B')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (3, 'C')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+
+        // drop table
+        sEnv.executeSql("DROP TABLE T2");
+
+        LocalFileIO fileIO = LocalFileIO.create();
+        assertThat(fileIO.exists(new Path(path + "/warehouse" + "/default.db" + "/T2"))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath1))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath2))).isFalse();
+    }
+
+    @Test
+    public void testDropTableWithAlterExternalPaths() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths = TraceableFileIO.SCHEME + "://" + externalPath1;
+        String externalPath2s = LocalFileIOLoader.SCHEME + "://" + externalPath2;
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'round-robin'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (1, 'A')").await();
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (2, 'B')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        // alter table external path
+        sEnv.executeSql(
+                "ALTER TABLE T2 SET ( "
+                        + "'data-file.external-paths' = '"
+                        + externalPath2s
+                        + "'"
+                        + ")");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (3, 'C')").await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+
+        LocalFileIO fileIO = LocalFileIO.create();
+
+        assertThat(fileIO.exists(new Path(externalPath1))).isTrue();
+        assertThat(fileIO.exists(new Path(externalPath2))).isTrue();
+
+        // drop table
+        sEnv.executeSql("DROP TABLE T2");
+
+        assertThat(fileIO.exists(new Path(path + "/warehouse" + "/default.db" + "/T2"))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath1))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath2))).isFalse();
+    }
+
+    @Test
+    public void testDropTableWithBranchExternalPaths() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths = TraceableFileIO.SCHEME + "://" + externalPath1;
+        String externalPath2s = LocalFileIOLoader.SCHEME + "://" + externalPath2;
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'round-robin'"
+                        + ")");
+
+        // create branch
+        sEnv.executeSql(
+                String.format("CALL sys.create_branch('%s.%s', 'branch1')", "default", "T2"));
+
+        // insert data to branch
+        sEnv.executeSql("INSERT INTO T2/*+ OPTIONS('branch' = 'branch1') */ VALUES (1, 'A')")
+                .await();
+
+        CloseableIterator<Row> it =
+                collect(sEnv.executeSql("SELECT * FROM T2 /*+ OPTIONS('branch' = 'branch1') */"));
+
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        String sql =
+                String.format(
+                        "ALTER TABLE `T2$branch_branch1` SET ( 'data-file.external-paths' = '%s')",
+                        externalPath2s);
+        sEnv.executeSql(sql);
+        // insert data
+        sEnv.executeSql("INSERT INTO T2/*+ OPTIONS('branch' = 'branch1') */ VALUES (2, 'B')")
+                .await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        // alter table external path
+        sEnv.executeSql(
+                "ALTER TABLE T2 SET ( "
+                        + "'data-file.external-paths' = '"
+                        + externalPath2s
+                        + "'"
+                        + ")");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2/*+ OPTIONS('branch' = 'branch1') */ VALUES (3, 'C')")
+                .await();
+
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+
+        LocalFileIO fileIO = LocalFileIO.create();
+
+        assertThat(fileIO.exists(new Path(externalPath1))).isTrue();
+        assertThat(fileIO.exists(new Path(externalPath2))).isTrue();
+
+        // drop table
+        sEnv.executeSql("DROP TABLE T2");
+
+        assertThat(fileIO.exists(new Path(path + "/warehouse" + "/default.db" + "/T2"))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath1))).isFalse();
+        assertThat(fileIO.exists(new Path(externalPath2))).isFalse();
+    }
+
+    @Test
+    public void testTableReadWriteWithExternalPathSpecificFS() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths =
+                TraceableFileIO.SCHEME
+                        + "://"
+                        + externalPath1.toString()
+                        + ","
+                        + "fake://"
+                        + externalPath2.toString();
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '1',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'specific-fs',"
+                        + "'data-file.external-paths.specific-fs' = 'traceable'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (1, 'A')").await();
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (2, 'B'), (3, 'C')").await();
+
+        for (int i = 0; i < 2; i++) {
+            actual.add(it.next().toString());
+        }
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]");
+    }
+
+    @Test
+    public void testTableReadWriteWithChangedExternalPath() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        String externalPaths1 = TraceableFileIO.SCHEME + "://" + externalPath1.toString();
+        String externalPaths2 = LocalFileIOLoader.SCHEME + "://" + externalPath2.toString();
+
+        int bucket = ThreadLocalRandom.current().nextBoolean() ? 1 : -1;
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v INT, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '"
+                        + bucket
+                        + "',"
+                        + "'sink.writer-refresh-detectors' = 'external-paths',"
+                        + "'data-file.external-paths' = '"
+                        + externalPaths1
+                        + "',"
+                        + "'data-file.external-paths.strategy' = 'round-robin'"
+                        + ")");
+
+        // Create a datagen source table
+        sEnv.executeSql(
+                "CREATE TEMPORARY TABLE datagen_source (k INT, v INT) WITH ("
+                        + "'connector' = 'datagen', "
+                        + "'rows-per-second' = '1', "
+                        + "'fields.k.kind' = 'sequence', "
+                        + "'fields.k.start' = '1', "
+                        + "'fields.k.end' = '5', "
+                        + "'fields.v.kind' = 'sequence', "
+                        + "'fields.v.start' = '1', "
+                        + "'fields.v.end' = '5'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // Insert data from datagen source into T2
+        sEnv.executeSql("INSERT INTO T2 SELECT * FROM datagen_source");
+
+        sEnv.executeSql(
+                "ALTER TABLE T2 SET ( "
+                        + "'data-file.external-paths' = '"
+                        + externalPaths2
+                        + "'"
+                        + ")");
+
+        // Read and verify the data
+        List<String> resultRows = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            resultRows.add(it.next().toString());
+        }
+
+        assertThat(resultRows)
+                .containsExactlyInAnyOrder(
+                        "+I[1, 1]", "+I[2, 2]", "+I[3, 3]", "+I[4, 4]", "+I[5, 5]");
+
+        LocalFileIO fileIO = LocalFileIO.create();
+        assertThat(fileIO.exists(new Path(externalPath1))).isTrue();
+        assertThat(fileIO.exists(new Path(externalPath2))).isTrue();
+        assertThat(fileIO.listStatus(new Path(externalPath1)).length).isGreaterThanOrEqualTo(1);
+        assertThat(fileIO.listStatus(new Path(externalPath2)).length).isGreaterThanOrEqualTo(1);
+    }
+
+    @Test
+    public void testTableReadWriteBranch() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        sEnv.executeSql(
+                "CREATE TABLE T2 ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '2'"
+                        + ")");
+
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T2"));
+
+        // insert data
+        sEnv.executeSql("INSERT INTO T2 VALUES (1, 'A')").await();
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 1; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual).containsExactlyInAnyOrder("+I[1, A]");
+
+        // create tag
+        sEnv.executeSql(
+                String.format("CALL sys.create_tag('%s.%s', 'tag2', 1, '5 d')", "default", "T2"));
+        // create branch
+        sEnv.executeSql(
+                String.format(
+                        "CALL sys.create_branch('%s.%s', 'branch1', 'tag2')", "default", "T2"));
+        // alter table
+        sEnv.executeSql("ALTER TABLE T2 SET ('changelog-producer'='full-compaction')");
+
+        CloseableIterator<Row> branchIt =
+                collect(sEnv.executeSql("select * from T2 /*+ OPTIONS('branch' = 'branch1') */"));
+        // insert data to branch
+        sEnv.executeSql(
+                        "INSERT INTO T2/*+ OPTIONS('branch' = 'branch1') */ VALUES (10, 'v10'),(11, 'v11'),(12, 'v12')")
+                .await();
+
+        // read initial data
+        List<String> actualBranch = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            actualBranch.add(branchIt.next().toString());
+        }
+        assertThat(actualBranch)
+                .containsExactlyInAnyOrder("+I[1, A]", "+I[10, v10]", "+I[11, v11]", "+I[12, v12]");
+
+        it.close();
+        branchIt.close();
+    }
+
+    private void innerTestChangelogProducing(List<String> options) throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(ThreadLocalRandom.current().nextInt(900) + 100)
+                        .parallelism(1)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        sEnv.executeSql(
+                "CREATE TABLE T ( k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED ) "
+                        + "WITH ( "
+                        + "'bucket' = '2', "
+                        // producers will very quickly produce snapshots,
+                        // so consumers should also discover new snapshots quickly
+                        + "'continuous.discovery-interval' = '1ms', "
+                        + String.join(", ", options)
+                        + ")");
+
+        Path inputPath = new Path(path, "input");
+        LocalFileIO.create().mkdirs(inputPath);
+        sEnv.executeSql(
+                "CREATE TABLE `default_catalog`.`default_database`.`S` ( i INT, g STRING ) "
+                        + "WITH ( 'connector' = 'filesystem', 'format' = 'testcsv', 'path' = '"
+                        + inputPath
+                        + "', 'source.monitor-interval' = '500ms' )");
+
+        sEnv.executeSql(
+                "INSERT INTO T SELECT SUM(i) AS k, g AS v FROM `default_catalog`.`default_database`.`S` GROUP BY g");
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T"));
+
+        // write initial data
+        sEnv.executeSql(
+                        "INSERT INTO `default_catalog`.`default_database`.`S` "
+                                + "VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D')")
+                .await();
+
+        // read initial data
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual)
+                .containsExactlyInAnyOrder("+I[1, A]", "+I[2, B]", "+I[3, C]", "+I[4, D]");
+
+        // write update data
+        sEnv.executeSql(
+                        "INSERT INTO `default_catalog`.`default_database`.`S` "
+                                + "VALUES (1, 'D'), (1, 'C'), (1, 'B'), (1, 'A')")
+                .await();
+
+        // read update data
+        actual.clear();
+        for (int i = 0; i < 8; i++) {
+            actual.add(it.next().toString());
+        }
+
+        assertThat(actual)
+                .containsExactlyInAnyOrder(
+                        "-D[1, A]",
+                        "-U[2, B]",
+                        "+U[2, A]",
+                        "-U[3, C]",
+                        "+U[3, B]",
+                        "-U[4, D]",
+                        "+U[4, C]",
+                        "+I[5, D]");
+
+        it.close();
+    }
+
+    @Test
+    public void testBatchJobWithConflictAndRestart() throws Exception {
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().allowRestart(10).build();
+        tEnv.executeSql(
+                "CREATE CATALOG mycat WITH ( 'type' = 'paimon', 'warehouse' = '" + path + "' )");
+        tEnv.executeSql("USE CATALOG mycat");
+        tEnv.executeSql(
+                "CREATE TABLE t ( k INT, v INT, PRIMARY KEY (k) NOT ENFORCED ) "
+                        // force compaction for each commit
+                        + "WITH ( 'bucket' = '2', 'full-compaction.delta-commits' = '1' )");
+        // write some basic records
+        tEnv.executeSql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").await();
+
+        // two batch jobs compact at the same time
+        // let writer's parallelism > 1, so it cannot be chained with committer
+        TableResult result1 =
+                tEnv.executeSql(
+                        "INSERT INTO t /*+ OPTIONS('sink.parallelism' = '2') */ VALUES (1, 11), (2, 21), (3, 31)");
+        TableResult result2 =
+                tEnv.executeSql(
+                        "INSERT INTO t /*+ OPTIONS('sink.parallelism' = '2') */ VALUES (1, 12), (2, 22), (3, 32)");
+
+        result1.await();
+        result2.await();
+
+        try (CloseableIterator<Row> it = collect(tEnv.executeSql("SELECT * FROM t"))) {
+            for (int i = 0; i < 3; i++) {
+                assertThat(it).hasNext();
+                Row row = it.next();
+                assertThat(row.getField(1)).isNotEqualTo((int) row.getField(0) * 10);
+            }
+        }
+    }
+
+    @Timeout(TIMEOUT)
+    @ParameterizedTest()
+    @ValueSource(booleans = {false, true})
+    public void testRecreateTableWithException(boolean isReloadData) throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        bEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        bEnv.executeSql("USE CATALOG testCatalog");
+        bEnv.executeSql(
+                "CREATE TABLE t ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) "
+                        + "WITH ("
+                        + "    'bucket' = '2'\n"
+                        + "    ,'continuous.discovery-interval' = '1s'\n"
+                        + ")");
+
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .parallelism(4)
+                        .checkpointIntervalMs(1000)
+                        .build();
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM t"));
+
+        // first write
+        List<String> values = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            values.add(String.format("(0, %d, %d)", i, i));
+            values.add(String.format("(1, %d, %d)", i, i));
+        }
+        bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+        List<Row> expected = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            expected.add(Row.ofKind(RowKind.INSERT, 0, i, i));
+            expected.add(Row.ofKind(RowKind.INSERT, 1, i, i));
+        }
+        assertStreamingResult(it, expected);
+
+        // second write
+        values.clear();
+        for (int i = 0; i < 10; i++) {
+            values.add(String.format("(0, %d, %d)", i, i + 1));
+            values.add(String.format("(1, %d, %d)", i, i + 1));
+        }
+        bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+
+        // start a read job
+        for (int i = 0; i < 10; i++) {
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 0, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 1, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 0, i, i + 1));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 1, i, i + 1));
+        }
+        assertStreamingResult(it, expected.subList(20, 60));
+
+        // delete table and recreate a same table
+        bEnv.executeSql("DROP TABLE t");
+        bEnv.executeSql(
+                "CREATE TABLE t ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) "
+                        + "WITH ("
+                        + "    'bucket' = '2'\n"
+                        + ")");
+
+        // if reload data, it will generate a new snapshot for recreated table
+        if (isReloadData) {
+            bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+        }
+        assertThatCode(it::next)
+                .rootCause()
+                .hasMessageContaining(
+                        "The next expected snapshot is too big! Most possible cause might be the table had been recreated.");
+    }
+
+    @Test
+    public void testDeleteFallbackBranch() {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        bEnv.executeSql(
+                createCatalogSql("testCatalog", path + "/warehouse", "'cache-enabled' = 'false'"));
+        bEnv.executeSql("USE CATALOG testCatalog");
+        bEnv.executeSql(
+                "CREATE TABLE t ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) "
+                        + "WITH ("
+                        + "    'bucket' = '2'\n"
+                        + "    ,'continuous.discovery-interval' = '1s'\n"
+                        + ")");
+        bEnv.executeSql("CALL sys.create_branch('default.t', 'branch1')");
+        bEnv.executeSql("ALTER TABLE t SET ('scan.fallback-branch' = 'branch1')");
+        // branch1 is fallback branch, can not be deleted
+        assertThatCode(() -> bEnv.executeSql("CALL sys.delete_branch('default.t', 'branch1')"))
+                .rootCause()
+                .hasMessageContaining(
+                        "Cannot delete branch 'branch1' because it is configured as 'scan.fallback-branch'.");
+
+        // reset scan.fallback-branch
+        bEnv.executeSql("ALTER TABLE t RESET ('scan.fallback-branch')");
+        bEnv.executeSql("CALL sys.delete_branch('default.t', 'branch1')");
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testChangelogCompactInBatchWrite() throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        String catalogDdl =
+                "CREATE CATALOG mycat WITH ( 'type' = 'paimon', 'warehouse' = '" + path + "' )";
+        bEnv.executeSql(catalogDdl);
+        bEnv.executeSql("USE CATALOG mycat");
+        bEnv.executeSql(
+                "CREATE TABLE t ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) "
+                        + "WITH ("
+                        + "    'bucket' = '10',\n"
+                        + "    'changelog-producer' = 'lookup',\n"
+                        + "    'precommit-compact' = 'true',\n"
+                        + "    'snapshot.num-retained.min' = '3',\n"
+                        + "    'snapshot.num-retained.max' = '3'\n"
+                        + ")");
+
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder().streamingMode().checkpointIntervalMs(1000).build();
+        sEnv.executeSql(catalogDdl);
+        sEnv.executeSql("USE CATALOG mycat");
+
+        List<String> values = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            values.add(String.format("(0, %d, %d)", i, i));
+            values.add(String.format("(1, %d, %d)", i, i));
+        }
+        bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+
+        List<String> compactedChangelogs2 = listAllFilesWithPrefix("compacted-changelog-");
+        assertThat(compactedChangelogs2).hasSize(2);
+        assertThat(listAllFilesWithPrefix("changelog-")).isEmpty();
+
+        List<Row> expected = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            expected.add(Row.ofKind(RowKind.INSERT, 0, i, i));
+            expected.add(Row.ofKind(RowKind.INSERT, 1, i, i));
+        }
+        assertStreamingResult(
+                sEnv.executeSql("SELECT * FROM t /*+ OPTIONS('scan.snapshot-id' = '1') */"),
+                expected);
+
+        values.clear();
+        for (int i = 0; i < 1000; i++) {
+            values.add(String.format("(0, %d, %d)", i, i + 1));
+            values.add(String.format("(1, %d, %d)", i, i + 1));
+        }
+        bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+
+        assertThat(listAllFilesWithPrefix("compacted-changelog-")).hasSize(4);
+        assertThat(listAllFilesWithPrefix("changelog-")).isEmpty();
+
+        for (int i = 0; i < 1000; i++) {
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 0, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 1, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 0, i, i + 1));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 1, i, i + 1));
+        }
+        assertStreamingResult(
+                sEnv.executeSql("SELECT * FROM t /*+ OPTIONS('scan.snapshot-id' = '1') */"),
+                expected);
+
+        values.clear();
+        for (int i = 0; i < 1000; i++) {
+            values.add(String.format("(0, %d, %d)", i, i + 2));
+            values.add(String.format("(1, %d, %d)", i, i + 2));
+        }
+        bEnv.executeSql("INSERT INTO t VALUES " + String.join(", ", values)).await();
+
+        assertThat(listAllFilesWithPrefix("compacted-changelog-")).hasSize(4);
+        assertThat(listAllFilesWithPrefix("changelog-")).isEmpty();
+        LocalFileIO fileIO = LocalFileIO.create();
+        for (String p : compactedChangelogs2) {
+            assertThat(fileIO.exists(new Path(p))).isFalse();
+        }
+
+        expected = expected.subList(2000, 6000);
+        for (int i = 0; i < 1000; i++) {
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 0, i, i + 1));
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 1, i, i + 1));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 0, i, i + 2));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 1, i, i + 2));
+        }
+        assertStreamingResult(
+                sEnv.executeSql("SELECT * FROM t /*+ OPTIONS('scan.snapshot-id' = '1') */"),
+                expected);
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testChangelogCompactInStreamWrite() throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(2000)
+                        .parallelism(4)
+                        .build();
+
+        sEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        sEnv.executeSql("USE CATALOG testCatalog");
+        sEnv.executeSql(
+                "CREATE TABLE t ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED ) "
+                        + "PARTITIONED BY (pt) "
+                        + "WITH ("
+                        + "    'bucket' = '10',\n"
+                        + "    'changelog-producer' = 'lookup',\n"
+                        + "    'precommit-compact' = 'true'\n"
+                        + ")");
+
+        Path inputPath = new Path(path, "input");
+        LocalFileIO.create().mkdirs(inputPath);
+        sEnv.executeSql(
+                "CREATE TABLE `default_catalog`.`default_database`.`s` ( pt INT, k INT, v INT, PRIMARY KEY (pt, k) NOT ENFORCED) "
+                        + "WITH ( 'connector' = 'filesystem', 'format' = 'testcsv', 'path' = '"
+                        + inputPath
+                        + "', 'source.monitor-interval' = '500ms' )");
+
+        sEnv.executeSql("INSERT INTO t SELECT * FROM `default_catalog`.`default_database`.`s`");
+        CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM t"));
+
+        // write initial data
+        List<String> values = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            values.add(String.format("(0, %d, %d)", i, i));
+            values.add(String.format("(1, %d, %d)", i, i));
+        }
+        sEnv.executeSql(
+                        "INSERT INTO `default_catalog`.`default_database`.`s` VALUES "
+                                + String.join(", ", values))
+                .await();
+
+        List<Row> expected = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            expected.add(Row.ofKind(RowKind.INSERT, 0, i, i));
+            expected.add(Row.ofKind(RowKind.INSERT, 1, i, i));
+        }
+        assertStreamingResult(it, expected);
+
+        List<String> compactedChangelogs2 = listAllFilesWithPrefix("compacted-changelog-");
+        assertThat(compactedChangelogs2).hasSize(2);
+        assertThat(listAllFilesWithPrefix("changelog-")).isEmpty();
+
+        // write update data
+        values.clear();
+        for (int i = 0; i < 100; i++) {
+            values.add(String.format("(0, %d, %d)", i, i + 1));
+            values.add(String.format("(1, %d, %d)", i, i + 1));
+        }
+        sEnv.executeSql(
+                        "INSERT INTO `default_catalog`.`default_database`.`s` VALUES "
+                                + String.join(", ", values))
+                .await();
+        for (int i = 0; i < 100; i++) {
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 0, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_BEFORE, 1, i, i));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 0, i, i + 1));
+            expected.add(Row.ofKind(RowKind.UPDATE_AFTER, 1, i, i + 1));
+        }
+        assertStreamingResult(it, expected.subList(200, 600));
+        assertThat(listAllFilesWithPrefix("compacted-changelog-")).hasSize(4);
+        assertThat(listAllFilesWithPrefix("changelog-")).isEmpty();
+    }
+
+    private List<String> listAllFilesWithPrefix(String prefix) throws Exception {
+        try (Stream<java.nio.file.Path> stream = Files.walk(java.nio.file.Paths.get(path))) {
+            return stream.filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().startsWith(prefix))
+                    .map(java.nio.file.Path::toString)
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private void assertStreamingResult(TableResult result, List<Row> expected) throws Exception {
+        List<Row> actual = new ArrayList<>();
+        try (CloseableIterator<Row> it = collect(result)) {
+            while (actual.size() < expected.size() && it.hasNext()) {
+                actual.add(it.next());
+            }
+        }
+        assertThat(actual).hasSameElementsAs(expected);
+    }
+
+    private void assertStreamingResult(CloseableIterator<Row> it, List<Row> expected) {
+        List<Row> actual = new ArrayList<>();
+        while (actual.size() < expected.size() && it.hasNext()) {
+            actual.add(it.next());
+        }
+
+        assertThat(actual).hasSameElementsAs(expected);
+    }
+
+    // ------------------------------------------------------------------------
+    //  Random Tests
+    // ------------------------------------------------------------------------
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testNoChangelogProducerBatchRandom() throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        testNoChangelogProducerRandom(bEnv, 1, false);
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testNoChangelogProducerStreamingRandom() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(random.nextInt(900) + 100)
+                        .allowRestart()
+                        .build();
+        testNoChangelogProducerRandom(sEnv, random.nextInt(1, 3), random.nextBoolean());
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testFullCompactionChangelogProducerBatchRandom() throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        testFullCompactionChangelogProducerRandom(bEnv, 1, false);
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testFullCompactionChangelogProducerStreamingRandom() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(random.nextInt(900) + 100)
+                        .allowRestart()
+                        .build();
+        testFullCompactionChangelogProducerRandom(sEnv, random.nextInt(1, 3), random.nextBoolean());
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testStandAloneFullCompactJobRandom() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(random.nextInt(900) + 100)
+                        .allowRestart()
+                        .build();
+        testStandAloneFullCompactJobRandom(sEnv, random.nextInt(1, 3), random.nextBoolean());
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testLookupChangelogProducerBatchRandom() throws Exception {
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        testLookupChangelogProducerRandom(bEnv, 1, false);
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testLookupChangelogProducerStreamingRandom() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(random.nextInt(900) + 100)
+                        .allowRestart()
+                        .build();
+        testLookupChangelogProducerRandom(sEnv, random.nextInt(1, 3), random.nextBoolean());
+    }
+
+    @Test
+    @Timeout(TIMEOUT)
+    public void testStandAloneLookupJobRandom() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(random.nextInt(900) + 100)
+                        .allowRestart()
+                        .build();
+        testStandAloneLookupJobRandom(sEnv, random.nextInt(1, 3), random.nextBoolean());
+    }
+
+    private static final int NUM_PARTS = 4;
+    private static final int NUM_KEYS = 64;
+    private static final int NUM_VALUES = 1024;
+    private static final int LIMIT = 10000;
+
+    private void testNoChangelogProducerRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableFailure) throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        boolean enableDeletionVectors = random.nextBoolean();
+        if (enableDeletionVectors) {
+            // Deletion vectors mode not support concurrent write
+            numProducers = 1;
+        }
+
+        testRandom(
+                tEnv,
+                numProducers,
+                enableFailure,
+                "'bucket' = '4',"
+                        + String.format(
+                                "'deletion-vectors.enabled' = '%s', 'deletion-vectors.bitmap64' = '%s'",
+                                enableDeletionVectors, random.nextBoolean()));
+
+        // changelog is produced by Flink normalize operator
+        checkChangelogTestResult(numProducers);
+    }
+
+    private void testFullCompactionChangelogProducerRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableFailure) throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+
+        testRandom(
+                tEnv,
+                numProducers,
+                enableFailure,
+                "'bucket' = '4',"
+                        + String.format(
+                                "'write-buffer-size' = '%s',"
+                                        + "'changelog-producer' = 'full-compaction',"
+                                        + "'full-compaction.delta-commits' = '3'",
+                                random.nextBoolean() ? "4mb" : "8mb"));
+
+        // sleep for a random amount of time to check
+        // if we can first read complete records then read incremental records correctly
+        Thread.sleep(random.nextInt(5000));
+
+        checkChangelogTestResult(numProducers);
+    }
+
+    private void testLookupChangelogProducerRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableFailure) throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        boolean enableDeletionVectors = random.nextBoolean();
+        if (enableDeletionVectors) {
+            // Deletion vectors mode not support concurrent write
+            numProducers = 1;
+        }
+        testRandom(
+                tEnv,
+                numProducers,
+                enableFailure,
+                String.format(
+                        "'bucket' = '4', "
+                                + "'writer-buffer-size' = '%s', "
+                                + "'changelog-producer' = 'lookup', "
+                                + "'lookup-wait' = '%s', "
+                                + "'deletion-vectors.enabled' = '%s', "
+                                + "'deletion-vectors.bitmap64' = '%s', "
+                                + "'precommit-compact' = '%s'",
+                        random.nextBoolean() ? "4mb" : "8mb",
+                        random.nextBoolean(),
+                        enableDeletionVectors,
+                        random.nextBoolean(),
+                        random.nextBoolean()));
+
+        // sleep for a random amount of time to check
+        // if we can first read complete records then read incremental records correctly
+        Thread.sleep(random.nextInt(5000));
+
+        checkChangelogTestResult(numProducers);
+    }
+
+    private void testStandAloneFullCompactJobRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableConflicts) throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+
+        testRandom(
+                tEnv,
+                numProducers,
+                false,
+                "'bucket' = '4',"
+                        + String.format(
+                                "'write-buffer-size' = '%s',"
+                                        + "'changelog-producer' = 'full-compaction',"
+                                        + "'full-compaction.delta-commits' = '3',"
+                                        + "'write-only' = 'true'",
+                                random.nextBoolean() ? "4mb" : "8mb"));
+
+        // sleep for a random amount of time to check
+        // if dedicated compactor job can find first snapshot to compact correctly
+        Thread.sleep(random.nextInt(2500));
+
+        for (int i = enableConflicts ? 2 : 1; i > 0; i--) {
+            StreamExecutionEnvironment env =
+                    streamExecutionEnvironmentBuilder()
+                            .streamingMode()
+                            .checkpointIntervalMs(random.nextInt(1900) + 100)
+                            .parallelism(2)
+                            .allowRestart()
+                            .build();
+            new CompactAction(
+                            "default",
+                            "T",
+                            Collections.singletonMap("warehouse", path),
+                            Collections.emptyMap())
+                    .withStreamExecutionEnvironment(env)
+                    .build();
+            env.executeAsync();
+        }
+
+        // sleep for a random amount of time to check
+        // if we can first read complete records then read incremental records correctly
+        Thread.sleep(random.nextInt(2500));
+
+        checkChangelogTestResult(numProducers);
+    }
+
+    private void testStandAloneLookupJobRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableConflicts) throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+
+        testRandom(
+                tEnv,
+                numProducers,
+                false,
+                "'bucket' = '4',"
+                        + String.format(
+                                "'write-buffer-size' = '%s',"
+                                        + "'changelog-producer' = 'lookup',"
+                                        + "'lookup-wait' = '%s',"
+                                        + "'write-only' = 'true'",
+                                random.nextBoolean() ? "4mb" : "8mb", random.nextBoolean()));
+
+        // sleep for a random amount of time to check
+        // if dedicated compactor job can find first snapshot to compact correctly
+        Thread.sleep(random.nextInt(2500));
+
+        for (int i = enableConflicts ? 2 : 1; i > 0; i--) {
+            StreamExecutionEnvironment env =
+                    streamExecutionEnvironmentBuilder()
+                            .streamingMode()
+                            .checkpointIntervalMs(random.nextInt(1900) + 100)
+                            .allowRestart()
+                            .build();
+            env.setParallelism(2);
+            new CompactAction(
+                            "default",
+                            "T",
+                            Collections.singletonMap("warehouse", path),
+                            Collections.emptyMap())
+                    .withStreamExecutionEnvironment(env)
+                    .build();
+            env.executeAsync();
+        }
+
+        // sleep for a random amount of time to check
+        // if we can first read complete records then read incremental records correctly
+        Thread.sleep(random.nextInt(2500));
+
+        checkChangelogTestResult(numProducers);
+    }
+
+    private void checkChangelogTestResult(int numProducers) throws Exception {
+        TableEnvironment sEnv =
+                tableEnvironmentBuilder()
+                        .streamingMode()
+                        .checkpointIntervalMs(100)
+                        .parallelism(1)
+                        .build();
+        sEnv.executeSql(createCatalogSql("testCatalog", path));
+        sEnv.executeSql("USE CATALOG testCatalog");
+
+        ResultChecker checker = new ResultChecker();
+        int endCnt = 0;
+        try (CloseableIterator<Row> it = collect(sEnv.executeSql("SELECT * FROM T"))) {
+            while (it.hasNext()) {
+                Row row = it.next();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Changelog get {}", row);
+                }
+                checker.addChangelog(row);
+                if (((long) row.getField(2)) >= LIMIT) {
+                    endCnt++;
+                    if (endCnt == numProducers * NUM_PARTS * NUM_KEYS) {
+                        break;
+                    }
+                }
+            }
+        }
+        checker.assertResult(numProducers);
+
+        checkBatchResult(numProducers);
+    }
+
+    /**
+     * Run {@code numProducers} jobs at the same time. Each job randomly update {@code NUM_PARTS}
+     * partitions and {@code NUM_KEYS} keys for about {@code LIMIT} records. For the final {@code
+     * NUM_PARTS * NUM_KEYS} records, keys are updated to some specific values for result checking.
+     *
+     * <p>All jobs will modify the same set of partitions to emulate conflicting writes. Each job
+     * will write its own set of keys for easy result checking.
+     */
+    private void testRandom(
+            TableEnvironment tEnv, int numProducers, boolean enableFailure, String tableProperties)
+            throws Exception {
+        // producers will very quickly produce snapshots,
+        // so consumers should also discover new snapshots quickly
+        tableProperties += ",'continuous.discovery-interval' = '1ms'";
+
+        String failingName = UUID.randomUUID().toString();
+        String failingPath = FailingFileIO.getFailingPath(failingName, path);
+
+        // no failure when creating catalog and table
+        FailingFileIO.reset(failingName, 0, 1);
+        tEnv.executeSql(createCatalogSql("testCatalog", failingPath));
+        tEnv.executeSql("USE CATALOG testCatalog");
+        tEnv.executeSql(
+                "CREATE TABLE T("
+                        + "  pt STRING,"
+                        + "  k INT,"
+                        + "  v1 BIGINT,"
+                        + "  v2 STRING,"
+                        + "  PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + tableProperties
+                        + ")");
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Creating test table with properties {}", tableProperties);
+        }
+
+        // input data must be strictly ordered
+        tEnv.getConfig()
+                .getConfiguration()
+                .set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+
+        // We use a large number of rows to mimic unbounded streams because there is a known
+        // consistency issue in bounded streams.
+        //
+        // For bounded streams, if COMPACT snapshot fails to commit when the stream ends (due to
+        // conflict or whatever reasons), we have no chance to modify the compaction result, so the
+        // changelogs produced by compaction will not be committed.
+        //
+        // If it happens in production, users can run another job to compact the table, or run
+        // another job to write more data into the table. These remaining changelogs will be
+        // produced again.
+        int factor;
+        RuntimeExecutionMode mode =
+                tEnv.getConfig().getConfiguration().get(ExecutionOptions.RUNTIME_MODE);
+        if (mode == RuntimeExecutionMode.BATCH) {
+            factor = 1;
+        } else if (mode == RuntimeExecutionMode.STREAMING) {
+            factor = 10;
+        } else {
+            throw new UnsupportedOperationException(
+                    "Unknown runtime execution mode " + mode.name());
+        }
+        int usefulNumRows = LIMIT + NUM_PARTS * NUM_KEYS;
+        tEnv.executeSql(
+                        "CREATE TABLE `default_catalog`.`default_database`.`S` ("
+                                + "  i INT"
+                                + ") WITH ("
+                                + "  'connector' = 'datagen',"
+                                + "  'fields.i.kind' = 'sequence',"
+                                + "  'fields.i.start' = '0',"
+                                + "  'fields.i.end' = '"
+                                + (usefulNumRows * factor - 1)
+                                + "',"
+                                + "  'number-of-rows' = '"
+                                + usefulNumRows * factor
+                                + "',"
+                                + "  'rows-per-second' = '"
+                                + (LIMIT / 20 + ThreadLocalRandom.current().nextInt(LIMIT / 20))
+                                + "'"
+                                + ")")
+                .await();
+
+        if (enableFailure) {
+            FailingFileIO.reset(failingName, 2, 10000);
+        }
+        for (int i = 0; i < numProducers; i++) {
+            // for the last `NUM_PARTS * NUM_KEYS` records, we update every key to a specific value
+            String ptSql =
+                    String.format(
+                            "IF(i >= %d, CAST((i - %d) / %d AS STRING), CAST(CAST(FLOOR(RAND() * %d) AS INT) AS STRING)) AS pt",
+                            LIMIT, LIMIT, NUM_KEYS, NUM_PARTS);
+            String kSql =
+                    String.format(
+                            "IF(i >= %d, MOD(i - %d, %d), CAST(FLOOR(RAND() * %d) AS INT)) + %d AS k",
+                            LIMIT, LIMIT, NUM_KEYS, NUM_KEYS, i * NUM_KEYS);
+            String v1Sql =
+                    String.format(
+                            "IF(i >= %d, i, CAST(FLOOR(RAND() * %d) AS BIGINT)) AS v1",
+                            LIMIT, NUM_VALUES);
+            String v2Sql = "CAST(i AS STRING) || '.str' AS v2";
+            tEnv.executeSql(
+                    String.format(
+                            "CREATE TEMPORARY VIEW myView%d AS SELECT %s, %s, %s, %s, i FROM `default_catalog`.`default_database`.`S`",
+                            i, ptSql, kSql, v1Sql, v2Sql));
+
+            // run test SQL
+            int idx = i;
+            FailingFileIO.retryArtificialException(
+                    () ->
+                            tEnv.executeSql(
+                                    "INSERT INTO T /*+ OPTIONS('sink.parallelism' = '2') */ SELECT pt, k, v1, v2 FROM myView"
+                                            + idx
+                                            + " WHERE i < "
+                                            + usefulNumRows));
+        }
+    }
+
+    private void checkBatchResult(int numProducers) throws Exception {
+        FileSystemCatalog catalog = new FileSystemCatalog(LocalFileIO.create(), new Path(path));
+        FileStoreTable table = (FileStoreTable) catalog.getTable(Identifier.create("default", "T"));
+        TableEnvironment bEnv = tableEnvironmentBuilder().batchMode().build();
+        bEnv.executeSql(createCatalogSql("testCatalog", path));
+        bEnv.executeSql("USE CATALOG testCatalog");
+
+        if (table.coreOptions().needLookup()) {
+            // if table needs lookup, batch query will not get data on level = 0,
+            // so we need to wait until all level 0 are compacted
+            while (true) {
+                try (CloseableIterator<Row> it =
+                        bEnv.executeSql("SELECT * FROM `T$files` WHERE level = 0").collect()) {
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                }
+                Thread.sleep(500);
+            }
+        }
+
+        ResultChecker checker = new ResultChecker();
+        try (CloseableIterator<Row> it = collect(bEnv.executeSql("SELECT * FROM T"))) {
+            while (it.hasNext()) {
+                checker.addChangelog(it.next());
+            }
+        }
+        checker.assertResult(numProducers);
+    }
+
+    private static class ResultChecker {
+
+        private final Map<String, String> valueMap;
+        private final Map<String, RowKind> kindMap;
+
+        private ResultChecker() {
+            this.valueMap = new HashMap<>();
+            this.kindMap = new HashMap<>();
+        }
+
+        private void addChangelog(Row row) {
+            String key = row.getField(0) + "|" + row.getField(1);
+            String value = row.getField(2) + "|" + row.getField(3);
+            switch (row.getKind()) {
+                case INSERT:
+                    assertThat(valueMap.containsKey(key)).isFalse();
+                    assertThat(!kindMap.containsKey(key) || kindMap.get(key) == RowKind.DELETE)
+                            .isTrue();
+                    valueMap.put(key, value);
+                    break;
+                case UPDATE_AFTER:
+                    assertThat(valueMap.containsKey(key)).isFalse();
+                    assertThat(kindMap.get(key)).isEqualTo(RowKind.UPDATE_BEFORE);
+                    valueMap.put(key, value);
+                    break;
+                case UPDATE_BEFORE:
+                case DELETE:
+                    assertThat(valueMap.get(key)).isEqualTo(value);
+                    assertThat(
+                                    kindMap.get(key) == RowKind.INSERT
+                                            || kindMap.get(key) == RowKind.UPDATE_AFTER)
+                            .isTrue();
+                    valueMap.remove(key);
+                    break;
+                default:
+                    throw new UnsupportedOperationException("Unknown row kind " + row.getKind());
+            }
+            kindMap.put(key, row.getKind());
+        }
+
+        private void assertResult(int numProducers) {
+            assertThat(valueMap.size()).isEqualTo(NUM_PARTS * NUM_KEYS * numProducers);
+            for (int i = 0; i < NUM_PARTS; i++) {
+                for (int j = 0; j < NUM_KEYS * numProducers; j++) {
+                    String key = i + "|" + j;
+                    int x = LIMIT + i * NUM_KEYS + j % NUM_KEYS;
+                    String expectedValue = x + "|" + x + ".str";
+                    assertThat(valueMap.get(key)).isEqualTo(expectedValue);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testLimitPushdownWithTimeFilter() throws Exception {
+        // This test verifies that limit pushdown works correctly when valueFilter
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().build();
+        tEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        tEnv.executeSql("USE CATALOG testCatalog");
+        tEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "id INT, "
+                        + "name STRING, "
+                        + "ts TIMESTAMP(3), "
+                        + "PRIMARY KEY (id) NOT ENFORCED"
+                        + ")");
+
+        // Insert data with different timestamps
+        tEnv.executeSql(
+                        "INSERT INTO T VALUES "
+                                + "(1, 'a', TIMESTAMP '2024-01-01 10:00:00'), "
+                                + "(2, 'b', TIMESTAMP '2024-01-01 11:00:00'), "
+                                + "(3, 'c', TIMESTAMP '2024-01-01 12:00:00'), "
+                                + "(4, 'd', TIMESTAMP '2024-01-01 13:00:00'), "
+                                + "(5, 'e', TIMESTAMP '2024-01-01 14:00:00')")
+                .await();
+
+        // Without filter, limit pushdown should work
+        try (CloseableIterator<Row> iter = tEnv.executeSql("SELECT * FROM T LIMIT 3").collect()) {
+            List<Row> allRows = new ArrayList<>();
+            iter.forEachRemaining(allRows::add);
+            assertThat(allRows.size()).isEqualTo(3);
+        }
+
+        // Test limit pushdown with time filter (4 rows match, LIMIT 3)
+        try (CloseableIterator<Row> iter =
+                tEnv.executeSql(
+                                "SELECT * FROM T WHERE ts >= TIMESTAMP '2024-01-01 11:00:00' LIMIT 3")
+                        .collect()) {
+            List<Row> filteredRows = new ArrayList<>();
+            iter.forEachRemaining(filteredRows::add);
+            assertThat(filteredRows.size()).isGreaterThanOrEqualTo(3);
+            assertThat(filteredRows.size()).isLessThanOrEqualTo(4);
+            for (Row row : filteredRows) {
+                java.time.LocalDateTime ts = (java.time.LocalDateTime) row.getField(2);
+                java.time.LocalDateTime filterTime =
+                        java.time.LocalDateTime.parse("2024-01-01T11:00:00");
+                assertThat(ts).isAfterOrEqualTo(filterTime);
+            }
+        }
+
+        // Test with more restrictive filter (3 rows match, LIMIT 2)
+        try (CloseableIterator<Row> iter =
+                tEnv.executeSql(
+                                "SELECT * FROM T WHERE ts >= TIMESTAMP '2024-01-01 12:00:00' LIMIT 2")
+                        .collect()) {
+            List<Row> filteredRows2 = new ArrayList<>();
+            iter.forEachRemaining(filteredRows2::add);
+            assertThat(filteredRows2.size()).isGreaterThanOrEqualTo(2);
+            assertThat(filteredRows2.size()).isLessThanOrEqualTo(3);
+            for (Row row : filteredRows2) {
+                java.time.LocalDateTime ts = (java.time.LocalDateTime) row.getField(2);
+                java.time.LocalDateTime filterTime =
+                        java.time.LocalDateTime.parse("2024-01-01T12:00:00");
+                assertThat(ts).isAfterOrEqualTo(filterTime);
+            }
+        }
+    }
+
+    @Test
+    public void testLimitPushdownBasic() throws Exception {
+        // Test basic limit pushdown
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().build();
+        tEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        tEnv.executeSql("USE CATALOG testCatalog");
+        tEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "id INT, "
+                        + "name STRING, "
+                        + "PRIMARY KEY (id) NOT ENFORCED"
+                        + ")");
+
+        tEnv.executeSql("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c')").await();
+        tEnv.executeSql("INSERT INTO T VALUES (4, 'd'), (5, 'e'), (6, 'f')").await();
+        tEnv.executeSql("INSERT INTO T VALUES (7, 'g'), (8, 'h'), (9, 'i')").await();
+
+        try (CloseableIterator<Row> iter = tEnv.executeSql("SELECT * FROM T LIMIT 5").collect()) {
+            List<Row> rows = new ArrayList<>();
+            iter.forEachRemaining(rows::add);
+
+            assertThat(rows.size()).isEqualTo(5);
+        }
+    }
+
+    @Test
+    public void testLimitPushdownWithDeletionVector() throws Exception {
+        // Test limit pushdown is disabled when deletion vector is enabled
+        TableEnvironment tEnv = tableEnvironmentBuilder().batchMode().build();
+        tEnv.executeSql(createCatalogSql("testCatalog", path + "/warehouse"));
+        tEnv.executeSql("USE CATALOG testCatalog");
+        tEnv.executeSql(
+                "CREATE TABLE T ("
+                        + "id INT, "
+                        + "name STRING, "
+                        + "PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ("
+                        + "'deletion-vectors.enabled' = 'true'"
+                        + ")");
+
+        tEnv.executeSql("INSERT INTO T VALUES (1, 'a'), (2, 'b'), (3, 'c')").await();
+        tEnv.executeSql("INSERT INTO T VALUES (4, 'd'), (5, 'e'), (6, 'f')").await();
+
+        tEnv.executeSql("DELETE FROM T WHERE id = 2").await();
+
+        // Limit pushdown should be disabled when deletion vector is enabled
+        // because we can't accurately calculate row count after applying deletion vectors
+        try (CloseableIterator<Row> iter = tEnv.executeSql("SELECT * FROM T LIMIT 3").collect()) {
+            List<Row> rows = new ArrayList<>();
+            iter.forEachRemaining(rows::add);
+
+            assertThat(rows.size()).isEqualTo(3);
+
+            for (Row row : rows) {
+                assertThat(row.getField(0)).isNotEqualTo(2);
+            }
+        }
+    }
+}

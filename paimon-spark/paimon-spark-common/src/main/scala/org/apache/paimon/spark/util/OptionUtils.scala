@@ -1,0 +1,195 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.util
+
+import org.apache.paimon.CoreOptions
+import org.apache.paimon.catalog.Identifier
+import org.apache.paimon.options.ConfigOption
+import org.apache.paimon.spark.{SparkCatalogOptions, SparkConnectorOptions}
+import org.apache.paimon.table.Table
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.SQLConfHelper
+import org.apache.spark.sql.internal.StaticSQLConf
+
+import java.util.{HashMap => JHashMap, Map => JMap}
+import java.util.regex.Pattern
+
+import scala.collection.JavaConverters._
+
+object OptionUtils extends SQLConfHelper with Logging {
+
+  private val PAIMON_OPTION_PREFIX = "spark.paimon."
+  private val SPARK_CATALOG_PREFIX = "spark.sql.catalog."
+  private val SPARK_HADOOP_PREFIX = "spark.hadoop."
+  private val OBS_CONF_PREFIX = "fs.obs."
+  private val SPARK_NATIVE_IO_ENGINE = "spark"
+
+  def paimonExtensionEnabled: Boolean = {
+    conf
+      .getConf(StaticSQLConf.SPARK_SESSION_EXTENSIONS)
+      .getOrElse(Seq.empty)
+      .contains("org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions")
+  }
+
+  def getOptionString(option: ConfigOption[_]): String = {
+    conf.getConfString(s"$PAIMON_OPTION_PREFIX${option.key()}", option.defaultValue().toString)
+  }
+
+  private def getSparkVersionSpecificDefault(option: ConfigOption[_]): String = {
+    val sparkVersion = org.apache.spark.SPARK_VERSION
+
+    option.key() match {
+      case key if key == SparkConnectorOptions.USE_V2_WRITE.key() =>
+        if (sparkVersion >= "3.4") {
+          "false"
+        } else {
+          option.defaultValue().toString
+        }
+      case _ =>
+        option.defaultValue().toString
+    }
+  }
+
+  def checkRequiredConfigurations(): Unit = {
+    if (getOptionString(SparkConnectorOptions.REQUIRED_SPARK_CONFS_CHECK_ENABLED).toBoolean) {
+      if (!paimonExtensionEnabled) {
+        throw new RuntimeException(
+          """
+            |When using Paimon, it is necessary to configure `spark.sql.extensions` and ensure that it includes `org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions`.
+            |You can disable this check by configuring `spark.paimon.requiredSparkConfsCheck.enabled` to `false`, but it is strongly discouraged to do so.
+            |""".stripMargin)
+      }
+    }
+  }
+
+  def useV2Write(): Boolean = {
+    val defaultValue = getSparkVersionSpecificDefault(SparkConnectorOptions.USE_V2_WRITE)
+    val configuredValue = conf
+      .getConfString(
+        s"$PAIMON_OPTION_PREFIX${SparkConnectorOptions.USE_V2_WRITE.key()}",
+        defaultValue
+      )
+      .toBoolean
+
+    val sparkVersion = org.apache.spark.SPARK_VERSION
+    val isVersionSupported = sparkVersion >= "3.4"
+
+    if (configuredValue && !isVersionSupported) {
+      logWarning(
+        "DataSourceV2 write is not supported in Spark versions prior to 3.4. Falling back to DataSourceV1.")
+    }
+
+    configuredValue && isVersionSupported
+  }
+
+  def writeMergeSchemaEnabled(): Boolean = {
+    getOptionString(SparkConnectorOptions.MERGE_SCHEMA).toBoolean
+  }
+
+  def writeMergeSchemaExplicitCastEnabled(): Boolean = {
+    getOptionString(SparkConnectorOptions.EXPLICIT_CAST).toBoolean
+  }
+
+  def v1FunctionEnabled(): Boolean = {
+    getOptionString(SparkCatalogOptions.V1FUNCTION_ENABLED).toBoolean
+  }
+
+  def readAllowFullScan(): Boolean = {
+    getOptionString(SparkConnectorOptions.READ_ALLOW_FULL_SCAN).toBoolean
+  }
+
+  def sourceSplitTargetSizeWithColumnPruning(): Boolean = {
+    getOptionString(SparkConnectorOptions.SOURCE_SPLIT_TARGET_SIZE_WITH_COLUMN_PRUNING).toBoolean
+  }
+
+  private def mergeSQLConf(extraOptions: JMap[String, String]): JMap[String, String] = {
+    val mergedOptions = new JHashMap[String, String](
+      conf.getAllConfs
+        .filterKeys(_.startsWith(PAIMON_OPTION_PREFIX))
+        .map {
+          case (key, value) =>
+            key.stripPrefix(PAIMON_OPTION_PREFIX) -> value
+        }
+        .toMap
+        .asJava)
+    mergedOptions.putAll(extraOptions)
+    mergedOptions
+  }
+
+  private def mergeSQLConfWithIdentifier(
+      extraOptions: JMap[String, String],
+      catalogName: String,
+      ident: Identifier): JMap[String, String] = {
+    val tableOptionsTemplate = String.format(
+      "(%s)(%s|\\*)\\.(%s|\\*)\\.(%s|\\*)\\.(.+)",
+      PAIMON_OPTION_PREFIX,
+      catalogName,
+      ident.getDatabaseName,
+      ident.getObjectName)
+    val tableOptionsPattern = Pattern.compile(tableOptionsTemplate)
+    val mergedOptions = org.apache.paimon.options.OptionsUtils
+      .convertToDynamicTableProperties(
+        conf.getAllConfs.asJava,
+        PAIMON_OPTION_PREFIX,
+        tableOptionsPattern,
+        5)
+    mergedOptions.putAll(extraOptions)
+    mergedOptions
+  }
+
+  def withNativeIOReadOptions(extraOptions: JMap[String, String]): JMap[String, String] = {
+    val readOptions = new JHashMap[String, String]()
+    conf.getAllConfs.foreach {
+      case (key, value) if key.startsWith(s"$SPARK_HADOOP_PREFIX$OBS_CONF_PREFIX") =>
+        readOptions.put(key.stripPrefix(SPARK_HADOOP_PREFIX), value)
+      case _ =>
+    }
+    readOptions.putAll(extraOptions)
+    readOptions.put(CoreOptions.NATIVE_IO_INTERNAL_ENGINE.key(), SPARK_NATIVE_IO_ENGINE)
+    readOptions
+  }
+
+  def copyWithSQLConf[T <: Table](
+      table: T,
+      catalogName: String = null,
+      ident: Identifier = null,
+      extraOptions: JMap[String, String] = new JHashMap[String, String]()): T = {
+    val mergedOptions = if (catalogName != null && ident != null) {
+      mergeSQLConfWithIdentifier(extraOptions, catalogName, ident)
+    } else {
+      mergeSQLConf(extraOptions)
+    }
+    val readOptions = withNativeIOReadOptions(mergedOptions)
+    if (readOptions.isEmpty) {
+      table
+    } else {
+      table.copy(readOptions).asInstanceOf[T]
+    }
+  }
+
+  def copyWithSQLConf[T <: Table](
+      table: T,
+      catalogName: String,
+      databaseName: String,
+      tableName: String,
+      extraOptions: JMap[String, String]): T = {
+    copyWithSQLConf(table, catalogName, new Identifier(databaseName, tableName), extraOptions)
+  }
+}

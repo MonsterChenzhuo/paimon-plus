@@ -1,0 +1,796 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.system;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.consumer.ConsumerManager;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.manifest.BucketEntry;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.operation.ManifestsReader;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.LeafPredicate;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.predicate.PredicateReplaceVisitor;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.DataTable;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.ReadonlyTable;
+import org.apache.paimon.table.SpecialFields;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.DataTableScan;
+import org.apache.paimon.table.source.InnerTableRead;
+import org.apache.paimon.table.source.InnerTableScan;
+import org.apache.paimon.table.source.ScanMode;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.SplitGenerator;
+import org.apache.paimon.table.source.StreamDataTableScan;
+import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.table.source.snapshot.StartingContext;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.BiFilter;
+import org.apache.paimon.utils.BranchManager;
+import org.apache.paimon.utils.ChangelogManager;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.ProjectedRow;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.RowRangeIndex;
+import org.apache.paimon.utils.SimpleFileReader;
+import org.apache.paimon.utils.SnapshotManager;
+import org.apache.paimon.utils.TagManager;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.CoreOptions.TABLE_READ_SEQUENCE_NUMBER_ENABLED;
+import static org.apache.paimon.catalog.Identifier.SYSTEM_TABLE_SPLITTER;
+
+/** A {@link Table} for reading audit log of table. */
+public class AuditLogTable implements DataTable, ReadonlyTable {
+
+    public static final String AUDIT_LOG = "audit_log";
+
+    protected final FileStoreTable wrapped;
+
+    protected final List<DataField> specialFields;
+
+    public AuditLogTable(FileStoreTable wrapped) {
+        this.wrapped = wrapped;
+        this.specialFields = new ArrayList<>();
+        specialFields.add(SpecialFields.ROW_KIND);
+
+        boolean includeSequenceNumber =
+                CoreOptions.fromMap(wrapped.options()).tableReadSequenceNumberEnabled();
+
+        if (includeSequenceNumber) {
+            this.wrapped.options().put(CoreOptions.KEY_VALUE_SEQUENCE_NUMBER_ENABLED.key(), "true");
+            specialFields.add(SpecialFields.SEQUENCE_NUMBER);
+        }
+    }
+
+    /** Creates a PredicateReplaceVisitor that adjusts field indices by systemFieldCount. */
+    private PredicateReplaceVisitor createPredicateConverter() {
+        return p -> {
+            Optional<FieldRef> fieldRefOptional = p.fieldRefOptional();
+            if (!fieldRefOptional.isPresent()) {
+                return Optional.empty();
+            }
+            FieldRef fieldRef = fieldRefOptional.get();
+            if (fieldRef.index() < specialFields.size()) {
+                return Optional.empty();
+            }
+            return Optional.of(
+                    new LeafPredicate(
+                            p.function(),
+                            fieldRef.type(),
+                            fieldRef.index() - specialFields.size(),
+                            fieldRef.name(),
+                            p.literals()));
+        };
+    }
+
+    @Override
+    public Optional<Snapshot> latestSnapshot() {
+        return wrapped.latestSnapshot();
+    }
+
+    @Override
+    public Snapshot snapshot(long snapshotId) {
+        return wrapped.snapshot(snapshotId);
+    }
+
+    @Override
+    public SimpleFileReader<ManifestFileMeta> manifestListReader() {
+        return wrapped.manifestListReader();
+    }
+
+    @Override
+    public SimpleFileReader<ManifestEntry> manifestFileReader() {
+        return wrapped.manifestFileReader();
+    }
+
+    @Override
+    public SimpleFileReader<IndexManifestEntry> indexManifestFileReader() {
+        return wrapped.indexManifestFileReader();
+    }
+
+    @Override
+    public String name() {
+        return wrapped.name() + SYSTEM_TABLE_SPLITTER + AUDIT_LOG;
+    }
+
+    @Override
+    public RowType rowType() {
+        List<DataField> fields = new ArrayList<>(specialFields);
+        fields.addAll(wrapped.rowType().getFields());
+        return new RowType(fields);
+    }
+
+    @Override
+    public List<String> partitionKeys() {
+        return wrapped.partitionKeys();
+    }
+
+    @Override
+    public Map<String, String> options() {
+        return wrapped.options();
+    }
+
+    @Override
+    public List<String> primaryKeys() {
+        return Collections.emptyList();
+    }
+
+    @Override
+    public SnapshotReader newSnapshotReader() {
+        return new AuditLogDataReader(wrapped.newSnapshotReader());
+    }
+
+    @Override
+    public DataTableScan newScan() {
+        return new AuditLogBatchScan(wrapped.newScan());
+    }
+
+    @Override
+    public StreamDataTableScan newStreamScan() {
+        return new AuditLogStreamScan(wrapped.newStreamScan());
+    }
+
+    @Override
+    public CoreOptions coreOptions() {
+        return wrapped.coreOptions();
+    }
+
+    @Override
+    public Path location() {
+        return wrapped.location();
+    }
+
+    @Override
+    public SnapshotManager snapshotManager() {
+        return wrapped.snapshotManager();
+    }
+
+    @Override
+    public ChangelogManager changelogManager() {
+        return wrapped.changelogManager();
+    }
+
+    @Override
+    public ConsumerManager consumerManager() {
+        return wrapped.consumerManager();
+    }
+
+    @Override
+    public SchemaManager schemaManager() {
+        return wrapped.schemaManager();
+    }
+
+    @Override
+    public TagManager tagManager() {
+        return wrapped.tagManager();
+    }
+
+    @Override
+    public BranchManager branchManager() {
+        return wrapped.branchManager();
+    }
+
+    @Override
+    public DataTable switchToBranch(String branchName) {
+        return new AuditLogTable(wrapped.switchToBranch(branchName));
+    }
+
+    @Override
+    public InnerTableRead newRead() {
+        return new AuditLogRead(wrapped.newRead());
+    }
+
+    @Override
+    public Table copy(Map<String, String> dynamicOptions) {
+        if (Boolean.parseBoolean(
+                dynamicOptions.getOrDefault(TABLE_READ_SEQUENCE_NUMBER_ENABLED.key(), "false"))) {
+            throw new UnsupportedOperationException(
+                    "table-read.sequence-number.enabled is not supported by hint.");
+        }
+        return new AuditLogTable(wrapped.copy(dynamicOptions));
+    }
+
+    @Override
+    public FileIO fileIO() {
+        return wrapped.fileIO();
+    }
+
+    /** Push down predicate to dataScan and dataRead. */
+    private Optional<Predicate> convert(Predicate predicate) {
+        PredicateReplaceVisitor converter = createPredicateConverter();
+        List<Predicate> result =
+                PredicateBuilder.splitAnd(predicate).stream()
+                        .map(p -> p.visit(converter))
+                        .filter(Optional::isPresent)
+                        .map(Optional::get)
+                        .collect(Collectors.toList());
+        if (result.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(PredicateBuilder.and(result));
+    }
+
+    private class AuditLogDataReader implements SnapshotReader {
+
+        private final SnapshotReader wrapped;
+
+        private AuditLogDataReader(SnapshotReader wrapped) {
+            this.wrapped = wrapped;
+        }
+
+        @Override
+        public Integer parallelism() {
+            return wrapped.parallelism();
+        }
+
+        @Override
+        public SnapshotManager snapshotManager() {
+            return wrapped.snapshotManager();
+        }
+
+        @Override
+        public ChangelogManager changelogManager() {
+            return wrapped.changelogManager();
+        }
+
+        @Override
+        public ManifestsReader manifestsReader() {
+            return wrapped.manifestsReader();
+        }
+
+        @Override
+        public List<ManifestEntry> readManifest(ManifestFileMeta manifest) {
+            return wrapped.readManifest(manifest);
+        }
+
+        @Override
+        public ConsumerManager consumerManager() {
+            return wrapped.consumerManager();
+        }
+
+        @Override
+        public SplitGenerator splitGenerator() {
+            return wrapped.splitGenerator();
+        }
+
+        @Override
+        public FileStorePathFactory pathFactory() {
+            return wrapped.pathFactory();
+        }
+
+        public SnapshotReader withSnapshot(long snapshotId) {
+            wrapped.withSnapshot(snapshotId);
+            return this;
+        }
+
+        public SnapshotReader withSnapshot(Snapshot snapshot) {
+            wrapped.withSnapshot(snapshot);
+            return this;
+        }
+
+        public SnapshotReader withFilter(Predicate predicate) {
+            convert(predicate).ifPresent(wrapped::withFilter);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withPartitionFilter(Map<String, String> partitionSpec) {
+            wrapped.withPartitionFilter(partitionSpec);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withPartitionFilter(Predicate predicate) {
+            wrapped.withPartitionFilter(predicate);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withPartitionFilter(List<BinaryRow> partitions) {
+            wrapped.withPartitionFilter(partitions);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withPartitionFilter(PartitionPredicate partitionPredicate) {
+            wrapped.withPartitionFilter(partitionPredicate);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withPartitionsFilter(List<Map<String, String>> partitions) {
+            wrapped.withPartitionsFilter(partitions);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withMode(ScanMode scanMode) {
+            wrapped.withMode(scanMode);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withLevel(int level) {
+            wrapped.withLevel(level);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withLevelFilter(Filter<Integer> levelFilter) {
+            wrapped.withLevelFilter(levelFilter);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withLevelMinMaxFilter(BiFilter<Integer, Integer> minMaxFilter) {
+            wrapped.withLevelMinMaxFilter(minMaxFilter);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader enableValueFilter() {
+            wrapped.enableValueFilter();
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withManifestEntryFilter(Filter<ManifestEntry> filter) {
+            wrapped.withManifestEntryFilter(filter);
+            return this;
+        }
+
+        public SnapshotReader withBucket(int bucket) {
+            wrapped.withBucket(bucket);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader onlyReadRealBuckets() {
+            wrapped.onlyReadRealBuckets();
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withBucketFilter(Filter<Integer> bucketFilter) {
+            wrapped.withBucketFilter(bucketFilter);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withDataFileNameFilter(Filter<String> fileNameFilter) {
+            wrapped.withDataFileNameFilter(fileNameFilter);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader dropStats() {
+            wrapped.dropStats();
+            return this;
+        }
+
+        @Override
+        public SnapshotReader keepStats() {
+            wrapped.keepStats();
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withShard(int indexOfThisSubtask, int numberOfParallelSubtasks) {
+            wrapped.withShard(indexOfThisSubtask, numberOfParallelSubtasks);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withMetricRegistry(MetricRegistry registry) {
+            wrapped.withMetricRegistry(registry);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withRowRanges(List<Range> rowRanges) {
+            wrapped.withRowRanges(rowRanges);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withRowRangeIndex(RowRangeIndex rowRangeIndex) {
+            wrapped.withRowRangeIndex(rowRangeIndex);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withReadType(RowType readType) {
+            wrapped.withReadType(readType);
+            return this;
+        }
+
+        @Override
+        public SnapshotReader withLimit(int limit) {
+            wrapped.withLimit(limit);
+            return this;
+        }
+
+        @Override
+        public boolean hasNonPartitionFilter() {
+            return wrapped.hasNonPartitionFilter();
+        }
+
+        @Override
+        public Plan read() {
+            return wrapped.read();
+        }
+
+        @Override
+        public Plan readChanges() {
+            return wrapped.readChanges();
+        }
+
+        @Override
+        public Plan readIncrementalDiff(Snapshot before) {
+            return wrapped.readIncrementalDiff(before);
+        }
+
+        @Override
+        public List<BinaryRow> partitions() {
+            return wrapped.partitions();
+        }
+
+        @Override
+        public List<PartitionEntry> partitionEntries() {
+            return wrapped.partitionEntries();
+        }
+
+        @Override
+        public List<BucketEntry> bucketEntries() {
+            return wrapped.bucketEntries();
+        }
+
+        @Override
+        public Iterator<ManifestEntry> readFileIterator() {
+            return wrapped.readFileIterator();
+        }
+    }
+
+    private class AuditLogBatchScan implements DataTableScan {
+
+        private final DataTableScan batchScan;
+
+        private AuditLogBatchScan(DataTableScan batchScan) {
+            this.batchScan = batchScan;
+        }
+
+        @Override
+        public InnerTableScan withFilter(Predicate predicate) {
+            convert(predicate).ifPresent(batchScan::withFilter);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withMetricRegistry(MetricRegistry metricsRegistry) {
+            batchScan.withMetricRegistry(metricsRegistry);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withLimit(int limit) {
+            batchScan.withLimit(limit);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withPartitionFilter(Map<String, String> partitionSpec) {
+            batchScan.withPartitionFilter(partitionSpec);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withPartitionFilter(List<BinaryRow> partitions) {
+            batchScan.withPartitionFilter(partitions);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withPartitionsFilter(List<Map<String, String>> partitions) {
+            batchScan.withPartitionsFilter(partitions);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withPartitionFilter(PartitionPredicate partitionPredicate) {
+            batchScan.withPartitionFilter(partitionPredicate);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withBucketFilter(Filter<Integer> bucketFilter) {
+            batchScan.withBucketFilter(bucketFilter);
+            return this;
+        }
+
+        @Override
+        public InnerTableScan withLevelFilter(Filter<Integer> levelFilter) {
+            batchScan.withLevelFilter(levelFilter);
+            return this;
+        }
+
+        @Override
+        public Plan plan() {
+            return batchScan.plan();
+        }
+
+        @Override
+        public List<PartitionEntry> listPartitionEntries() {
+            return batchScan.listPartitionEntries();
+        }
+
+        @Override
+        public DataTableScan withShard(int indexOfThisSubtask, int numberOfParallelSubtasks) {
+            batchScan.withShard(indexOfThisSubtask, numberOfParallelSubtasks);
+            return this;
+        }
+    }
+
+    private class AuditLogStreamScan implements StreamDataTableScan {
+
+        private final StreamDataTableScan streamScan;
+
+        private AuditLogStreamScan(StreamDataTableScan streamScan) {
+            this.streamScan = streamScan;
+        }
+
+        @Override
+        public StreamDataTableScan withFilter(Predicate predicate) {
+            convert(predicate).ifPresent(streamScan::withFilter);
+            return this;
+        }
+
+        @Override
+        public StartingContext startingContext() {
+            return streamScan.startingContext();
+        }
+
+        @Override
+        public Plan plan() {
+            return streamScan.plan();
+        }
+
+        @Override
+        public List<PartitionEntry> listPartitionEntries() {
+            return streamScan.listPartitionEntries();
+        }
+
+        @Nullable
+        @Override
+        public Long checkpoint() {
+            return streamScan.checkpoint();
+        }
+
+        @Nullable
+        @Override
+        public Long watermark() {
+            return streamScan.watermark();
+        }
+
+        @Override
+        public void restore(@Nullable Long nextSnapshotId) {
+            streamScan.restore(nextSnapshotId);
+        }
+
+        @Override
+        public void restore(@Nullable Long nextSnapshotId, boolean scanAllSnapshot) {
+            streamScan.restore(nextSnapshotId, scanAllSnapshot);
+        }
+
+        @Override
+        public void notifyCheckpointComplete(@Nullable Long nextSnapshot) {
+            streamScan.notifyCheckpointComplete(nextSnapshot);
+        }
+
+        @Override
+        public StreamDataTableScan withMetricRegistry(MetricRegistry metricsRegistry) {
+            streamScan.withMetricRegistry(metricsRegistry);
+            return this;
+        }
+
+        @Override
+        public DataTableScan withShard(int indexOfThisSubtask, int numberOfParallelSubtasks) {
+            streamScan.withShard(indexOfThisSubtask, numberOfParallelSubtasks);
+            return this;
+        }
+    }
+
+    class AuditLogRead implements InnerTableRead {
+
+        // Special index for rowkind field
+        protected static final int ROW_KIND_INDEX = -1;
+        // _SEQUENCE_NUMBER is at index 0 by setting: KEY_VALUE_SEQUENCE_NUMBER_ENABLED
+        protected static final int SEQUENCE_NUMBER_INDEX = 0;
+
+        protected final InnerTableRead dataRead;
+
+        protected int[] readProjection;
+
+        protected AuditLogRead(InnerTableRead dataRead) {
+            this.dataRead = dataRead.forceKeepDelete();
+            this.readProjection = defaultProjection();
+        }
+
+        /** Default projection, add system fields (rowkind, and optionally _SEQUENCE_NUMBER). */
+        private int[] defaultProjection() {
+            int dataFieldCount = wrapped.rowType().getFieldCount();
+            int[] projection = new int[dataFieldCount + specialFields.size()];
+            projection[0] = ROW_KIND_INDEX;
+            if (specialFields.contains(SpecialFields.SEQUENCE_NUMBER)) {
+                projection[1] = SEQUENCE_NUMBER_INDEX;
+            }
+            for (int i = 0; i < dataFieldCount; i++) {
+                projection[specialFields.size() + i] = i + specialFields.size() - 1;
+            }
+            return projection;
+        }
+
+        /** Build projection array from readType. */
+        private int[] buildProjection(RowType readType) {
+            List<DataField> fields = readType.getFields();
+            int[] projection = new int[fields.size()];
+            int dataFieldIndex = 0;
+
+            for (int i = 0; i < fields.size(); i++) {
+                String fieldName = fields.get(i).name();
+                if (fieldName.equals(SpecialFields.ROW_KIND.name())) {
+                    projection[i] = ROW_KIND_INDEX;
+                } else if (fieldName.equals(SpecialFields.SEQUENCE_NUMBER.name())) {
+                    projection[i] = SEQUENCE_NUMBER_INDEX;
+                } else {
+                    projection[i] = dataFieldIndex + specialFields.size() - 1;
+                    dataFieldIndex++;
+                }
+            }
+            return projection;
+        }
+
+        @Override
+        public InnerTableRead withFilter(Predicate predicate) {
+            convert(predicate).ifPresent(dataRead::withFilter);
+            return this;
+        }
+
+        @Override
+        public InnerTableRead withReadType(RowType readType) {
+            this.readProjection = buildProjection(readType);
+            List<DataField> dataFields = extractDataFields(readType);
+            dataRead.withReadType(new RowType(readType.isNullable(), dataFields));
+            return this;
+        }
+
+        /** Extract data fields (non-system fields) from readType. */
+        private List<DataField> extractDataFields(RowType readType) {
+            return readType.getFields().stream()
+                    .filter(f -> !SpecialFields.isSystemField(f.name()))
+                    .collect(Collectors.toList());
+        }
+
+        @Override
+        public TableRead withIOManager(IOManager ioManager) {
+            this.dataRead.withIOManager(ioManager);
+            return this;
+        }
+
+        @Override
+        public RecordReader<InternalRow> createReader(Split split) throws IOException {
+            return dataRead.createReader(split).transform(this::convertRow);
+        }
+
+        private InternalRow convertRow(InternalRow data) {
+            return new AuditLogRow(readProjection, data);
+        }
+    }
+
+    /**
+     * A {@link ProjectedRow} which returns row kind and sequence number when mapping index is
+     * negative.
+     */
+    static class AuditLogRow extends ProjectedRow {
+
+        AuditLogRow(int[] indexMapping, InternalRow row) {
+            super(indexMapping);
+            replaceRow(row);
+        }
+
+        @Override
+        public RowKind getRowKind() {
+            return RowKind.INSERT;
+        }
+
+        @Override
+        public void setRowKind(RowKind kind) {
+            throw new UnsupportedOperationException(
+                    "Set row kind is not supported in AuditLogRowData.");
+        }
+
+        @Override
+        public boolean isNullAt(int pos) {
+            if (indexMapping[pos] < 0) {
+                // row kind and sequence num are always not null
+                return false;
+            }
+            return super.isNullAt(pos);
+        }
+
+        @Override
+        public BinaryString getString(int pos) {
+            int index = indexMapping[pos];
+            if (index == AuditLogRead.ROW_KIND_INDEX) {
+                return BinaryString.fromString(row.getRowKind().shortString());
+            }
+            return super.getString(pos);
+        }
+    }
+}

@@ -1,0 +1,313 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.sql
+
+import org.apache.paimon.spark.PaimonSparkTestBase
+
+import org.apache.spark.sql.{AnalysisException, Row}
+
+class PaimonPartitionManagementTest extends PaimonSparkTestBase {
+
+  withPk.foreach {
+    hasPk =>
+      bucketModes.foreach {
+        bucket =>
+          test(s"Partition for non-partitioned table: hasPk: $hasPk, bucket: $bucket") {
+            val prop = if (hasPk) {
+              s"'primary-key'='a,b', 'bucket' = '$bucket' "
+            } else if (bucket != -1) {
+              s"'bucket-key'='a,b', 'bucket' = '$bucket' "
+            } else {
+              "'write-only'='true'"
+            }
+
+            spark.sql(
+              s"""
+                 |CREATE TABLE T (a VARCHAR(10), b CHAR(10),c BIGINT,dt VARCHAR(8),hh VARCHAR(4))
+                 |TBLPROPERTIES ($prop)
+                 |""".stripMargin)
+            spark.sql("INSERT INTO T VALUES('a','b',1,'20230816','1132')")
+            spark.sql("INSERT INTO T VALUES('a','b',1,'20230816','1133')")
+            spark.sql("INSERT INTO T VALUES('a','b',1,'20230816','1134')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,'20230817','1132')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,'20230817','1133')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,'20230817','1134')")
+
+            assertThrows[AnalysisException] {
+              spark.sql("alter table T drop partition (dt='20230816', hh='1134')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("alter table T drop partition (dt='20230816')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("alter table T drop partition (hh='1134')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("alter table T drop partition (dt='20230816'), partition (dt='20230817')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("show partitions T partition (dt='20230816', hh='1134')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("show partitions T partition (dt='20230816')")
+            }
+
+            assertThrows[AnalysisException] {
+              spark.sql("show partitions T partition (hh='1134')")
+            }
+          }
+      }
+  }
+
+  withPk.foreach {
+    hasPk =>
+      bucketModes.foreach {
+        bucket =>
+          test(s"Partition for partitioned table: hasPk: $hasPk, bucket: $bucket") {
+            val prop = if (hasPk) {
+              s"'primary-key'='a,b,dt,hh', 'bucket' = '$bucket' "
+            } else if (bucket != -1) {
+              s"'bucket-key'='a,b', 'bucket' = '$bucket' "
+            } else {
+              "'write-only'='true'"
+            }
+
+            spark.sql(s"""
+                         |CREATE TABLE T (a VARCHAR(10), b CHAR(10),c BIGINT,dt LONG,hh VARCHAR(4))
+                         |PARTITIONED BY (dt, hh)
+                         |TBLPROPERTIES ($prop)
+                         |""".stripMargin)
+
+            spark.sql("INSERT INTO T VALUES('a','b',1,20230816,'1132')")
+            spark.sql("INSERT INTO T VALUES('a','b',1,20230816,'1133')")
+            spark.sql("INSERT INTO T VALUES('a','b',1,20230816,'1134')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,20230817,'1132')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,20230817,'1133')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,20230817,'1134')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,20240101,'00')")
+            spark.sql("INSERT INTO T VALUES('a','b',2,20240102,'00')")
+
+            checkAnswer(
+              spark.sql("show partitions T "),
+              Row("dt=20230816/hh=1132") :: Row("dt=20230816/hh=1133")
+                :: Row("dt=20230816/hh=1134") :: Row("dt=20230817/hh=1132") :: Row(
+                  "dt=20230817/hh=1133") :: Row("dt=20230817/hh=1134") :: Row(
+                  "dt=20240101/hh=00") :: Row("dt=20240102/hh=00") :: Nil
+            )
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (dt=20230817, hh='1132')"),
+              Row("dt=20230817/hh=1132") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (hh='1132')"),
+              Row("dt=20230816/hh=1132") :: Row("dt=20230817/hh=1132") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (dt=20230816)"),
+              Row("dt=20230816/hh=1132") :: Row("dt=20230816/hh=1133") :: Row(
+                "dt=20230816/hh=1134") :: Nil)
+
+            checkAnswer(spark.sql("show partitions T PARTITION (hh='1135')"), Nil)
+
+            checkAnswer(spark.sql("show partitions T PARTITION (dt=20230818)"), Nil)
+
+            spark.sql("alter table T drop partition (dt=20230816, hh='1134')")
+
+            spark.sql("alter table T drop partition (dt=20230817, hh='1133')")
+
+            assertThrows[AnalysisException] {
+              spark.sql(
+                "alter table T drop partition (dt=20240101, hh='00'), partition(dt=999999, hh='00')")
+            }
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (dt=20240101)"),
+              Row("dt=20240101/hh=00") :: Nil)
+
+            spark.sql(
+              "alter table T drop partition (dt=20240101, hh='00'), partition (dt=20240102, hh='00')")
+
+            assertThrows[AnalysisException] {
+              spark.sql("alter table T drop partition (hh='1134')")
+            }
+
+            checkAnswer(
+              spark.sql("show partitions T "),
+              Row("dt=20230816/hh=1132") :: Row("dt=20230816/hh=1133")
+                :: Row("dt=20230817/hh=1132") :: Row("dt=20230817/hh=1134") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (dt=20230817, hh='1132')"),
+              Row("dt=20230817/hh=1132") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (hh='1132')"),
+              Row("dt=20230817/hh=1132") :: Row("dt=20230816/hh=1132") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (hh='1134')"),
+              Row("dt=20230817/hh=1134") :: Nil)
+
+            checkAnswer(
+              spark.sql("show partitions T PARTITION (dt=20230817)"),
+              Row("dt=20230817/hh=1132") :: Row("dt=20230817/hh=1134") :: Nil)
+
+            checkAnswer(
+              spark.sql("select * from T"),
+              Row("a", "b         ", 1L, 20230816L, "1132") :: Row(
+                "a",
+                "b         ",
+                1L,
+                20230816L,
+                "1133") :: Row("a", "b         ", 2L, 20230817L, "1132") :: Row(
+                "a",
+                "b         ",
+                2L,
+                20230817L,
+                "1134") :: Nil
+            )
+          }
+      }
+  }
+
+  test("Paimon Partition Management: drop null partition with specified default partition name") {
+    spark.sql(s"""
+                 |CREATE TABLE T (a INT, dt STRING)
+                 |PARTITIONED BY (dt)
+                 |TBLPROPERTIES ('partition.default-name'='__TEST_DEFAULT_PARTITION__')
+                 |""".stripMargin)
+
+    spark.sql("INSERT INTO T VALUES (1, '20240601'), (2, null)")
+    checkAnswer(
+      spark.sql("SHOW PARTITIONS T"),
+      Row("dt=20240601") :: Row("dt=null") :: Nil
+    )
+
+    spark.sql("ALTER TABLE T DROP PARTITION (dt=null)")
+    checkAnswer(
+      spark.sql("SHOW PARTITIONS T"),
+      Row("dt=20240601") :: Nil
+    )
+  }
+
+  test("Paimon Partition Management: timestamp partition column") {
+    spark.sql(s"""
+                 |CREATE TABLE T (a INT, dt TIMESTAMP)
+                 |PARTITIONED BY (dt)
+                 |""".stripMargin)
+
+    spark.sql("INSERT INTO T VALUES (1, CAST('2024-06-01 10:30:01' AS TIMESTAMP))")
+    spark.sql("INSERT INTO T VALUES (2, CAST('2024-06-02 15:45:30' AS TIMESTAMP))")
+
+    checkAnswer(
+      spark.sql("SHOW PARTITIONS T"),
+      Seq(
+        Row("dt=2024-06-01 10%3A30%3A01"),
+        Row("dt=2024-06-02 15%3A45%3A30")
+      )
+    )
+
+    checkAnswer(
+      spark.sql("SELECT * FROM T ORDER BY dt"),
+      spark.sql(
+        "SELECT 1 AS a, CAST('2024-06-01 10:30:01' AS TIMESTAMP) AS dt UNION ALL SELECT 2, CAST('2024-06-02 15:45:30' AS TIMESTAMP) ORDER BY dt")
+    )
+  }
+
+  test("Paimon Partition Management: batch drop partitions") {
+    withTable("T_Batch") {
+      spark.sql(s"""
+                   |CREATE TABLE T_Batch (a INT, dt INT, hh STRING, mm STRING)
+                   |using paimon
+                   |TBLPROPERTIES ('file.format' = 'avro')
+                   |PARTITIONED BY (dt, hh, mm)
+                   |""".stripMargin)
+
+      spark.sql(
+        "INSERT INTO T_Batch VALUES " +
+          "(1, 20240101, '00', '00'), " +
+          "(2, 20240101, '00', '01'), " +
+          "(3, 20240101, '01', '00'), " +
+          "(4, 20240102, '00', '00'), " +
+          "(5, 20240102, '00', '01')")
+      checkAnswer(
+        spark.sql("SHOW PARTITIONS T_Batch"),
+        Row("dt=20240101/hh=00/mm=00") ::
+          Row("dt=20240101/hh=00/mm=01") ::
+          Row("dt=20240101/hh=01/mm=00") ::
+          Row("dt=20240102/hh=00/mm=00") ::
+          Row("dt=20240102/hh=00/mm=01") :: Nil
+      )
+
+      // First, drop all sub-partitions for dt=20240101 by specifying only the first-level partition column dt
+      spark.sql("ALTER TABLE T_Batch DROP PARTITION (dt=20240101)")
+      checkAnswer(
+        spark.sql("SHOW PARTITIONS T_Batch"),
+        Row("dt=20240102/hh=00/mm=00") ::
+          Row("dt=20240102/hh=00/mm=01") :: Nil
+      )
+
+      // Then, drop all sub-partitions under dt=20240102 and hh='00' by specifying the first two partition columns dt and hh
+      spark.sql("ALTER TABLE T_Batch DROP PARTITION (dt=20240102, hh='00')")
+      checkAnswer(
+        spark.sql("SHOW PARTITIONS T_Batch"),
+        Nil
+      )
+    }
+  }
+
+  test("Paimon Partition Management: batch drop partitions with mixed full and partial specs") {
+    withTable("T_Mixed_Batch") {
+      spark.sql(s"""
+                   |CREATE TABLE T_Mixed_Batch (a INT, dt INT, hh STRING, mm STRING)
+                   |using paimon
+                   |TBLPROPERTIES ('file.format' = 'avro')
+                   |PARTITIONED BY (dt, hh, mm)
+                   |""".stripMargin)
+
+      spark.sql(
+        "INSERT INTO T_Mixed_Batch VALUES " +
+          "(1, 20240101, '00', '00'), " +
+          "(2, 20240101, '00', '01'), " +
+          "(3, 20240101, '01', '00'), " +
+          "(4, 20240102, '00', '00'), " +
+          "(5, 20240102, '00', '01')")
+
+      spark.sql(
+        "ALTER TABLE T_Mixed_Batch DROP PARTITION (dt=20240101, hh='00', mm='00'), " +
+          "PARTITION (dt=20240102)")
+
+      checkAnswer(
+        spark.sql("SELECT COUNT(*) FROM `T_Mixed_Batch$snapshots` WHERE commit_kind = 'OVERWRITE'"),
+        Row(1L) :: Nil
+      )
+
+      checkAnswer(
+        spark.sql("SHOW PARTITIONS T_Mixed_Batch"),
+        Row("dt=20240101/hh=00/mm=01") ::
+          Row("dt=20240101/hh=01/mm=00") :: Nil
+      )
+    }
+  }
+}
