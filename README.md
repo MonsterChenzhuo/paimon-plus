@@ -141,6 +141,27 @@ mvn -pl paimon-spark/paimon-spark-common -DskipTests compile
 mvn -pl paimon-native-io -am -Pnative-io -DskipTests package
 ```
 
+使用 `monster830/paimon-plus:spark344-java8` 打包 Spark 3.4、OBS 插件和 Native IO：
+
+```bash
+docker run --rm --entrypoint /bin/bash \
+  -v "/Users/opay-20240095/IdeaProjects/nativeio:/work/nativeio" \
+  -v "$HOME/.m2:/root/.m2" \
+  -w /work/nativeio/paimon-plus \
+  monster830/paimon-plus:spark344-java8 \
+  -c 'set -euo pipefail;
+      export PATH=/opt/maven/bin:/usr/local/cargo/bin:/opt/spark/bin:/opt/java/openjdk/bin:$PATH;
+      mvn -T 1C \
+        -pl :paimon-spark-3.4_2.12,:paimon-obs,:paimon-native-io \
+        -am \
+        -Pfast-build,spark3,native-io \
+        -DskipTests \
+        -Dscala.binary.version=2.12 \
+        package'
+```
+
+该命令要求 `paimon-plus` 与 `obs-rust-sdk` 同在 `/Users/opay-20240095/IdeaProjects/nativeio` 下。运行 Spark 时需要同时带上 `paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar`、`paimon-obs-1.4-SNAPSHOT.jar` 和 `paimon-native-io-1.4-SNAPSHOT.jar`。
+
 格式化代码：
 
 ```bash
