@@ -21,7 +21,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." >/dev/null && pwd)"
-WORKSPACE_ROOT="$(cd "${PROJECT_ROOT}/.." >/dev/null && pwd)"
 
 IMAGE="${PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE:-${PAIMON_NATIVE_IO_DOCKER_IMAGE:-paimon-nativeio-centos7:local}}"
 PLATFORM="${PAIMON_NATIVE_IO_DOCKER_PLATFORM:-linux/amd64}"
@@ -78,12 +77,6 @@ case "${PLATFORM}" in
         exit 1
         ;;
 esac
-
-if [ ! -d "${WORKSPACE_ROOT}/obs-rust-sdk" ]; then
-    echo "Missing required sibling repository: ${WORKSPACE_ROOT}/obs-rust-sdk" >&2
-    echo "package-jars.sh expects paimon-plus and obs-rust-sdk under the same parent directory." >&2
-    exit 1
-fi
 
 if is_truthy "${BUILD_IMAGE}"; then
     build_image

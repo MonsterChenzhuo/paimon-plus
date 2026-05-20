@@ -17,4 +17,4 @@ parquet = { version = "57", default-features = true, features = ["arrow"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 url = "2"
-huaweicloud-sdk-rust-obs = { path = "../../../obs-rust-sdk" }
+huaweicloud-sdk-rust-obs = { path = "vendor/huaweicloud-sdk-rust-obs" }

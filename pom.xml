@@ -646,6 +646,8 @@ under the License.
                         <exclude>**/dependency-reduced-pom.xml</exclude>
                         <!-- Bundled license files -->
                         <exclude>**/LICENSE*</exclude>
+                        <!-- Bundled OBS Rust SDK source -->
+                        <exclude>paimon-native-io/rust/vendor/huaweicloud-sdk-rust-obs/**</exclude>
                         <!-- artifacts created during release process -->
                         <exclude>release/**</exclude>
                         <!-- antlr grammar files -->

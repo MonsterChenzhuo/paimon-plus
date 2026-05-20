@@ -24,7 +24,6 @@ DOCKER_PLATFORM="${PAIMON_NATIVE_IO_DOCKER_PLATFORM:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." >/dev/null && pwd)"
-WORKSPACE_ROOT="$(cd "${PROJECT_ROOT}/.." >/dev/null && pwd)"
 PROJECT_NAME="$(basename "${PROJECT_ROOT}")"
 OUTPUT_DIR="${PROJECT_ROOT}/native-io"
 
@@ -85,7 +84,7 @@ if [ -n "${DOCKER_PLATFORM}" ]; then
 fi
 
 docker run "${DOCKER_RUN_ARGS[@]}" \
-    -v "${WORKSPACE_ROOT}:/work/nativeio" \
+    -v "${PROJECT_ROOT}:/work/nativeio/${PROJECT_NAME}" \
     -v "${HOME}/.m2:/root/.m2" \
     -w "/work/nativeio/${PROJECT_NAME}" \
     "${IMAGE}" \

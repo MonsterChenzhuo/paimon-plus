@@ -150,7 +150,7 @@ mvn -pl paimon-native-io -am -Pnative-io -DskipTests package
 tools/native-io/package-jars.sh
 ```
 
-该脚本默认把当前仓库的父目录挂载到容器的 `/work/nativeio`，因此 `paimon-plus` 与 `obs-rust-sdk` 需要在同一父目录下。运行 Spark 时需要同时带上 `native-io/` 下的 `paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar`、`paimon-obs-1.4-SNAPSHOT.jar` 和 `paimon-native-io-1.4-SNAPSHOT.jar`。
+该脚本默认把当前仓库挂载到容器的 `/work/nativeio/paimon-plus`。运行 Spark 时需要同时带上 `native-io/` 下的 `paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar`、`paimon-obs-1.4-SNAPSHOT.jar` 和 `paimon-native-io-1.4-SNAPSHOT.jar`。
 如果要给 x86_64 YARN 集群打包 native library，可显式指定 Docker platform：
 
 ```bash
