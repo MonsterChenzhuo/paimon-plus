@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Current checkout note:** core SPI, provider registration, export option validation, fallback controls, JNR FFI wrapper, JSON request/result models, Spark source-file planning, DV position extraction, predicate JSON conversion, Rust export execution, native writer target-size rolling, export read projection, OBS range read metrics, and temp-file-backed OBS multipart upload are present. The remaining production hardening items are direct streaming multipart writes, compressed-size-aware rolling, fuller schema evolution/type coverage, and real OBS end-to-end benchmark validation.
+> **Current checkout note:** core SPI, provider registration, export option validation, fallback controls, JNR FFI wrapper, JSON request/result models, Spark source-file planning, DV position extraction, predicate JSON conversion, Rust export execution, native writer target-size rolling based on encoded parquet size estimates, export read projection, OBS range read metrics, and temp-file-backed OBS multipart upload are present. The remaining production hardening items are direct streaming multipart writes, fuller schema evolution/type coverage, and real OBS end-to-end benchmark validation.
 
 **Goal:** Build a native fast path for `CALL sys.export_parquet` so Spark tasks call Rust directly to read OBS Parquet, apply supported filters and DV, and write Parquet output without materializing JVM `InternalRow`.
 

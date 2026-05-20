@@ -1226,9 +1226,7 @@ fn write_projected_export_batch(
         }
 
         let roll_limit = export_roll_limit(task);
-        let buffered = writer.as_ref().unwrap().buffered_bytes;
-        let batch_bytes = record_batch_memory_size(&batch);
-        if roll_limit != u64::MAX && buffered > 0 && buffered + batch_bytes > roll_limit {
+        if should_roll_export_writer(writer.as_ref().unwrap(), roll_limit) {
             let finished = writer.take().unwrap();
             finish_export_writer(
                 finished,
@@ -1244,46 +1242,33 @@ fn write_projected_export_batch(
             continue;
         }
 
-        if roll_limit != u64::MAX && buffered + batch_bytes > roll_limit && batch.num_rows() > 1 {
-            let remaining = roll_limit.saturating_sub(buffered).max(1);
-            let rows = batch.num_rows() as u64;
-            let to_write = ((rows * remaining) / batch_bytes.max(1)).max(1);
-            if to_write < rows {
-                let to_write = to_write as usize;
-                let head = batch.slice(0, to_write);
-                let tail = batch.slice(to_write, batch.num_rows() - to_write);
-                write_export_chunk(
-                    writer.as_mut().unwrap(),
-                    &head,
-                    peak_buffered_bytes,
-                    encode_ms,
-                )?;
-                batch = tail;
-                if writer.as_ref().unwrap().buffered_bytes >= roll_limit {
-                    let finished = writer.take().unwrap();
-                    finish_export_writer(
-                        finished,
-                        files_written,
-                        &task.object_store_options,
-                        obs_write_requests,
-                        obs_write_bytes,
-                        encode_ms,
-                        obs_write_ms,
-                        multipart_finish_ms,
-                    )?;
-                    *writer_rolls += 1;
-                }
-                continue;
-            }
-        }
-
+        let to_write = next_export_write_rows(writer.as_ref().unwrap(), task, batch.num_rows());
+        let chunk = batch.slice(0, to_write);
         write_export_chunk(
             writer.as_mut().unwrap(),
-            &batch,
+            &chunk,
+            task.memory_limit_bytes,
             peak_buffered_bytes,
             encode_ms,
         )?;
-        break;
+        if should_roll_export_writer(writer.as_ref().unwrap(), roll_limit) {
+            let finished = writer.take().unwrap();
+            finish_export_writer(
+                finished,
+                files_written,
+                &task.object_store_options,
+                obs_write_requests,
+                obs_write_bytes,
+                encode_ms,
+                obs_write_ms,
+                multipart_finish_ms,
+            )?;
+            *writer_rolls += 1;
+        }
+        if to_write == batch.num_rows() {
+            break;
+        }
+        batch = batch.slice(to_write, batch.num_rows() - to_write);
     }
     Ok(())
 }
@@ -1324,16 +1309,21 @@ fn create_export_writer(
 fn write_export_chunk(
     writer: &mut ActiveExportWriter,
     batch: &RecordBatch,
+    memory_limit_bytes: u64,
     peak_buffered_bytes: &mut u64,
     encode_ms: &mut u64,
 ) -> Result<(), String> {
     let encode_start = std::time::Instant::now();
     writer.writer.write(batch).map_err(|e| e.to_string())?;
+    if writer.writer.memory_size() as u64 >= memory_limit_bytes {
+        writer.writer.flush().map_err(|e| e.to_string())?;
+    }
     *encode_ms += elapsed_ms(encode_start);
     writer.rows += batch.num_rows() as u64;
-    writer.buffered_bytes += record_batch_memory_size(batch);
+    writer.buffered_bytes = writer_buffered_bytes(writer);
     *peak_buffered_bytes = (*peak_buffered_bytes)
         .max(writer.buffered_bytes)
+        .max(record_batch_memory_size(batch))
         .max(writer.writer.memory_size() as u64)
         .max(writer.writer.in_progress_size() as u64);
     Ok(())
@@ -1387,7 +1377,29 @@ fn finish_export_writer(
 
 fn export_roll_limit(task: &ExportTask) -> u64 {
     task.target_file_size_bytes
-        .min(task.memory_limit_bytes.max(1))
+}
+
+fn next_export_write_rows(
+    writer: &ActiveExportWriter,
+    task: &ExportTask,
+    remaining_rows: usize,
+) -> usize {
+    let row_group_size = task.writer_row_group_size.max(1);
+    let in_progress_rows = writer.writer.in_progress_rows();
+    let rows_until_row_group_boundary = row_group_size.saturating_sub(in_progress_rows).max(1);
+    remaining_rows.min(rows_until_row_group_boundary)
+}
+
+fn should_roll_export_writer(writer: &ActiveExportWriter, roll_limit: u64) -> bool {
+    roll_limit != u64::MAX && writer.rows > 0 && writer_estimated_output_bytes(writer) >= roll_limit
+}
+
+fn writer_estimated_output_bytes(writer: &ActiveExportWriter) -> u64 {
+    writer.writer.bytes_written() as u64 + writer.writer.in_progress_size() as u64
+}
+
+fn writer_buffered_bytes(writer: &ActiveExportWriter) -> u64 {
+    (writer.writer.memory_size() as u64).max(writer.writer.in_progress_size() as u64)
 }
 
 fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
@@ -1977,6 +1989,21 @@ mod tests {
         path
     }
 
+    fn write_string_parquet_column(name: &str, values: Vec<String>) -> String {
+        let path = temp_parquet_path("string");
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(values)) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
     #[test]
     fn native_export_writes_local_parquet_with_predicate_and_partition() {
         let input = write_i64_parquet_columns(vec![("id", vec![1, 2, 3])]);
@@ -2194,6 +2221,56 @@ mod tests {
         );
         assert!(result["metrics"]["writer_rolls"].as_u64().unwrap() > 0);
         assert!(result["metrics"]["peak_buffered_bytes"].as_u64().unwrap() > 0);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_rolling_uses_encoded_parquet_size_not_arrow_memory() {
+        let input = write_string_parquet_column(
+            "payload",
+            (0..2000)
+                .map(|_| "compressible-payload-value".repeat(8))
+                .collect(),
+        );
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-encoded-roll-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "target_file_size_bytes": 8192,
+            "writer_batch_size": 2000,
+            "writer_row_group_size": 2000,
+            "memory_limit_bytes": 1024 * 1024,
+            "projection": ["payload"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 2000,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+
+        let result = export_parquet(&request.to_string()).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(2000));
+        let files = result["files_written"].as_array().unwrap();
+        assert!(
+            files.len() <= 3,
+            "expected compressed-size rolling to avoid many tiny files: {}",
+            result
+        );
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_dir_all(output_dir);
