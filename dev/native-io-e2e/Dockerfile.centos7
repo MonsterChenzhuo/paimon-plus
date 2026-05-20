@@ -78,15 +78,14 @@ RUN set -eux; \
       *) \
         echo "Skipping Spark binary installation for jar packaging image."; \
         ;; \
-    esac; \
-    rm -rf /tmp/spark-local
+    esac
 
 RUN set -eux; \
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
     chmod -R a+rX "${CARGO_HOME}" "${RUSTUP_HOME}"
 
 RUN set -eux; \
-    ldd --version | head -n 1; \
+    ldd --version | sed -n '1p'; \
     java -version; \
     mvn -version; \
     rustc --version; \

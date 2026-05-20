@@ -82,20 +82,20 @@ prepare_build_context() {
             exit 1
         fi
         BUILD_CONTEXT="$(mktemp -d)"
-        trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
         mkdir -p "${BUILD_CONTEXT}/spark-local"
         cp "${PAIMON_NATIVE_IO_SPARK_TGZ}" "${BUILD_CONTEXT}/spark-local/spark.tgz"
         SPARK_LOCAL_KIND="tgz"
+        echo "Prepared temporary Docker build context: ${BUILD_CONTEXT}"
     elif [ -n "${PAIMON_NATIVE_IO_SPARK_DIR:-}" ]; then
         if [ ! -d "${PAIMON_NATIVE_IO_SPARK_DIR}" ]; then
             echo "Missing Spark directory: ${PAIMON_NATIVE_IO_SPARK_DIR}" >&2
             exit 1
         fi
         BUILD_CONTEXT="$(mktemp -d)"
-        trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
         mkdir -p "${BUILD_CONTEXT}/spark-local/spark"
         cp -R "${PAIMON_NATIVE_IO_SPARK_DIR}/." "${BUILD_CONTEXT}/spark-local/spark/"
         SPARK_LOCAL_KIND="dir"
+        echo "Prepared temporary Docker build context: ${BUILD_CONTEXT}"
     fi
 }
 
