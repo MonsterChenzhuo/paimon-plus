@@ -43,7 +43,7 @@ CALL sys.export_parquet(
 - Spark 读路径可通过动态参数启用 native IO。
 - Native reader 通过 Arrow batch 返回数据，降低 JVM row-by-row 读取开销。
 - OBS 相关配置可从 Spark Hadoop conf、Paimon options 或环境变量透传。
-- `export_parquet` native fast path 的设计与计划文档已在 `docs/superpowers` 下维护。
+- `export_parquet` 已接入 native fast path 的 SPI、配置校验、Spark split 到 raw Parquet source file 的规划、DV position 下沉、predicate JSON 转换、JNR FFI 和 Rust 读写 pipeline。
 
 常用开关：
 
@@ -56,11 +56,14 @@ SET spark.paimon.native-io.max-batch-bytes='64 MB';
 `export_parquet` native fast path 相关配置：
 
 ```sql
+SET spark.paimon.native-io.enabled=true;
 SET spark.paimon.native-io.export.enabled=true;
-SET spark.paimon.native-io.export.fallback.enabled=true;
 SET spark.paimon.native-io.export.metrics.enabled=true;
 SET spark.paimon.native-io.export.memory-limit='512 MB';
+SET spark.paimon.native-io.export.fail-on-fallback=true;
 ```
+
+默认 `spark.paimon.native-io.export.fallback.enabled=true`，driver preflight 不适用时会回退 Java export。压测或验收 native fast path 时建议设置 `spark.paimon.native-io.export.fail-on-fallback=true`，这样未命中 native 会直接抛出 reject reason，便于确认是否真正走到 native。
 
 Native IO 设计入口：
 
@@ -141,26 +144,18 @@ mvn -pl paimon-spark/paimon-spark-common -DskipTests compile
 mvn -pl paimon-native-io -am -Pnative-io -DskipTests package
 ```
 
-使用 `monster830/paimon-plus:spark344-java8` 打包 Spark 3.4、OBS 插件和 Native IO：
+使用 `monster830/paimon-plus:spark344-java8` 打包 Spark 3.4、OBS 插件和 Native IO，并把运行所需的三个 jar 复制到当前项目的 `native-io/` 目录：
 
 ```bash
-docker run --rm --entrypoint /bin/bash \
-  -v "/Users/opay-20240095/IdeaProjects/nativeio:/work/nativeio" \
-  -v "$HOME/.m2:/root/.m2" \
-  -w /work/nativeio/paimon-plus \
-  monster830/paimon-plus:spark344-java8 \
-  -c 'set -euo pipefail;
-      export PATH=/opt/maven/bin:/usr/local/cargo/bin:/opt/spark/bin:/opt/java/openjdk/bin:$PATH;
-      mvn -T 1C \
-        -pl :paimon-spark-3.4_2.12,:paimon-obs,:paimon-native-io \
-        -am \
-        -Pfast-build,spark3,native-io \
-        -DskipTests \
-        -Dscala.binary.version=2.12 \
-        package'
+tools/native-io/package-jars.sh
 ```
 
-该命令要求 `paimon-plus` 与 `obs-rust-sdk` 同在 `/Users/opay-20240095/IdeaProjects/nativeio` 下。运行 Spark 时需要同时带上 `paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar`、`paimon-obs-1.4-SNAPSHOT.jar` 和 `paimon-native-io-1.4-SNAPSHOT.jar`。
+该脚本默认把当前仓库的父目录挂载到容器的 `/work/nativeio`，因此 `paimon-plus` 与 `obs-rust-sdk` 需要在同一父目录下。运行 Spark 时需要同时带上 `native-io/` 下的 `paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar`、`paimon-obs-1.4-SNAPSHOT.jar` 和 `paimon-native-io-1.4-SNAPSHOT.jar`。
+如果要给 x86_64 YARN 集群打包 native library，可显式指定 Docker platform：
+
+```bash
+PAIMON_NATIVE_IO_DOCKER_PLATFORM=linux/amd64 tools/native-io/package-jars.sh
+```
 
 格式化代码：
 

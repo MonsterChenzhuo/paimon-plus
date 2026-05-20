@@ -10,6 +10,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arrow-array = { version = "57", features = ["ffi"] }
 arrow-schema = "57"
+arrow-select = "57"
 bytes = "1"
 futures = "0.3"
 parquet = { version = "57", default-features = true, features = ["arrow"] }

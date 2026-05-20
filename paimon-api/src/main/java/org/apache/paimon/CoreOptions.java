@@ -413,6 +413,82 @@ public class CoreOptions implements Serializable {
                     .defaultValue(MemorySize.ofMebiBytes(64))
                     .withDescription("The maximum memory size returned by one native IO batch.");
 
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_ENABLED =
+            key("native-io.export.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Whether to enable native fast path for sys.export_parquet.");
+
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_FALLBACK_ENABLED =
+            key("native-io.export.fallback.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether sys.export_parquet may fall back to the Java path when native export is not applicable during driver preflight.");
+
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_FAIL_ON_FALLBACK =
+            key("native-io.export.fail-on-fallback")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether sys.export_parquet should fail instead of falling back when native export is requested but not applicable.");
+
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_METRICS_ENABLED =
+            key("native-io.export.metrics.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription("Whether native export should return and log task metrics.");
+
+    public static final ConfigOption<MemorySize> NATIVE_IO_EXPORT_OBS_READ_BUFFER_SIZE =
+            key("native-io.export.obs.read-buffer-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(8))
+                    .withDescription(
+                            "Sequential read buffer size used by native OBS export reader.");
+
+    public static final ConfigOption<Integer> NATIVE_IO_EXPORT_OBS_READ_CONCURRENCY =
+            key("native-io.export.obs.read-concurrency")
+                    .intType()
+                    .defaultValue(4)
+                    .withDescription("Maximum per-task native OBS read concurrency for export.");
+
+    public static final ConfigOption<Integer> NATIVE_IO_EXPORT_WRITER_BATCH_SIZE =
+            key("native-io.export.writer.batch-size")
+                    .intType()
+                    .defaultValue(8192)
+                    .withDescription("Arrow record batch size used by native export writer.");
+
+    public static final ConfigOption<Integer> NATIVE_IO_EXPORT_WRITER_ROW_GROUP_SIZE =
+            key("native-io.export.writer.row-group-size")
+                    .intType()
+                    .defaultValue(250000)
+                    .withDescription("Maximum rows per row group used by native export writer.");
+
+    public static final ConfigOption<MemorySize> NATIVE_IO_EXPORT_WRITER_MULTIPART_PART_SIZE =
+            key("native-io.export.writer.multipart-part-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(64))
+                    .withDescription("Multipart upload part size used by native export writer.");
+
+    public static final ConfigOption<MemorySize> NATIVE_IO_EXPORT_MEMORY_LIMIT =
+            key("native-io.export.memory-limit")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(512))
+                    .withDescription("Soft memory limit per native export task.");
+
+    public static final ConfigOption<Integer> NATIVE_IO_EXPORT_RUNTIME_THREADS =
+            key("native-io.export.runtime-threads")
+                    .intType()
+                    .defaultValue(4)
+                    .withDescription("Worker thread count for process-wide native export runtime.");
+
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_METADATA_CACHE_ENABLED =
+            key("native-io.export.metadata-cache.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether native export may use process-wide parquet metadata cache.");
+
     @ExcludeFromDocumentation("Internal use only")
     public static final ConfigOption<String> NATIVE_IO_INTERNAL_ENGINE =
             key("__paimon.internal.native-io.engine")

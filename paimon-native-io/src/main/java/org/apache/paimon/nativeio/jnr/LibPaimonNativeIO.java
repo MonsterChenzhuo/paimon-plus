@@ -19,6 +19,7 @@
 package org.apache.paimon.nativeio.jnr;
 
 import jnr.ffi.Pointer;
+import jnr.ffi.byref.PointerByReference;
 
 /** JNR ABI binding for the optional paimon native IO library. */
 public interface LibPaimonNativeIO {
@@ -48,4 +49,16 @@ public interface LibPaimonNativeIO {
     int paimon_reader_get_schema(Pointer reader, long arrowSchemaAddress);
 
     String paimon_reader_last_error(Pointer reader);
+
+    Pointer paimon_exporter_new();
+
+    void paimon_exporter_free(Pointer exporter);
+
+    int paimon_exporter_export_parquet(
+            Pointer exporter,
+            String requestJson,
+            PointerByReference resultJson,
+            PointerByReference errorMessage);
+
+    void paimon_string_free(Pointer value);
 }
