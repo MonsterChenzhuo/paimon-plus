@@ -17,11 +17,15 @@
 # limitations under the License.
 ################################################################################
 
-FROM quay.io/pypa/manylinux2014_x86_64
+ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux2014_x86_64
+FROM ${MANYLINUX_IMAGE}
 
 ARG JDK8_URL=https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse
 ARG MAVEN_VERSION=3.9.9
 ARG SPARK_VERSION=3.4.4
+ARG SPARK_TGZ_URL=https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz
+ARG SPARK_LOCAL_KIND=none
+ARG INSTALL_SPARK=0
 ARG RUST_TOOLCHAIN=stable
 
 ENV JAVA_HOME=/opt/java/openjdk
@@ -45,11 +49,37 @@ RUN set -eux; \
     tar -xzf /tmp/maven.tgz -C "${MAVEN_HOME}" --strip-components=1; \
     rm -f /tmp/maven.tgz
 
+COPY spark-local /tmp/spark-local
+
 RUN set -eux; \
-    curl -fsSL "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" -o /tmp/spark.tgz; \
-    tar -xzf /tmp/spark.tgz -C /opt; \
-    mv "/opt/spark-${SPARK_VERSION}-bin-hadoop3" "${SPARK_HOME}"; \
-    rm -f /tmp/spark.tgz
+    case "${INSTALL_SPARK}" in \
+      1|true|TRUE|yes|YES|y|Y) \
+        case "${SPARK_LOCAL_KIND}" in \
+          tgz) \
+            tar -xzf /tmp/spark-local/spark.tgz -C /opt; \
+            mv "/opt/spark-${SPARK_VERSION}-bin-hadoop3" "${SPARK_HOME}"; \
+            ;; \
+          dir) \
+            mkdir -p "${SPARK_HOME}"; \
+            cp -a /tmp/spark-local/spark/. "${SPARK_HOME}/"; \
+            ;; \
+          none) \
+            curl -fsSL "${SPARK_TGZ_URL}" -o /tmp/spark.tgz; \
+            tar -xzf /tmp/spark.tgz -C /opt; \
+            mv "/opt/spark-${SPARK_VERSION}-bin-hadoop3" "${SPARK_HOME}"; \
+            rm -f /tmp/spark.tgz; \
+            ;; \
+          *) \
+            echo "Unsupported SPARK_LOCAL_KIND: ${SPARK_LOCAL_KIND}" >&2; \
+            exit 1; \
+            ;; \
+        esac; \
+        ;; \
+      *) \
+        echo "Skipping Spark binary installation for jar packaging image."; \
+        ;; \
+    esac; \
+    rm -rf /tmp/spark-local
 
 RUN set -eux; \
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
@@ -61,6 +91,6 @@ RUN set -eux; \
     mvn -version; \
     rustc --version; \
     cargo --version; \
-    spark-submit --version
+    if [ -x "${SPARK_HOME}/bin/spark-submit" ]; then spark-submit --version; fi
 
 WORKDIR /work/nativeio/paimon

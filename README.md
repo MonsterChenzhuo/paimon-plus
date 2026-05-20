@@ -163,13 +163,35 @@ PAIMON_NATIVE_IO_DOCKER_PLATFORM=linux/amd64 tools/native-io/package-jars.sh
 tools/native-io/package-centos7-jars.sh
 ```
 
-脚本默认构建本地镜像 `paimon-nativeio-centos7:local`，再调用 `tools/native-io/package-jars.sh`。如果本地镜像已经存在，可跳过镜像构建：
+脚本默认构建本地镜像 `paimon-nativeio-centos7:local`，再调用 `tools/native-io/package-jars.sh`。打包 jar 默认不安装 Spark 二进制，避免在线下载 `spark-3.4.4-bin-hadoop3.tgz`。如果确实需要把 Spark 放进镜像，可使用本地压缩包或已解压目录：
+
+```bash
+PAIMON_NATIVE_IO_SPARK_TGZ=/data/soft/spark-3.4.4-bin-hadoop3.tgz \
+  tools/native-io/package-centos7-jars.sh
+
+PAIMON_NATIVE_IO_SPARK_DIR=/data/soft/spark-3.4.4-bin-hadoop3 \
+  tools/native-io/package-centos7-jars.sh
+```
+
+如果本地镜像已经存在，可跳过镜像构建：
 
 ```bash
 PAIMON_NATIVE_IO_BUILD_IMAGE=0 tools/native-io/package-centos7-jars.sh
 ```
 
 可通过 `PAIMON_NATIVE_IO_DOCKER_IMAGE` 或 `PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE` 指定本地镜像 tag。
+
+构建并推送瘦身后的多架构 CentOS 7 兼容构建镜像：
+
+```bash
+docker login
+
+PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE=monster830/paimon-plus:paimon-nativeio-centos7-java8 \
+PAIMON_NATIVE_IO_PUSH_IMAGE=1 \
+  tools/native-io/build-centos7-image.sh
+```
+
+该脚本默认发布 `linux/amd64,linux/arm64` 两个架构。多架构镜像不包含 Spark 二进制；如需包含 Spark，可同样传入 `PAIMON_NATIVE_IO_SPARK_TGZ` 或 `PAIMON_NATIVE_IO_SPARK_DIR`。
 
 格式化代码：
 

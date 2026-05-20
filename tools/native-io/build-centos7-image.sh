@@ -22,9 +22,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." >/dev/null && pwd)"
 
-IMAGE="${PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE:-${PAIMON_NATIVE_IO_DOCKER_IMAGE:-paimon-nativeio-centos7:local}}"
-PLATFORM="${PAIMON_NATIVE_IO_DOCKER_PLATFORM:-linux/amd64}"
-BUILD_IMAGE="${PAIMON_NATIVE_IO_BUILD_IMAGE:-1}"
+IMAGE="${PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE:-monster830/paimon-plus:paimon-nativeio-centos7-java8}"
+PLATFORMS="${PAIMON_NATIVE_IO_DOCKER_PLATFORMS:-linux/amd64,linux/arm64}"
+PUSH_IMAGE="${PAIMON_NATIVE_IO_PUSH_IMAGE:-0}"
 if [ -n "${PAIMON_NATIVE_IO_SPARK_TGZ:-}" ] || [ -n "${PAIMON_NATIVE_IO_SPARK_DIR:-}" ]; then
     INSTALL_SPARK="${PAIMON_NATIVE_IO_INSTALL_SPARK:-1}"
 else
@@ -35,12 +35,40 @@ CONTEXT_DIR="${PROJECT_ROOT}/dev/native-io-e2e"
 BUILD_CONTEXT="${CONTEXT_DIR}"
 SPARK_LOCAL_KIND="none"
 
+usage() {
+    cat <<EOF
+Usage: tools/native-io/build-centos7-image.sh
+
+Environment variables:
+  PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE  Image tag to build. Default: ${IMAGE}
+  PAIMON_NATIVE_IO_DOCKER_PLATFORMS      Comma-separated platforms. Default: ${PLATFORMS}
+  PAIMON_NATIVE_IO_PUSH_IMAGE            Set to 1 to push and create a multi-arch manifest.
+  PAIMON_NATIVE_IO_SPARK_TGZ             Optional local spark-*-bin-hadoop3.tgz path.
+  PAIMON_NATIVE_IO_SPARK_DIR             Optional local unpacked Spark directory.
+  PAIMON_NATIVE_IO_INSTALL_SPARK         Set to 1 to download Spark when no local path is set.
+EOF
+}
+
 is_truthy() {
     case "${1}" in
         1 | true | TRUE | yes | YES | y | Y) return 0 ;;
         *) return 1 ;;
     esac
 }
+
+case "${1:-}" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "Unknown argument: ${1}" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
 
 prepare_build_context() {
     if [ -n "${PAIMON_NATIVE_IO_SPARK_TGZ:-}" ] && [ -n "${PAIMON_NATIVE_IO_SPARK_DIR:-}" ]; then
@@ -71,31 +99,52 @@ prepare_build_context() {
     fi
 }
 
-build_image() {
-    local manylinux_image="${PAIMON_NATIVE_IO_MANYLINUX_IMAGE:-}"
-    local jdk8_url="${PAIMON_NATIVE_IO_JDK8_URL:-}"
+image_repo() {
+    case "${IMAGE}" in
+        *:*) printf '%s\n' "${IMAGE%:*}" ;;
+        *) printf '%s\n' "${IMAGE}" ;;
+    esac
+}
 
-    case "${PLATFORM}" in
-        linux/amd64 | linux/amd64/*)
-            manylinux_image="${manylinux_image:-quay.io/pypa/manylinux2014_x86_64}"
-            jdk8_url="${jdk8_url:-https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse}"
-            ;;
-        linux/arm64 | linux/arm64/*)
-            manylinux_image="${manylinux_image:-quay.io/pypa/manylinux2014_aarch64}"
-            jdk8_url="${jdk8_url:-https://api.adoptium.net/v3/binary/latest/8/ga/linux/aarch64/jdk/hotspot/normal/eclipse}"
-            ;;
+image_tag() {
+    case "${IMAGE}" in
+        *:*) printf '%s\n' "${IMAGE##*:}" ;;
+        *) printf 'latest\n' ;;
+    esac
+}
+
+platform_arch() {
+    case "${1}" in
+        linux/amd64 | linux/amd64/*) printf 'amd64\n' ;;
+        linux/arm64 | linux/arm64/*) printf 'arm64\n' ;;
         *)
-            echo "CentOS 7 compatible Native IO packaging only supports linux/amd64 or linux/arm64, got: ${PLATFORM}" >&2
+            echo "Unsupported platform: ${1}" >&2
             exit 1
             ;;
     esac
+}
 
-    local args=(
-        --platform "${PLATFORM}"
-        -t "${IMAGE}"
+manylinux_image() {
+    case "$(platform_arch "${1}")" in
+        amd64) printf 'quay.io/pypa/manylinux2014_x86_64\n' ;;
+        arm64) printf 'quay.io/pypa/manylinux2014_aarch64\n' ;;
+    esac
+}
+
+jdk8_url() {
+    case "$(platform_arch "${1}")" in
+        amd64) printf 'https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse\n' ;;
+        arm64) printf 'https://api.adoptium.net/v3/binary/latest/8/ga/linux/aarch64/jdk/hotspot/normal/eclipse\n' ;;
+    esac
+}
+
+set_build_args_for_platform() {
+    local platform="$1"
+    args=(
+        --platform "${platform}"
         -f "${DOCKERFILE}"
-        --build-arg "MANYLINUX_IMAGE=${manylinux_image}"
-        --build-arg "JDK8_URL=${jdk8_url}"
+        --build-arg "MANYLINUX_IMAGE=$(manylinux_image "${platform}")"
+        --build-arg "JDK8_URL=$(jdk8_url "${platform}")"
         --build-arg "INSTALL_SPARK=${INSTALL_SPARK}"
         --build-arg "SPARK_LOCAL_KIND=${SPARK_LOCAL_KIND}"
     )
@@ -112,15 +161,6 @@ build_image() {
     if [ -n "${PAIMON_NATIVE_IO_RUST_TOOLCHAIN:-}" ]; then
         args+=(--build-arg "RUST_TOOLCHAIN=${PAIMON_NATIVE_IO_RUST_TOOLCHAIN}")
     fi
-
-    args+=("${BUILD_CONTEXT}")
-
-    echo "Building CentOS 7 compatible Native IO image: ${IMAGE} (${PLATFORM})"
-    if docker buildx version >/dev/null 2>&1; then
-        docker buildx build --load "${args[@]}"
-    else
-        docker build "${args[@]}"
-    fi
 }
 
 if [ ! -f "${DOCKERFILE}" ]; then
@@ -128,13 +168,43 @@ if [ ! -f "${DOCKERFILE}" ]; then
     exit 1
 fi
 
-if is_truthy "${BUILD_IMAGE}"; then
-    prepare_build_context
-    build_image
-else
-    echo "Skipping image build because PAIMON_NATIVE_IO_BUILD_IMAGE=${BUILD_IMAGE}"
+prepare_build_context
+
+if ! docker buildx version >/dev/null 2>&1; then
+    echo "docker buildx is required to build the Native IO image." >&2
+    exit 1
 fi
 
-PAIMON_NATIVE_IO_DOCKER_IMAGE="${IMAGE}" \
-PAIMON_NATIVE_IO_DOCKER_PLATFORM="${PLATFORM}" \
-    "${SCRIPT_DIR}/package-jars.sh"
+IFS=',' read -r -a platform_list <<<"${PLATFORMS}"
+
+if [ "${#platform_list[@]}" -gt 1 ] && ! is_truthy "${PUSH_IMAGE}"; then
+    echo "Multi-architecture build requires PAIMON_NATIVE_IO_PUSH_IMAGE=1." >&2
+    echo "For a local single-platform image, set PAIMON_NATIVE_IO_DOCKER_PLATFORMS=linux/amd64." >&2
+    exit 1
+fi
+
+repo="$(image_repo)"
+tag="$(image_tag)"
+refs=()
+args=()
+
+for platform in "${platform_list[@]}"; do
+    arch="$(platform_arch "${platform}")"
+    if is_truthy "${PUSH_IMAGE}"; then
+        ref="${repo}:${tag}-${arch}"
+        refs+=("${ref}")
+        set_build_args_for_platform "${platform}"
+        echo "Building and pushing ${ref} for ${platform}"
+        docker buildx build --push -t "${ref}" "${args[@]}" "${BUILD_CONTEXT}"
+    else
+        set_build_args_for_platform "${platform}"
+        echo "Building and loading ${IMAGE} for ${platform}"
+        docker buildx build --load -t "${IMAGE}" "${args[@]}" "${BUILD_CONTEXT}"
+    fi
+done
+
+if is_truthy "${PUSH_IMAGE}"; then
+    echo "Creating multi-architecture manifest ${IMAGE}"
+    docker buildx imagetools create -t "${IMAGE}" "${refs[@]}"
+    docker buildx imagetools inspect "${IMAGE}"
+fi
