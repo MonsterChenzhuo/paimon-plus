@@ -1,32 +1,51 @@
 # Apache Paimon
 
-Guidelines for AI coding assistants working with the Apache Paimon codebase.
+面向 AI 编码助手的 Apache Paimon 项目协作指南。
 
-## Syntax Requirements
+## 响应要求
 
-- Based on JDK 8 and Scala 2.12, higher version syntax features must not be used.
+- 默认使用中文解释实现思路、变更内容、验证结果和风险点。
+- 输出应直接、具体，优先说明可执行结论。
 
-## Build and Test
+## 语法要求
 
-Prefer the smallest possible build/test scope and use the speedup techniques below to keep feedback loops fast.
+- 项目基于 JDK 8 和 Scala 2.12，不能使用更高版本才支持的语法特性。
+- 新增 Java、Scala 代码时，应保持与现有模块的代码风格一致。
 
-### Build
+## 项目实现
 
-- Compile a single module: `mvn -pl <module> -DskipTests compile`
-- Compile multiple modules: `mvn -pl <module1>,<module2> -DskipTests compile`
+- 修改前先阅读相关模块的现有实现、测试和调用路径，优先沿用已有抽象与工具方法。
+- 变更范围应尽量收敛，只改动完成需求所必需的文件。
+- 新增行为或修复缺陷时，优先补充最小但有效的测试覆盖。
+- 不做无关格式化、重命名或大范围重构，除非这是完成需求的必要条件。
 
-### Test
+## 分支与提交
 
-Prefer running the narrowest tests.
+- 新代码默认直接在 `main` 分支实现、提交并推送到远端 `main`。
+- 如果用户明确要求使用功能分支、PR 或暂不推送，则以用户要求为准。
+- 提交前检查工作区状态，只暂存和提交本次任务相关文件，避免带入无关改动。
 
-#### Java Tests (surefire)
+## 构建和测试
 
-- Single method: `mvn -pl <module> -Dtest=TestClassName#methodName test`
-- Single class: `mvn -pl <module> -Dtest=TestClassName test`
+优先使用最小可行的构建和测试范围，配合下面的加速方式缩短反馈周期。
 
-#### Scala Tests (scalatest)
+### 构建
 
-Scala tests use `scalatest-maven-plugin`, not surefire. Use `-DwildcardSuites` and `-Dtest=none`:
+- 编译单个模块：`mvn -pl <module> -DskipTests compile`
+- 编译多个模块：`mvn -pl <module1>,<module2> -DskipTests compile`
+
+### 测试
+
+优先运行最窄范围的测试。
+
+#### Java 测试（surefire）
+
+- 单个方法：`mvn -pl <module> -Dtest=TestClassName#methodName test`
+- 单个类：`mvn -pl <module> -Dtest=TestClassName test`
+
+#### Scala 测试（scalatest）
+
+Scala 测试使用 `scalatest-maven-plugin`，不是 surefire。运行时使用 `-DwildcardSuites` 和 `-Dtest=none`：
 
 ```shell
 mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
@@ -34,15 +53,15 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
   -Dtest=none test
 ```
 
-### Local Iteration Speedup
+### 本地迭代加速
 
-Use `-Pfast-build` to skip checkstyle, spotless, enforcer, and rat checks (not for final verification):
+本地迭代时可使用 `-Pfast-build` 跳过 checkstyle、spotless、enforcer 和 rat 检查；最终验证不要依赖该选项：
 
 ```shell
 mvn -pl <module> -Pfast-build -Dtest=TestClassName#methodName test
 ```
 
-Use `-am` if your target module depends on locally changed modules. Add `-DfailIfNoTests=false` to avoid failures for modules without tests:
+如果目标模块依赖本地已修改模块，使用 `-am`。如遇到无测试模块导致失败，可增加 `-DfailIfNoTests=false`：
 
 ```shell
 mvn -pl <module> -am -Pfast-build -DfailIfNoTests=false -Dtest=TestClassName#methodName test
