@@ -4,7 +4,7 @@
 **状态**：待评审  
 **目标读者**：Paimon native IO / Spark SQL 维护者  
 
-> 当前实现状态：native export SPI、配置校验、JNR FFI、JSON request/result 合约、Spark split 到 raw Parquet source file 的规划、DV position 下沉、基础 predicate JSON 转换，以及 Rust 本地/OBS Parquet 读写 pipeline 已落到代码中。当前实现仍是第一阶段 fast path：OBS 写出仍先生成临时本地 Parquet 文件，但超过 `multipart_part_size_bytes` 后会按 part 分片走 OBS multipart upload，不再对大对象执行整文件单 PUT；尚未实现 LakeSoul 风格的 `ArrowWriter` 直接流式 multipart。`target_file_size` 已在 native writer 内按 row group 边界滚动，并使用 ArrowWriter 已写出字节数与 in-progress encoded size 估算，避免按 Arrow batch 内存把高压缩率数据切成大量小文件。Rust export 读 Parquet 时会裁剪到输出列和 predicate 列，并在 OBS range reader 中汇总 read request/bytes 指标。
+> 当前实现状态：native export SPI、配置校验、JNR FFI、JSON request/result 合约、Spark split 到 raw Parquet source file 的规划、DV position 下沉、基础 predicate JSON 转换，以及 Rust 本地/OBS Parquet 读写 pipeline 已落到代码中。当前实现仍是第一阶段 fast path：OBS 写出仍先生成临时本地 Parquet 文件，但超过 `multipart_part_size_bytes` 后会按 part 分片走 OBS multipart upload，不再对大对象执行整文件单 PUT；尚未实现 LakeSoul 风格的 `ArrowWriter` 直接流式 multipart。`target_file_size` 已在 native writer 内按 row group 边界滚动，并使用 ArrowWriter 已写出字节数与 in-progress encoded size 估算，避免按 Arrow batch 内存把高压缩率数据切成大量小文件。Rust export 读 Parquet 时会裁剪到输出列和 predicate 列，并在 OBS range reader 中汇总 read request/bytes 指标；`runtime_threads` 已接入 OBS read/write 复用的进程级 Tokio runtime 初始化。
 
 ---
 

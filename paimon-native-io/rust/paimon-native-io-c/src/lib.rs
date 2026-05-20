@@ -110,6 +110,7 @@ struct ObsObjectInner {
     bucket: String,
     key: String,
     len: u64,
+    runtime_threads: usize,
     metrics: Option<Arc<ObsReadMetrics>>,
 }
 
@@ -327,10 +328,13 @@ fn runtime_worker_threads() -> usize {
     runtime_worker_threads_with(|key| std::env::var(key).ok())
 }
 
-fn global_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+fn global_runtime_with_threads(
+    worker_threads: usize,
+) -> Result<&'static tokio::runtime::Runtime, String> {
+    let worker_threads = worker_threads.max(1);
     match GLOBAL_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(runtime_worker_threads())
+            .worker_threads(worker_threads)
             .enable_all()
             .build()
             .map_err(|e| e.to_string())
@@ -368,17 +372,19 @@ fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String>
 
 impl ObsObjectChunkReader {
     fn new(path: &str, options: &HashMap<String, String>) -> Result<Self, String> {
-        Self::new_with_metrics(path, options, None)
+        Self::new_with_runtime_metrics(path, options, None, runtime_worker_threads())
     }
 
-    fn new_with_metrics(
+    fn new_with_runtime_metrics(
         path: &str,
         options: &HashMap<String, String>,
         metrics: Option<Arc<ObsReadMetrics>>,
+        runtime_threads: usize,
     ) -> Result<Self, String> {
         let location = ObsObjectLocation::parse(path)?;
         let client = build_obs_client(options)?;
-        let len = global_runtime()?
+        let runtime_threads = runtime_threads.max(1);
+        let len = global_runtime_with_threads(runtime_threads)?
             .block_on(async {
                 client
                     .head_object()
@@ -397,6 +403,7 @@ impl ObsObjectChunkReader {
                 bucket: location.bucket,
                 key: location.key,
                 len,
+                runtime_threads,
                 metrics,
             }),
         })
@@ -420,7 +427,7 @@ impl ObsObjectChunkReader {
         if let Some(metrics) = &self.inner.metrics {
             metrics.requests.fetch_add(1, Ordering::Relaxed);
         }
-        let bytes = global_runtime()
+        let bytes = global_runtime_with_threads(self.inner.runtime_threads)
             .map_err(ParquetError::General)?
             .block_on(async {
                 self.inner
@@ -983,6 +990,7 @@ struct ActiveExportWriter {
     output_path: String,
     local_output: String,
     multipart_part_size_bytes: u64,
+    runtime_threads: usize,
     writer: ArrowWriter<File>,
     rows: u64,
     buffered_bytes: u64,
@@ -1300,6 +1308,7 @@ fn create_export_writer(
         output_path,
         local_output,
         multipart_part_size_bytes: task.multipart_part_size_bytes,
+        runtime_threads: task.runtime_threads,
         writer,
         rows: 0,
         buffered_bytes: 0,
@@ -1343,6 +1352,7 @@ fn finish_export_writer(
         output_path,
         local_output,
         multipart_part_size_bytes,
+        runtime_threads,
         writer,
         rows,
         ..
@@ -1360,6 +1370,7 @@ fn finish_export_writer(
             &output_path,
             object_store_options,
             multipart_part_size_bytes,
+            runtime_threads,
         )?;
         *obs_write_ms += elapsed_ms(obs_start);
         *obs_write_requests += stats.requests;
@@ -1420,7 +1431,12 @@ fn build_export_reader(
     if file.path.starts_with("obs://") {
         let metrics = Arc::new(ObsReadMetrics::default());
         let (schema, reader) = build_file_batch_reader(
-            ObsObjectChunkReader::new_with_metrics(&file.path, options, Some(metrics.clone()))?,
+            ObsObjectChunkReader::new_with_runtime_metrics(
+                &file.path,
+                options,
+                Some(metrics.clone()),
+                task.runtime_threads,
+            )?,
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
             Some(&read_columns),
@@ -1737,6 +1753,7 @@ fn upload_local_file_to_obs(
     output_path: &str,
     options: &HashMap<String, String>,
     multipart_part_size_bytes: u64,
+    runtime_threads: usize,
 ) -> Result<UploadStats, String> {
     let (bucket, key) = parse_obs_prefix(output_path)?;
     let bytes = std::fs::metadata(local_path)
@@ -1745,7 +1762,7 @@ fn upload_local_file_to_obs(
     let client = build_obs_client(options)?;
     if bytes <= multipart_part_size_bytes {
         let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
-        global_runtime()?.block_on(async {
+        global_runtime_with_threads(runtime_threads)?.block_on(async {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -1768,6 +1785,7 @@ fn upload_local_file_to_obs(
             &key,
             client,
             multipart_part_size_bytes,
+            runtime_threads,
         )
     }
 }
@@ -1814,6 +1832,7 @@ fn upload_local_file_to_obs_multipart(
     key: &str,
     client: Client,
     multipart_part_size_bytes: u64,
+    runtime_threads: usize,
 ) -> Result<UploadStats, String> {
     let ranges = multipart_part_ranges(
         std::fs::metadata(local_path)
@@ -1821,7 +1840,7 @@ fn upload_local_file_to_obs_multipart(
             .len(),
         multipart_part_size_bytes,
     )?;
-    global_runtime()?.block_on(async {
+    global_runtime_with_threads(runtime_threads)?.block_on(async {
         let initiate = client
             .initiate_multipart_upload()
             .bucket(bucket)
@@ -2307,6 +2326,41 @@ mod tests {
             export_read_columns(&task),
             vec!["id".to_string(), "dt".to_string(), "score".to_string()]
         );
+    }
+
+    #[test]
+    fn native_export_writer_carries_configured_runtime_threads() {
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-runtime-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let task = ExportTask {
+            output_path: output_dir.to_string_lossy().to_string(),
+            compression: "zstd".to_string(),
+            target_file_size_bytes: u64::MAX,
+            read_buffer_size_bytes: 8 * 1024 * 1024,
+            read_concurrency: 4,
+            writer_batch_size: 1024,
+            writer_row_group_size: 1024,
+            multipart_part_size_bytes: 64 * 1024 * 1024,
+            memory_limit_bytes: 1024 * 1024,
+            runtime_threads: 7,
+            metadata_cache_enabled: true,
+            projection: vec!["id".to_string()],
+            predicate_format: "paimon-json-v1".to_string(),
+            predicate: serde_json::json!({"op":"true"}),
+            object_store_options: HashMap::new(),
+            files: Vec::new(),
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let writer = create_export_writer(&task, schema, 0).unwrap();
+
+        assert_eq!(writer.runtime_threads, 7);
+        let _ = std::fs::remove_file(writer.local_output);
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 
     #[test]
