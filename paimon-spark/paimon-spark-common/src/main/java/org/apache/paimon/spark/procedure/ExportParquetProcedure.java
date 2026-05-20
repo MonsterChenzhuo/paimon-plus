@@ -20,6 +20,7 @@ package org.apache.paimon.spark.procedure;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.parquet.ParquetWriterFactory;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
@@ -32,6 +33,7 @@ import org.apache.paimon.operation.nativeio.export.NativeExportPlanDescriptor;
 import org.apache.paimon.operation.nativeio.export.NativeExportPreflightResult;
 import org.apache.paimon.operation.nativeio.export.NativeExportProvider;
 import org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory;
+import org.apache.paimon.operation.nativeio.export.NativeExportSourceFile;
 import org.apache.paimon.operation.nativeio.export.NativeExportTaskResult;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
@@ -44,6 +46,7 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.IncrementalSplit;
+import org.apache.paimon.table.source.RawFile;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
@@ -85,6 +88,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -232,7 +236,8 @@ public class ExportParquetProcedure extends BaseProcedure {
                         compression,
                         targetFileSize,
                         outputType,
-                        plannedSplits.size());
+                        plannedSplits,
+                        projectedPredicate);
         if (nativeExportAttempt.isPresent()) {
             NativeExportAttempt attempt = nativeExportAttempt.get();
             if (attempt.preflight.applicable()) {
@@ -245,11 +250,14 @@ public class ExportParquetProcedure extends BaseProcedure {
                     "Native export requested but rejected. reason={}, detail={}",
                     attempt.preflight.reason(),
                     attempt.preflight.detail());
-            throw new UnsupportedOperationException(
-                    "Native export is enabled but not applicable. reason="
-                            + attempt.preflight.reason()
-                            + ", detail="
-                            + attempt.preflight.detail());
+            if (!attempt.context.options().get(CoreOptions.NATIVE_IO_EXPORT_FALLBACK_ENABLED)
+                    || attempt.context.options().get(CoreOptions.NATIVE_IO_EXPORT_FAIL_ON_FALLBACK)) {
+                throw new UnsupportedOperationException(
+                        "Native export is enabled but not applicable. reason="
+                                + attempt.preflight.reason()
+                                + ", detail="
+                                + attempt.preflight.detail());
+            }
         }
 
         prepareOutputDirectory(outputFileIO, outputDir, overwrite);
@@ -377,7 +385,9 @@ public class ExportParquetProcedure extends BaseProcedure {
             String compression,
             @Nullable Long targetFileSize,
             RowType outputType,
-            int plannedSplitCount) {
+            List<Split> plannedSplits,
+            @Nullable Predicate projectedPredicate)
+            throws IOException {
         Options options = exportOptions(table);
         if (!options.get(CoreOptions.NATIVE_IO_EXPORT_ENABLED)) {
             return Optional.empty();
@@ -393,11 +403,13 @@ public class ExportParquetProcedure extends BaseProcedure {
                         compression,
                         targetFileSize,
                         outputType.getFieldNames(),
-                        plannedSplitCount);
+                        plannedSplits.size(),
+                        nativeSourceFiles(table, plannedSplits),
+                        projectedPredicate);
         LOG.info(
                 "Native export requested for sys.export_parquet. outputPath={}, splits={}, projection={}",
                 outputPath,
-                plannedSplitCount,
+                plannedSplits.size(),
                 outputType.getFieldNames());
         if (factories.isEmpty()) {
             return Optional.of(
@@ -412,6 +424,74 @@ public class ExportParquetProcedure extends BaseProcedure {
         NativeExportProvider provider = factories.get(0).create();
         NativeExportPreflightResult preflight = provider.preflight(context);
         return Optional.of(new NativeExportAttempt(provider, context, preflight));
+    }
+
+    private List<NativeExportSourceFile> nativeSourceFiles(Table table, List<Split> plannedSplits)
+            throws IOException {
+        List<NativeExportSourceFile> files = new ArrayList<>();
+        for (Split split : plannedSplits) {
+            if (!(split instanceof DataSplit)) {
+                return Collections.emptyList();
+            }
+            DataSplit dataSplit = (DataSplit) split;
+            Optional<List<RawFile>> rawFiles = dataSplit.convertToRawFiles();
+            if (!rawFiles.isPresent()) {
+                return Collections.emptyList();
+            }
+            Map<String, String> partition = partitionValues(table, dataSplit);
+            DeletionVector.Factory dvFactory =
+                    DeletionVector.factory(
+                            table.fileIO(),
+                            dataSplit.dataFiles(),
+                            dataSplit.deletionFiles().orElse(null));
+            List<RawFile> raw = rawFiles.get();
+            for (int i = 0; i < raw.size(); i++) {
+                RawFile rawFile = raw.get(i);
+                DataFileMeta dataFile = dataSplit.dataFiles().get(i);
+                files.add(
+                        new NativeExportSourceFile(
+                                rawFile.path(),
+                                rawFile.format(),
+                                rawFile.rowCount(),
+                                rawFile.fileSize(),
+                                rawFile.schemaId(),
+                                partition,
+                                deletedPositions(dvFactory, dataFile)));
+            }
+        }
+        return files;
+    }
+
+    private static Map<String, String> partitionValues(Table table, DataSplit split) {
+        Map<String, String> values = new LinkedHashMap<>();
+        List<String> partitionKeys = table.partitionKeys();
+        if (partitionKeys.isEmpty()) {
+            return values;
+        }
+        RowType partitionType = table.rowType().project(partitionKeys);
+        for (int i = 0; i < partitionKeys.size(); i++) {
+            Object value =
+                    org.apache.paimon.utils.InternalRowUtils.get(
+                            split.partition(), i, partitionType.getTypeAt(i));
+            values.put(partitionKeys.get(i), value == null ? null : value.toString());
+        }
+        return values;
+    }
+
+    private static List<Long> deletedPositions(
+            DeletionVector.Factory dvFactory, DataFileMeta dataFile) throws IOException {
+        Optional<DeletionVector> deletionVector = dvFactory.create(dataFile.fileName());
+        if (!deletionVector.isPresent() || deletionVector.get().isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Long> positions = new ArrayList<>();
+        DeletionVector vector = deletionVector.get();
+        for (long position = 0; position < dataFile.rowCount(); position++) {
+            if (vector.isDeleted(position)) {
+                positions.add(position);
+            }
+        }
+        return positions;
     }
 
     private Options exportOptions(Table table) {

@@ -31,6 +31,8 @@ class NativeExportOptionsTest {
         NativeExportOptions options = NativeExportOptions.from(new Options());
 
         assertThat(options.enabled()).isFalse();
+        assertThat(options.fallbackEnabled()).isTrue();
+        assertThat(options.failOnFallback()).isFalse();
         assertThat(options.metricsEnabled()).isTrue();
         assertThat(options.readBufferSizeBytes()).isEqualTo(8L * 1024 * 1024);
         assertThat(options.readConcurrency()).isEqualTo(4);

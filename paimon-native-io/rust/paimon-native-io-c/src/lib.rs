@@ -1,20 +1,29 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchReader, StructArray};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, RecordBatch, RecordBatchReader, StringArray, StructArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_select::filter::filter_record_batch;
 use bytes::Bytes;
 use huaweicloud_sdk_rust_obs::{Client, Config, Credentials};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{ChunkReader, Length};
+use serde_json::Value;
 use url::Url;
 
 const DEFAULT_ROW_INDEX_COLUMN: &str = "__paimon_native_row_index";
@@ -88,16 +97,29 @@ struct ObsObjectChunkReader {
     inner: Arc<ObsObjectInner>,
 }
 
+#[derive(Default)]
+struct ObsReadMetrics {
+    requests: AtomicU64,
+    retries: AtomicU64,
+    bytes: AtomicU64,
+}
+
 struct ObsObjectInner {
     client: Client,
     bucket: String,
     key: String,
     len: u64,
+    metrics: Option<Arc<ObsReadMetrics>>,
 }
 
 struct ObsObjectRead {
     source: ObsObjectChunkReader,
     position: u64,
+}
+
+struct ExportReader {
+    reader: FileBatchReader,
+    obs_metrics: Option<Arc<ObsReadMetrics>>,
 }
 
 impl ReaderConfig {
@@ -345,6 +367,14 @@ fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String>
 
 impl ObsObjectChunkReader {
     fn new(path: &str, options: &HashMap<String, String>) -> Result<Self, String> {
+        Self::new_with_metrics(path, options, None)
+    }
+
+    fn new_with_metrics(
+        path: &str,
+        options: &HashMap<String, String>,
+        metrics: Option<Arc<ObsReadMetrics>>,
+    ) -> Result<Self, String> {
         let location = ObsObjectLocation::parse(path)?;
         let client = build_obs_client(options)?;
         let len = global_runtime()?
@@ -366,6 +396,7 @@ impl ObsObjectChunkReader {
                 bucket: location.bucket,
                 key: location.key,
                 len,
+                metrics,
             }),
         })
     }
@@ -385,6 +416,9 @@ impl ObsObjectChunkReader {
         }
 
         let range = range_header(start, length);
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.requests.fetch_add(1, Ordering::Relaxed);
+        }
         let bytes = global_runtime()
             .map_err(ParquetError::General)?
             .block_on(async {
@@ -406,6 +440,11 @@ impl ObsObjectChunkReader {
                 start,
                 bytes.len()
             )));
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics
+                .bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
         Ok(bytes)
     }
@@ -782,6 +821,835 @@ pub unsafe extern "C" fn paimon_reader_last_error(reader: *mut Reader) -> *const
     }
 }
 
+pub struct Exporter;
+
+#[derive(Clone, Debug)]
+struct ExportFile {
+    path: String,
+    partition: HashMap<String, String>,
+    deleted_positions: HashSet<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ExportTask {
+    output_path: String,
+    compression: String,
+    target_file_size_bytes: u64,
+    writer_batch_size: usize,
+    writer_row_group_size: usize,
+    memory_limit_bytes: u64,
+    projection: Vec<String>,
+    predicate_format: String,
+    predicate: Value,
+    object_store_options: HashMap<String, String>,
+    files: Vec<ExportFile>,
+}
+
+#[derive(Clone, Debug)]
+enum ScalarValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Utf8(String),
+}
+
+fn parse_obs_prefix(path: &str) -> Result<(String, String), String> {
+    let url = Url::parse(path).map_err(|e| e.to_string())?;
+    if url.scheme() != "obs" {
+        return Err(format!(
+            "unsupported path scheme for OBS prefix: {}",
+            url.scheme()
+        ));
+    }
+    let bucket = url
+        .host_str()
+        .ok_or_else(|| "OBS path missing bucket".to_string())?;
+    Ok((
+        bucket.to_string(),
+        url.path().trim_start_matches('/').to_string(),
+    ))
+}
+
+fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
+    let root: Value = serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+    let version = root
+        .get("request_version")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "MISSING_REQUEST_VERSION".to_string())?;
+    if version != 1 {
+        return Err(format!("UNSUPPORTED_REQUEST_VERSION: {}", version));
+    }
+    let predicate_format = string_field(&root, "predicate_format")?;
+    if predicate_format != "paimon-json-v1" {
+        return Err(format!(
+            "UNSUPPORTED_PREDICATE_FORMAT: {}",
+            predicate_format
+        ));
+    }
+    let files = root
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MISSING_FILES".to_string())?
+        .iter()
+        .map(parse_export_file)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ExportTask {
+        output_path: string_field(&root, "output_path")?,
+        compression: string_field(&root, "compression")?,
+        target_file_size_bytes: root
+            .get("target_file_size_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+        writer_batch_size: root
+            .get("writer_batch_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(8192) as usize,
+        writer_row_group_size: root
+            .get("writer_row_group_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(250000) as usize,
+        memory_limit_bytes: root
+            .get("memory_limit_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(512 * 1024 * 1024),
+        projection: root
+            .get("projection")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "MISSING_PROJECTION".to_string())?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| "projection contains non-string value".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        predicate_format,
+        predicate: root
+            .get("predicate_json")
+            .and_then(Value::as_str)
+            .map(|s| serde_json::from_str(s).map_err(|e| e.to_string()))
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({"op":"true"})),
+        object_store_options: root
+            .get("object_store")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        files,
+    })
+}
+
+#[derive(Debug)]
+struct ActiveExportWriter {
+    output_path: String,
+    local_output: String,
+    writer: ArrowWriter<File>,
+    rows: u64,
+    buffered_bytes: u64,
+}
+
+fn parse_export_file(value: &Value) -> Result<ExportFile, String> {
+    let partition = value
+        .get("partition")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let deleted_positions = value
+        .get("positions")
+        .and_then(Value::as_array)
+        .map(|positions| {
+            positions
+                .iter()
+                .filter_map(Value::as_u64)
+                .collect::<HashSet<u64>>()
+        })
+        .unwrap_or_default();
+    Ok(ExportFile {
+        path: string_field(value, "path")?,
+        partition,
+        deleted_positions,
+    })
+}
+
+fn string_field(value: &Value, name: &str) -> Result<String, String> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("missing string field: {}", name))
+}
+
+fn export_parquet(request_json: &str) -> Result<String, String> {
+    let task = parse_export_task(request_json)?;
+    if !task.compression.eq_ignore_ascii_case("zstd") {
+        return Err(format!("UNSUPPORTED_COMPRESSION: {}", task.compression));
+    }
+    if task.predicate_format != "paimon-json-v1" {
+        return Err(format!(
+            "UNSUPPORTED_PREDICATE_FORMAT: {}",
+            task.predicate_format
+        ));
+    }
+    let mut rows_read = 0u64;
+    let mut rows_output = 0u64;
+    let mut predicate_filtered_rows = 0u64;
+    let mut dv_filtered_rows = 0u64;
+    let mut parquet_row_groups_read = 0u64;
+    let mut peak_buffered_bytes = 0u64;
+    let mut writer_rolls = 0u64;
+    let mut obs_read_requests = 0u64;
+    let mut obs_read_retries = 0u64;
+    let mut obs_read_bytes = 0u64;
+    let mut decode_ms = 0u64;
+    let mut filter_ms = 0u64;
+    let mut encode_ms = 0u64;
+    let mut obs_write_ms = 0u64;
+    let mut files_written = Vec::new();
+    let mut next_output_ordinal = 0usize;
+
+    for (file_ordinal, file) in task.files.iter().enumerate() {
+        let (schema, mut export_reader) =
+            build_export_reader(file, task.writer_batch_size, &task.object_store_options)?;
+        let _ = schema;
+        let reader = &mut export_reader.reader;
+        let _ = file_ordinal;
+        let mut writer: Option<ActiveExportWriter> = None;
+
+        loop {
+            let decode_start = std::time::Instant::now();
+            let batch = match reader.reader.next() {
+                Some(batch) => batch.map_err(|e| e.to_string())?,
+                None => break,
+            };
+            decode_ms += elapsed_ms(decode_start);
+            parquet_row_groups_read += 1;
+            let batch = append_row_index(batch, DEFAULT_ROW_INDEX_COLUMN, reader.row_offset)?;
+            reader.row_offset += batch.num_rows() as i64;
+            let input_rows = batch.num_rows();
+            rows_read += input_rows as u64;
+            let filter_start = std::time::Instant::now();
+            let (batch, filtered_by_dv) = apply_export_filters(batch, file, &task.predicate)?;
+            filter_ms += elapsed_ms(filter_start);
+            dv_filtered_rows += filtered_by_dv as u64;
+            predicate_filtered_rows +=
+                input_rows.saturating_sub(filtered_by_dv + batch.num_rows()) as u64;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let projected = project_export_batch(batch, &task.projection, &file.partition)?;
+            rows_output += projected.num_rows() as u64;
+            write_projected_export_batch(
+                projected,
+                &task,
+                &mut writer,
+                &mut next_output_ordinal,
+                &mut files_written,
+                &mut writer_rolls,
+                &mut peak_buffered_bytes,
+                &mut encode_ms,
+                &mut obs_write_ms,
+            )?;
+        }
+
+        if let Some(writer) = writer.take() {
+            finish_export_writer(
+                writer,
+                &mut files_written,
+                &task.object_store_options,
+                &mut encode_ms,
+                &mut obs_write_ms,
+            )?;
+        }
+        if let Some(metrics) = export_reader.obs_metrics {
+            obs_read_requests += metrics.requests.load(Ordering::Relaxed);
+            obs_read_retries += metrics.retries.load(Ordering::Relaxed);
+            obs_read_bytes += metrics.bytes.load(Ordering::Relaxed);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "rows_output": rows_output,
+        "files_written": files_written,
+        "metrics": {
+            "rows_read": rows_read,
+            "rows_output": rows_output,
+            "predicate_filtered_rows": predicate_filtered_rows,
+            "dv_filtered_rows": dv_filtered_rows,
+            "parquet_row_groups_read": parquet_row_groups_read,
+            "parquet_row_groups_pruned": 0,
+            "peak_buffered_bytes": peak_buffered_bytes,
+            "writer_rolls": writer_rolls,
+            "obs_read_requests": obs_read_requests,
+            "obs_read_retries": obs_read_retries,
+            "obs_read_bytes": obs_read_bytes,
+            "obs_write_requests": files_written.len(),
+            "obs_write_bytes": files_written.iter().map(|f| f.get("bytes").and_then(Value::as_u64).unwrap_or(0)).sum::<u64>(),
+            "read_ms": 0,
+            "decode_ms": decode_ms,
+            "filter_ms": filter_ms,
+            "encode_ms": encode_ms,
+            "obs_write_ms": obs_write_ms,
+            "multipart_finish_ms": 0
+        }
+    }).to_string())
+}
+
+fn write_projected_export_batch(
+    mut batch: RecordBatch,
+    task: &ExportTask,
+    writer: &mut Option<ActiveExportWriter>,
+    next_output_ordinal: &mut usize,
+    files_written: &mut Vec<Value>,
+    writer_rolls: &mut u64,
+    peak_buffered_bytes: &mut u64,
+    encode_ms: &mut u64,
+    obs_write_ms: &mut u64,
+) -> Result<(), String> {
+    while batch.num_rows() > 0 {
+        if writer.is_none() {
+            *writer = Some(create_export_writer(
+                task,
+                batch.schema(),
+                *next_output_ordinal,
+            )?);
+            *next_output_ordinal += 1;
+        }
+
+        let roll_limit = export_roll_limit(task);
+        let buffered = writer.as_ref().unwrap().buffered_bytes;
+        let batch_bytes = record_batch_memory_size(&batch);
+        if roll_limit != u64::MAX && buffered > 0 && buffered + batch_bytes > roll_limit {
+            let finished = writer.take().unwrap();
+            finish_export_writer(
+                finished,
+                files_written,
+                &task.object_store_options,
+                encode_ms,
+                obs_write_ms,
+            )?;
+            *writer_rolls += 1;
+            continue;
+        }
+
+        if roll_limit != u64::MAX && buffered + batch_bytes > roll_limit && batch.num_rows() > 1 {
+            let remaining = roll_limit.saturating_sub(buffered).max(1);
+            let rows = batch.num_rows() as u64;
+            let to_write = ((rows * remaining) / batch_bytes.max(1)).max(1);
+            if to_write < rows {
+                let to_write = to_write as usize;
+                let head = batch.slice(0, to_write);
+                let tail = batch.slice(to_write, batch.num_rows() - to_write);
+                write_export_chunk(
+                    writer.as_mut().unwrap(),
+                    &head,
+                    peak_buffered_bytes,
+                    encode_ms,
+                )?;
+                batch = tail;
+                if writer.as_ref().unwrap().buffered_bytes >= roll_limit {
+                    let finished = writer.take().unwrap();
+                    finish_export_writer(
+                        finished,
+                        files_written,
+                        &task.object_store_options,
+                        encode_ms,
+                        obs_write_ms,
+                    )?;
+                    *writer_rolls += 1;
+                }
+                continue;
+            }
+        }
+
+        write_export_chunk(
+            writer.as_mut().unwrap(),
+            &batch,
+            peak_buffered_bytes,
+            encode_ms,
+        )?;
+        break;
+    }
+    Ok(())
+}
+
+fn create_export_writer(
+    task: &ExportTask,
+    schema: SchemaRef,
+    ordinal: usize,
+) -> Result<ActiveExportWriter, String> {
+    let output_path = output_part_path(&task.output_path, ordinal)?;
+    let local_output = local_output_path(&output_path)?;
+    if let Some(parent) = std::path::Path::new(&local_output).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let writer_file = File::create(&local_output).map_err(|e| e.to_string())?;
+    let writer = ArrowWriter::try_new(
+        writer_file,
+        schema,
+        Some(
+            WriterProperties::builder()
+                .set_max_row_group_size(task.writer_row_group_size.max(1))
+                .set_write_batch_size(task.writer_batch_size.max(1))
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .build(),
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ActiveExportWriter {
+        output_path,
+        local_output,
+        writer,
+        rows: 0,
+        buffered_bytes: 0,
+    })
+}
+
+fn write_export_chunk(
+    writer: &mut ActiveExportWriter,
+    batch: &RecordBatch,
+    peak_buffered_bytes: &mut u64,
+    encode_ms: &mut u64,
+) -> Result<(), String> {
+    let encode_start = std::time::Instant::now();
+    writer.writer.write(batch).map_err(|e| e.to_string())?;
+    *encode_ms += elapsed_ms(encode_start);
+    writer.rows += batch.num_rows() as u64;
+    writer.buffered_bytes += record_batch_memory_size(batch);
+    *peak_buffered_bytes = (*peak_buffered_bytes)
+        .max(writer.buffered_bytes)
+        .max(writer.writer.memory_size() as u64)
+        .max(writer.writer.in_progress_size() as u64);
+    Ok(())
+}
+
+fn finish_export_writer(
+    writer: ActiveExportWriter,
+    files_written: &mut Vec<Value>,
+    object_store_options: &HashMap<String, String>,
+    encode_ms: &mut u64,
+    obs_write_ms: &mut u64,
+) -> Result<(), String> {
+    let ActiveExportWriter {
+        output_path,
+        local_output,
+        writer,
+        rows,
+        ..
+    } = writer;
+    let encode_start = std::time::Instant::now();
+    writer.close().map_err(|e| e.to_string())?;
+    *encode_ms += elapsed_ms(encode_start);
+    let bytes = std::fs::metadata(&local_output)
+        .map_err(|e| e.to_string())?
+        .len();
+    if output_path.starts_with("obs://") {
+        let obs_start = std::time::Instant::now();
+        upload_local_file_to_obs(&local_output, &output_path, object_store_options)?;
+        *obs_write_ms += elapsed_ms(obs_start);
+        let _ = std::fs::remove_file(&local_output);
+    }
+    files_written.push(serde_json::json!({
+        "path": output_path,
+        "rows": rows,
+        "bytes": bytes
+    }));
+    Ok(())
+}
+
+fn export_roll_limit(task: &ExportTask) -> u64 {
+    task.target_file_size_bytes
+        .min(task.memory_limit_bytes.max(1))
+}
+
+fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
+    batch.get_array_memory_size() as u64
+}
+
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    start.elapsed().as_millis() as u64
+}
+
+fn build_export_reader(
+    file: &ExportFile,
+    batch_size: usize,
+    options: &HashMap<String, String>,
+) -> Result<(SchemaRef, ExportReader), String> {
+    if file.path.starts_with("obs://") {
+        let metrics = Arc::new(ObsReadMetrics::default());
+        let (schema, reader) = build_file_batch_reader(
+            ObsObjectChunkReader::new_with_metrics(&file.path, options, Some(metrics.clone()))?,
+            batch_size,
+            DEFAULT_ROW_INDEX_COLUMN,
+            None,
+        )?;
+        Ok((
+            schema,
+            ExportReader {
+                reader,
+                obs_metrics: Some(metrics),
+            },
+        ))
+    } else {
+        let (schema, reader) = build_file_batch_reader(
+            open_local(&file.path)?,
+            batch_size,
+            DEFAULT_ROW_INDEX_COLUMN,
+            None,
+        )?;
+        Ok((
+            schema,
+            ExportReader {
+                reader,
+                obs_metrics: None,
+            },
+        ))
+    }
+}
+
+fn apply_export_filters(
+    batch: RecordBatch,
+    file: &ExportFile,
+    predicate: &Value,
+) -> Result<(RecordBatch, usize), String> {
+    let mut values = Vec::with_capacity(batch.num_rows());
+    let mut dv_filtered = 0usize;
+    for row in 0..batch.num_rows() {
+        let row_index = scalar_at(&batch, DEFAULT_ROW_INDEX_COLUMN, row)
+            .and_then(|value| match value {
+                ScalarValue::I64(v) => Some(v as u64),
+                _ => None,
+            })
+            .unwrap_or(row as u64);
+        let keep_dv = !file.deleted_positions.contains(&row_index);
+        if !keep_dv {
+            dv_filtered += 1;
+        }
+        values.push(keep_dv && eval_predicate(predicate, &batch, &file.partition, row)?);
+    }
+    let mask = BooleanArray::from(values);
+    filter_record_batch(&batch, &mask)
+        .map(|filtered| (filtered, dv_filtered))
+        .map_err(|e| e.to_string())
+}
+
+fn project_export_batch(
+    batch: RecordBatch,
+    projection: &[String],
+    partition: &HashMap<String, String>,
+) -> Result<RecordBatch, String> {
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    for name in projection {
+        if let Ok(index) = batch.schema().index_of(name) {
+            fields.push(batch.schema().field(index).clone());
+            columns.push(batch.column(index).clone());
+        } else if let Some(value) = partition.get(name) {
+            fields.push(Field::new(name, DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from_iter_values(
+                std::iter::repeat(value.as_str()).take(batch.num_rows()),
+            )) as ArrayRef);
+        } else {
+            return Err(format!(
+                "PARQUET_SCHEMA_MISMATCH: missing projected field {}",
+                name
+            ));
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| e.to_string())
+}
+
+fn eval_predicate(
+    predicate: &Value,
+    batch: &RecordBatch,
+    partition: &HashMap<String, String>,
+    row: usize,
+) -> Result<bool, String> {
+    let op = predicate
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or("true");
+    match op {
+        "true" => Ok(true),
+        "and" => {
+            for child in predicate
+                .get("children")
+                .and_then(Value::as_array)
+                .unwrap_or(&Vec::new())
+            {
+                if !eval_predicate(child, batch, partition, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "or" => {
+            for child in predicate
+                .get("children")
+                .and_then(Value::as_array)
+                .unwrap_or(&Vec::new())
+            {
+                if eval_predicate(child, batch, partition, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "is_null" | "is_not_null" => {
+            let field = string_field(predicate, "field")?;
+            let is_null = matches!(
+                field_value(batch, partition, &field, row),
+                ScalarValue::Null
+            );
+            Ok((op == "is_null" && is_null) || (op == "is_not_null" && !is_null))
+        }
+        "in" => {
+            let field = string_field(predicate, "field")?;
+            let value = field_value(batch, partition, &field, row);
+            for literal in predicate
+                .get("literals")
+                .and_then(Value::as_array)
+                .unwrap_or(&Vec::new())
+            {
+                if compare_scalar(&value, &literal_value(literal)?)
+                    == Some(std::cmp::Ordering::Equal)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "eq" | "ne" | "lt" | "le" | "gt" | "ge" => {
+            let field = string_field(predicate, "field")?;
+            let value = field_value(batch, partition, &field, row);
+            let literal = literal_value(
+                predicate
+                    .get("literal")
+                    .ok_or_else(|| "predicate missing literal".to_string())?,
+            )?;
+            let ordering = compare_scalar(&value, &literal);
+            Ok(match op {
+                "eq" => ordering == Some(std::cmp::Ordering::Equal),
+                "ne" => ordering != Some(std::cmp::Ordering::Equal),
+                "lt" => ordering == Some(std::cmp::Ordering::Less),
+                "le" => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+                ),
+                "gt" => ordering == Some(std::cmp::Ordering::Greater),
+                "ge" => matches!(
+                    ordering,
+                    Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+                ),
+                _ => false,
+            })
+        }
+        other => Err(format!("UNSUPPORTED_PREDICATE: {}", other)),
+    }
+}
+
+fn field_value(
+    batch: &RecordBatch,
+    partition: &HashMap<String, String>,
+    field: &str,
+    row: usize,
+) -> ScalarValue {
+    if let Some(value) = scalar_at(batch, field, row) {
+        value
+    } else {
+        partition
+            .get(field)
+            .map(|value| ScalarValue::Utf8(value.clone()))
+            .unwrap_or(ScalarValue::Null)
+    }
+}
+
+fn scalar_at(batch: &RecordBatch, field: &str, row: usize) -> Option<ScalarValue> {
+    let index = batch.schema().index_of(field).ok()?;
+    let column = batch.column(index);
+    if column.is_null(row) {
+        return Some(ScalarValue::Null);
+    }
+    if let Some(array) = column.as_any().downcast_ref::<BooleanArray>() {
+        return Some(ScalarValue::Bool(array.value(row)));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int8Array>() {
+        return Some(ScalarValue::I64(array.value(row) as i64));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int16Array>() {
+        return Some(ScalarValue::I64(array.value(row) as i64));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+        return Some(ScalarValue::I64(array.value(row) as i64));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return Some(ScalarValue::I64(array.value(row)));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Float32Array>() {
+        return Some(ScalarValue::F64(array.value(row) as f64));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+        return Some(ScalarValue::F64(array.value(row)));
+    }
+    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        return Some(ScalarValue::Utf8(array.value(row).to_string()));
+    }
+    None
+}
+
+fn literal_value(value: &Value) -> Result<ScalarValue, String> {
+    let value = value
+        .get("value")
+        .ok_or_else(|| "literal missing value".to_string())?;
+    if value.is_null() {
+        return Ok(ScalarValue::Null);
+    }
+    if let Some(v) = value.as_bool() {
+        return Ok(ScalarValue::Bool(v));
+    }
+    if let Some(v) = value.as_i64() {
+        return Ok(ScalarValue::I64(v));
+    }
+    if let Some(v) = value.as_f64() {
+        return Ok(ScalarValue::F64(v));
+    }
+    if let Some(v) = value.as_str() {
+        return Ok(ScalarValue::Utf8(v.to_string()));
+    }
+    Err("unsupported literal value".to_string())
+}
+
+fn compare_scalar(left: &ScalarValue, right: &ScalarValue) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (ScalarValue::Null, _) | (_, ScalarValue::Null) => None,
+        (ScalarValue::Bool(a), ScalarValue::Bool(b)) => Some(a.cmp(b)),
+        (ScalarValue::I64(a), ScalarValue::I64(b)) => Some(a.cmp(b)),
+        (ScalarValue::I64(a), ScalarValue::F64(b)) => (*a as f64).partial_cmp(b),
+        (ScalarValue::F64(a), ScalarValue::I64(b)) => a.partial_cmp(&(*b as f64)),
+        (ScalarValue::F64(a), ScalarValue::F64(b)) => a.partial_cmp(b),
+        (ScalarValue::Utf8(a), ScalarValue::Utf8(b)) => Some(a.cmp(b)),
+        (ScalarValue::Utf8(a), ScalarValue::I64(b)) => a.parse::<i64>().ok().map(|v| v.cmp(b)),
+        (ScalarValue::I64(a), ScalarValue::Utf8(b)) => b.parse::<i64>().ok().map(|v| a.cmp(&v)),
+        _ => None,
+    }
+}
+
+fn output_part_path(output_path: &str, ordinal: usize) -> Result<String, String> {
+    let file_name = format!(
+        "part-native-{}-{}-{}.parquet",
+        std::process::id(),
+        ordinal,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    );
+    Ok(format!(
+        "{}/{}",
+        output_path.trim_end_matches('/'),
+        file_name
+    ))
+}
+
+fn local_output_path(path: &str) -> Result<String, String> {
+    if path.starts_with("obs://") {
+        let mut local = std::env::temp_dir();
+        local.push(path.rsplit('/').next().unwrap_or("part-native.parquet"));
+        return Ok(local.to_string_lossy().to_string());
+    }
+    Ok(path
+        .strip_prefix("file://")
+        .or_else(|| path.strip_prefix("file:"))
+        .unwrap_or(path)
+        .to_string())
+}
+
+fn upload_local_file_to_obs(
+    local_path: &str,
+    output_path: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), String> {
+    let (bucket, key) = parse_obs_prefix(output_path)?;
+    let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
+    let client = build_obs_client(options)?;
+    global_runtime()?.block_on(async {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(body)
+            .content_type("application/octet-stream")
+            .send()
+            .await
+            .map_err(|e| e.to_string())
+            .map(|_| ())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn paimon_exporter_new() -> *mut Exporter {
+    match catch_unwind(|| Box::into_raw(Box::new(Exporter))) {
+        Ok(exporter) => exporter,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_exporter_free(exporter: *mut Exporter) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !exporter.is_null() {
+            drop(Box::from_raw(exporter));
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_exporter_export_parquet(
+    exporter: *mut Exporter,
+    request_json: *const c_char,
+    result_json: *mut *mut c_char,
+    error_message: *mut *mut c_char,
+) -> i32 {
+    if exporter.is_null() || result_json.is_null() || error_message.is_null() {
+        return -1;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        cstr_to_string(request_json).and_then(|r| export_parquet(&r))
+    })) {
+        Ok(Ok(result)) => {
+            *result_json = CString::new(result).unwrap().into_raw();
+            0
+        }
+        Ok(Err(error)) => {
+            *error_message = CString::new(error.replace('\0', "\\0")).unwrap().into_raw();
+            -1
+        }
+        Err(payload) => {
+            *error_message = CString::new(format!("native panic: {}", panic_message(payload)))
+                .unwrap()
+                .into_raw();
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_string_free(value: *mut c_char) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !value.is_null() {
+            drop(CString::from_raw(value));
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,6 +1695,113 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         path
+    }
+
+    #[test]
+    fn native_export_writes_local_parquet_with_predicate_and_partition() {
+        let input = write_i64_parquet_columns(vec![("id", vec![1, 2, 3])]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 2,
+            "projection": ["id", "dt"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({
+                "op": "and",
+                "children": [
+                    {"op": "ge", "field": "id", "literal": {"type": "BIGINT", "value": 2}},
+                    {"op": "eq", "field": "dt", "literal": {"type": "VARCHAR", "value": "2026-05-06"}}
+                ]
+            }).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 3,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {"dt": "2026-05-06"},
+                "positions": [2]
+            }]
+        });
+
+        let result = export_parquet(&request.to_string()).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(1));
+        let output_file = result["files_written"][0]["path"].as_str().unwrap();
+
+        let (schema, mut file_reader) =
+            build_file_batch_reader(open_local(output_file).unwrap(), 8, "__row_index", None)
+                .unwrap();
+        assert!(schema.field_with_name("dt").is_ok());
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        let id = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let dt = batch
+            .column(batch.schema().index_of("dt").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id.value(0), 2);
+        assert_eq!(dt.value(0), "2026-05-06");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_rolls_output_files_by_target_size() {
+        let input = write_i64_parquet_columns(vec![("id", (0..20).collect())]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-roll-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "target_file_size_bytes": 64,
+            "writer_batch_size": 20,
+            "writer_row_group_size": 4,
+            "memory_limit_bytes": 1024,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 20,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+
+        let result = export_parquet(&request.to_string()).unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(20));
+        assert!(
+            result["files_written"].as_array().unwrap().len() > 1,
+            "expected target size rolling to create multiple files: {}",
+            result
+        );
+        assert!(result["metrics"]["writer_rolls"].as_u64().unwrap() > 0);
+        assert!(result["metrics"]["peak_buffered_bytes"].as_u64().unwrap() > 0);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 
     #[test]

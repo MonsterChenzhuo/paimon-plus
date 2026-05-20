@@ -55,6 +55,14 @@ public final class NativeExportOptions {
         return options.get(CoreOptions.NATIVE_IO_EXPORT_ENABLED);
     }
 
+    public boolean fallbackEnabled() {
+        return options.get(CoreOptions.NATIVE_IO_EXPORT_FALLBACK_ENABLED);
+    }
+
+    public boolean failOnFallback() {
+        return options.get(CoreOptions.NATIVE_IO_EXPORT_FAIL_ON_FALLBACK);
+    }
+
     public boolean metricsEnabled() {
         return options.get(CoreOptions.NATIVE_IO_EXPORT_METRICS_ENABLED);
     }

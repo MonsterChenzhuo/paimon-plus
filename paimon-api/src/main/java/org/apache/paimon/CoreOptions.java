@@ -419,6 +419,20 @@ public class CoreOptions implements Serializable {
                     .defaultValue(false)
                     .withDescription("Whether to enable native fast path for sys.export_parquet.");
 
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_FALLBACK_ENABLED =
+            key("native-io.export.fallback.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether sys.export_parquet may fall back to the Java path when native export is not applicable during driver preflight.");
+
+    public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_FAIL_ON_FALLBACK =
+            key("native-io.export.fail-on-fallback")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether sys.export_parquet should fail instead of falling back when native export is requested but not applicable.");
+
     public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_METRICS_ENABLED =
             key("native-io.export.metrics.enabled")
                     .booleanType()

@@ -42,6 +42,7 @@ class NativeExportJsonTest {
                         10L,
                         1000L,
                         2L,
+                        Collections.singletonMap("dt", "2026-05-06"),
                         Collections.singletonList(3L));
         NativeExportTask task =
                 new NativeExportTask(
@@ -64,9 +65,13 @@ class NativeExportJsonTest {
 
         String json = NativeExportJson.toJson(task);
         assertThat(json).contains("\"output_path\":\"obs://bucket/export\"");
+        assertThat(json).contains("\"target_file_size_bytes\":536870912");
+        assertThat(json).contains("\"writer_row_group_size\":250000");
+        assertThat(json).contains("\"memory_limit_bytes\":536870912");
         assertThat(json).contains("\"runtime_threads\":4");
         assertThat(json).contains("\"metadata_cache_enabled\":true");
         assertThat(json).contains("\"projection\":[\"id\",\"score\"]");
+        assertThat(json).contains("\"partition\":{\"dt\":\"2026-05-06\"}");
         assertThat(json).contains("\"positions\":[3]");
 
         String redacted = NativeExportJson.toRedactedJson(task);

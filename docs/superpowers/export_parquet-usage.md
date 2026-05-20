@@ -47,6 +47,64 @@ CALL sys.export_parquet(
 | `overwrite` | `BOOLEAN` | 否 | `false` | 输出目录已存在时是否删除后重写。 |
 | `target_file_size` | `STRING` | 否 | 空，表示按 Paimon split 写文件 | 目标 Parquet 文件大小，例如 `'128 MB'`。配置后会启用滚动写文件。 |
 
+## Native fast path
+
+`export_parquet` 当前有两条执行路径：
+
+| 路径 | 触发条件 | 状态 |
+| --- | --- | --- |
+| Java export | 默认路径，或 `spark.paimon.native-io.export.enabled=false` | 可用；通过 Paimon Java reader 读取，再用 Paimon Parquet writer 写出。 |
+| Native export | `spark.paimon.native-io.enabled=true` 且 `spark.paimon.native-io.export.enabled=true` | 已接入 ServiceLoader SPI、driver preflight、配置校验、Spark split 到 raw Parquet source file 的规划、DV position 下沉、predicate JSON 转换、JNR FFI 和 Rust 读写 pipeline。 |
+
+默认仍使用 Java export 路径。联调或压测 native export 时显式开启 native export，并建议设置 `spark.paimon.native-io.export.fail-on-fallback=true`，避免误以为已命中 native。
+
+开启方式：
+
+```sql
+SET spark.paimon.native-io.enabled=true;
+SET spark.paimon.native-io.export.enabled=true;
+```
+
+启用 native export 时还需要在 driver 和 executor classpath 中包含 `paimon-native-io` jar 及其 native library resource。若 classpath 中没有 native export provider，会以 `NO_PROVIDER` 拒绝。
+
+`spark.paimon.native-io.export.fallback.enabled` 默认是 `true`，driver preflight 不适用时会回退 Java export。设置 `spark.paimon.native-io.export.fail-on-fallback=true` 后，preflight 不适用会抛出包含 reject reason 和 detail 的异常。
+
+当前 native preflight 的已实现限制：
+
+- 必须同时开启 `native-io.enabled` 和 `native-io.export.enabled`。
+- 只接受 Spark engine 内部标记；该标记由 Spark procedure 自动注入。
+- 当前只支持 `compression => 'zstd'`。
+- 当前只接受 `obs://` 输出路径。
+- 必须提供 OBS endpoint、access key 和 secret key。
+- native export 配置必须落在合法范围内。
+- 规划出的 split 必须能转换为 raw Parquet source file；否则以 `NOT_RAW_CONVERTIBLE` 拒绝并按 fallback 配置处理。
+
+Native export 配置项：
+
+| Spark 配置名 | 默认值 | 合法范围 / 说明 |
+| --- | --- | --- |
+| `spark.paimon.native-io.enabled` | `false` | native IO 总开关；native export 也依赖它。 |
+| `spark.paimon.native-io.export.enabled` | `false` | 是否尝试 `export_parquet` native fast path。 |
+| `spark.paimon.native-io.export.fallback.enabled` | `true` | driver preflight 不适用时是否回退 Java export。 |
+| `spark.paimon.native-io.export.fail-on-fallback` | `false` | preflight 不适用时是否强制失败；压测 native 时建议打开。 |
+| `spark.paimon.native-io.export.metrics.enabled` | `true` | native task 是否返回并记录 metrics。 |
+| `spark.paimon.native-io.export.obs.read-buffer-size` | `8 MB` | `1 MB` 到 `128 MB`；native OBS 顺序读 buffer 大小。 |
+| `spark.paimon.native-io.export.obs.read-concurrency` | `4` | `1` 到 `64`；每个 native task 的 OBS 读并发上限。 |
+| `spark.paimon.native-io.export.writer.batch-size` | `8192` | `1` 到 `65536`；native writer 使用的 Arrow batch 行数。 |
+| `spark.paimon.native-io.export.writer.row-group-size` | `250000` | `1024` 到 `10000000`；native writer 的 row group 行数上限。 |
+| `spark.paimon.native-io.export.writer.multipart-part-size` | `64 MB` | `5 MB` 到 `512 MB`；multipart upload part 大小。 |
+| `spark.paimon.native-io.export.memory-limit` | `512 MB` | `64 MB` 到 `16 GB`；单 native export task 的软内存上限。 |
+| `spark.paimon.native-io.export.runtime-threads` | `4` | `1` 到 `64`；executor 进程级 native runtime worker 数。 |
+| `spark.paimon.native-io.export.metadata-cache.enabled` | `true` | 是否允许 native export 使用进程级 Parquet metadata cache。 |
+
+OBS 配置来源：
+
+- Spark Hadoop conf：`spark.hadoop.fs.obs.endpoint`、`spark.hadoop.fs.obs.access.key`、`spark.hadoop.fs.obs.secret.key` 等。
+- Paimon/Spark option：`spark.paimon.fs.obs.*` 或表 options 中的 `fs.obs.*`。
+- 环境变量 fallback：`OBS_ENDPOINT`、`HUAWEICLOUD_OBS_ENDPOINT`、`OBS_ACCESS_KEY_ID`、`OBS_ACCESS_KEY`、`HUAWEICLOUD_OBS_ACCESS_KEY_ID`、`AWS_ACCESS_KEY_ID`、`OBS_SECRET_ACCESS_KEY`、`OBS_SECRET_KEY`、`HUAWEICLOUD_OBS_SECRET_ACCESS_KEY`、`AWS_SECRET_ACCESS_KEY`。
+- Access key alias：`fs.obs.accessKey`、`fs.obs.ak` 会归一化为 `fs.obs.access.key`。
+- Secret key alias：`fs.obs.secretKey`、`fs.obs.sk` 会归一化为 `fs.obs.secret.key`。
+
 ## 参数详细说明
 
 ### table
@@ -363,10 +421,17 @@ CALL sys.export_parquet(
 | `Unsupported filter literal type` | `where` 对复杂类型或暂不支持类型做过滤 | 改为支持的基础类型字段过滤。 |
 | `Invalid IN predicate` | `IN` 后面不是括号包裹的列表 | 使用 `col in ('a', 'b')` 格式。 |
 | `Target file size should be larger than 0 bytes.` | `target_file_size` 解析后小于等于 0 | 使用 `'128 MB'`、`'512 MB'` 等正数大小。 |
+| `Native export is enabled but not applicable. reason=NO_PROVIDER` | 开启了 native export，但 classpath 中没有 `paimon-native-io` provider | 补齐 `paimon-native-io` jar，或关闭 `spark.paimon.native-io.export.enabled` 使用 Java 路径。 |
+| `Native export is enabled but not applicable. reason=NOT_RAW_CONVERTIBLE` | 规划出的 split 不能转换为 native 可直接读取的 raw Parquet source file | 检查表文件格式、split 类型和表特性；必要时关闭 native export 或允许 fallback。 |
+| `Native export is enabled but not applicable. reason=EXPORT_UNSUPPORTED_COMPRESSION` | native export 当前只接受 `zstd` | 使用 `compression => 'zstd'`，或关闭 native export。 |
+| `Native export is enabled but not applicable. reason=NON_OBS_PATH` | native export 当前只接受 `obs://` 输出路径 | 改用 `obs://` 输出路径，或关闭 native export。 |
+| `Native export is enabled but not applicable. reason=MISSING_OBS_CONFIG` | native export 缺少 OBS endpoint、access key 或 secret key | 补齐 `fs.obs.*` 配置或相关环境变量。 |
+| `Native export is enabled but not applicable. reason=EXPORT_INVALID_CONFIG` | native export 参数超出合法范围 | 对照 native 配置表修正参数。 |
 
 ## 使用建议
 
 - 导出到对象存储时，建议设置 `target_file_size`，避免生成过多小文件。
+- 当前生产导出建议关闭 `spark.paimon.native-io.export.enabled`，保持 Java export 路径；native export 适合开发联调和后续压测验证。
 - 首次导出建议使用新目录；只有确认目录可删除时才使用 `overwrite => true`。
 - `where` 尽量包含分区列或高选择性字段，便于 Paimon scan 和 reader 减少读取量。
 - `parallelism` 应结合 Paimon split 数和 Spark executor 资源设置。单纯调大该值不一定能提升速度。

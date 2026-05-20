@@ -4,6 +4,8 @@
 **状态**：待评审  
 **目标读者**：Paimon native IO / Spark SQL 维护者  
 
+> 当前实现状态：native export SPI、配置校验、JNR FFI、JSON request/result 合约、Spark split 到 raw Parquet source file 的规划、DV position 下沉、基础 predicate JSON 转换，以及 Rust 本地/OBS Parquet 读写 pipeline 已落到代码中。当前实现仍是第一阶段 fast path：OBS 写出使用临时本地文件后单 PUT，暂未实现 multipart upload；`target_file_size` 已在 native writer 内按 batch 内存估算做文件滚动，尚不是基于最终压缩后对象大小的精确滚动。
+
 ---
 
 ## 1. 背景
@@ -158,6 +160,21 @@ LakeSoul 的 native-io 实现给 Paimon export fast path 提供了几个可以�
 - **metrics 和缓存**：LakeSoul 在 writer/plan 中接入 DataFusion metrics 和 metadata cache。Paimon 第一阶段不需要完整 DataFusion metrics 栈，但必须返回稳定的 read/write request、bytes、decode、filter、encode、multipart flush 指标。
 
 因此，本设计对 LakeSoul 的结论是：**借鉴 native IO 的架构边界与 object_store/multipart/DataFusion 组织方式，不照搬 LakeSoul 表语义、merge/sort writer 或动态分区 commit 逻辑**。
+
+### 4.3 LakeSoul 代码对照清单
+
+后续实现时应优先对照以下 LakeSoul 文件，避免只停留在概念借鉴：
+
+- `LakeSoul/native-io/lakesoul-io-java/src/main/java/com/dmetasoul/lakesoul/lakesoul/io/NativeIOBase.java`：参考 config builder、object store option setter、Arrow schema 传递和 callback 引用管理；Paimon export 只借鉴 builder/option/error 风格，不跨边界传 Arrow batch。
+- `LakeSoul/native-io/lakesoul-io-java/src/main/java/com/dmetasoul/lakesoul/lakesoul/io/NativeIOWriter.java`：参考 opaque writer pointer、`write_record_batch_blocked`、`flush_and_close_writer`、`abort_and_close_writer` 和 native result 释放模式；Paimon 的 C ABI 应保持同样的显式 free/abort 纪律。
+- `LakeSoul/native-io/lakesoul-io-java/src/main/java/com/dmetasoul/lakesoul/lakesoul/local/LakeSoulLocalJavaWriter.java`：参考 Hadoop/S3A 配置到 native object store option 的归一化；Paimon 需要补 OBS/S3A alias、bucket 校验、credential 脱敏和 credential-provider-only 回退。
+- `LakeSoul/rust/lakesoul-io/src/session.rs`：参考 process-wide Tokio runtime、metadata cache、DataFusion session/runtime env 和 object store 注册；Paimon export 不应按 Spark task 重建 runtime。
+- `LakeSoul/rust/lakesoul-io/src/writer/async_writer/multipart_writer.rs`：参考 `ArrowWriter<InMemBuf>` + `object_store::WriteMultipart`、row group flush 后上传 part、`finish()` 后 `head()` 获取大小、失败 `abort()`；这是 Paimon OBS 写侧的主要模板。
+- `LakeSoul/rust/lakesoul-io/src/writer/async_writer/partitioning_writer.rs`：只参考 bounded receiver、async sink、flush join 和错误 abort 模式；不要引入 LakeSoul 的 range partition、PK repartition、sort/merge、commit 语义。
+- `LakeSoul/rust/lakesoul-io/src/physical_plan/datasource/parquet.rs` 与 `LakeSoul/rust/lakesoul-io/src/session.rs` 的 `FileScanConfigBuilder` / `ParquetFormat` 使用：作为第二阶段 row group pruning 和 DataFusion parquet scan 的落点；第一阶段 reader 要保留可替换接口。
+- `LakeSoul/rust/lakesoul-io/src/config/options.rs`：参考 memory/spill/max file size 等 option key 集中化；Paimon export option 不应散落在 Java/Rust 多处硬编码。
+
+这些文件不是复制源。Paimon export 的边界仍是 Paimon split、DV、projection、predicate、外部 output path；LakeSoul 中 CDC、动态分区写表、primary key merge、hash bucket、LSH 和 metadata commit 逻辑均排除。
 
 ---
 

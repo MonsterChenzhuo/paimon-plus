@@ -27,6 +27,7 @@ paimon-python/.idea/
 target
 dependency-reduced-pom.xml
 metastore_db/
+/native-io/
 *.class
 *.jar
 !**/resources/**/*.jar

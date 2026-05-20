@@ -19,6 +19,7 @@
 package org.apache.paimon.operation.nativeio.export;
 
 import org.apache.paimon.options.Options;
+import org.apache.paimon.predicate.Predicate;
 
 import javax.annotation.Nullable;
 
@@ -38,6 +39,8 @@ public final class NativeExportContext implements Serializable {
     @Nullable private final Long targetFileSizeBytes;
     private final List<String> projectedFieldNames;
     private final int plannedSplitCount;
+    private final List<NativeExportSourceFile> sourceFiles;
+    @Nullable private final Predicate predicate;
 
     public NativeExportContext(
             Options options,
@@ -46,6 +49,26 @@ public final class NativeExportContext implements Serializable {
             @Nullable Long targetFileSizeBytes,
             List<String> projectedFieldNames,
             int plannedSplitCount) {
+        this(
+                options,
+                outputPath,
+                compression,
+                targetFileSizeBytes,
+                projectedFieldNames,
+                plannedSplitCount,
+                Collections.emptyList(),
+                null);
+    }
+
+    public NativeExportContext(
+            Options options,
+            String outputPath,
+            String compression,
+            @Nullable Long targetFileSizeBytes,
+            List<String> projectedFieldNames,
+            int plannedSplitCount,
+            List<NativeExportSourceFile> sourceFiles,
+            @Nullable Predicate predicate) {
         this.options = options == null ? new Options() : new Options(options.toMap());
         this.outputPath = requireNonEmpty(outputPath, "outputPath");
         this.compression = requireNonEmpty(compression, "compression");
@@ -53,6 +76,11 @@ public final class NativeExportContext implements Serializable {
         this.projectedFieldNames =
                 Collections.unmodifiableList(new ArrayList<>(projectedFieldNames));
         this.plannedSplitCount = plannedSplitCount;
+        this.sourceFiles =
+                Collections.unmodifiableList(
+                        new ArrayList<>(
+                                sourceFiles == null ? Collections.emptyList() : sourceFiles));
+        this.predicate = predicate;
     }
 
     public Options options() {
@@ -78,6 +106,15 @@ public final class NativeExportContext implements Serializable {
 
     public int plannedSplitCount() {
         return plannedSplitCount;
+    }
+
+    public List<NativeExportSourceFile> sourceFiles() {
+        return sourceFiles;
+    }
+
+    @Nullable
+    public Predicate predicate() {
+        return predicate;
     }
 
     private static String requireNonEmpty(String value, String fieldName) {

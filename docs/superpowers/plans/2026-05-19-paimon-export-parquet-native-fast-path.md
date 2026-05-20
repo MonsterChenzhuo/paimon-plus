@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Current checkout note:** core SPI, provider registration, export option validation, fallback controls, JNR FFI wrapper, JSON request/result models, Spark source-file planning, DV position extraction, predicate JSON conversion, Rust export execution, and native writer target-size rolling are present. The remaining production hardening items are native multipart OBS writes, compressed-size-aware rolling, fuller schema evolution/type coverage, and real OBS end-to-end benchmark validation.
+
 **Goal:** Build a native fast path for `CALL sys.export_parquet` so Spark tasks call Rust directly to read OBS Parquet, apply supported filters and DV, and write Parquet output without materializing JVM `InternalRow`.
 
-**Architecture:** Keep Spark as the planner and task scheduler. Add a Java native-export planning layer under `paimon-native-io`, route `ExportParquetProcedure` to it only after driver-side preflight, and add Rust JSON FFI for task-local export. The existing Java export path remains the fallback for unsupported tables, predicates, schemas, compression, and missing native configuration.
+**Architecture:** Keep Spark as the planner and task scheduler. Add a core ServiceLoader SPI so `paimon-spark-common` can discover native export support without a compile-time dependency on `paimon-native-io`; `paimon-native-io` implements the provider, performs driver-side preflight, and calls Rust JSON FFI inside executor tasks. The existing Java export path remains the fallback for unsupported tables, predicates, schemas, compression, and missing native configuration.
 
 **Tech Stack:** Java 8, Spark 3.4, Paimon core/native-io modules, JNR-FFI, Rust, arrow-rs, parquet-rs, object_store-compatible OBS/S3 client, multipart upload.
 
@@ -14,46 +16,64 @@
 
 Create:
 
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportOptions.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportApplicability.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportMetrics.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportFile.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportTask.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportResult.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportJson.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPredicateJson.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/PaimonNativeExporter.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportRunner.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPlanner.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportOptionsTest.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportJsonTest.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportPredicateJsonTest.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/PaimonNativeExporterTest.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/dev/native-io-export-benchmark/README.md`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportProviderFactory.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportProvider.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportContext.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportPreflightResult.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportPlanDescriptor.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportTaskResult.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportOptions.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportApplicability.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderFactoryImpl.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderImpl.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/resources/META-INF/services/org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportMetrics.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportFile.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportTask.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportResult.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportJson.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPredicateJson.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/PaimonNativeExporter.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportRunner.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPlanner.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportOptionsTest.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportJsonTest.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportPredicateJsonTest.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/PaimonNativeExporterTest.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/dev/native-io-export-benchmark/README.md`
 
 Modify:
 
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeRejectReason.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeIOOptions.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/jnr/LibPaimonNativeIO.java`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/Cargo.toml`
-- `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java`
-- Existing native IO tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-core/src/test/java/org/apache/paimon/operation/nativeio/`
-- Existing Rust tests in `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeRejectReason.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeIOOptions.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/jnr/LibPaimonNativeIO.java`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/Cargo.toml`
+- `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java`
+- Existing native IO tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/test/java/org/apache/paimon/operation/nativeio/`
+- Existing Rust tests in `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
 
 Responsibility boundaries:
 
-- `paimon-api` and `paimon-core`: define config and stable reject reasons only.
-- `paimon-native-io/src/main/java/org/apache/paimon/nativeio/export`: Java request planning, JSON serialization, JNR wrapper, and Spark task runner.
-- `ExportParquetProcedure`: strategy selection and fallback; it must not know Rust request internals.
+- `paimon-api`: define user-visible config.
+- `paimon-core`: define stable reject reasons and the native export ServiceLoader SPI only; it must not reference JNR, Spark classes, Arrow C Data, or `paimon-native-io` implementation classes.
+- `paimon-native-io/src/main/java/org/apache/paimon/nativeio/export`: ServiceLoader provider implementation, Java request planning, JSON serialization, JNR wrapper, and task runner.
+- `ExportParquetProcedure`: strategy selection, output directory lifecycle, fallback, and result aggregation through the core SPI; it must not import `org.apache.paimon.nativeio.export.*` implementation classes or know Rust request internals.
 - Rust `export.rs`: parse versioned request, evaluate predicates/DV, write Parquet, return result JSON.
 - Rust `object_store.rs`: OBS object_store registration and credential mapping.
 - Rust `buffered_reader.rs`: object_store-backed buffered reader and IO metrics.
 - Rust `multipart_writer.rs`: object_store multipart Parquet writer, target-size rolling, finish/abort.
+
+LakeSoul reference files to consult during implementation:
+
+- `LakeSoul/native-io/lakesoul-io-java/src/main/java/com/dmetasoul/lakesoul/lakesoul/io/NativeIOWriter.java` for opaque pointer lifecycle, blocked write status handling, flush result export, and abort-on-close.
+- `LakeSoul/native-io/lakesoul-io-java/src/main/java/com/dmetasoul/lakesoul/lakesoul/local/LakeSoulLocalJavaWriter.java` for Hadoop/S3A option extraction into native object store options.
+- `LakeSoul/rust/lakesoul-io/src/session.rs` for process-wide Tokio runtime, metadata cache, DataFusion runtime env, and object store registration.
+- `LakeSoul/rust/lakesoul-io/src/writer/async_writer/multipart_writer.rs` for `ArrowWriter` over an in-memory buffer plus object_store multipart `finish()` / `abort()`.
+- `LakeSoul/rust/lakesoul-io/src/writer/async_writer/partitioning_writer.rs` only for bounded async sink and flush/abort patterns; do not import LakeSoul PK/range partition semantics.
 
 ---
 
@@ -61,11 +81,11 @@ Responsibility boundaries:
 
 **Files:**
 
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeRejectReason.java`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeIOOptions.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportOptions.java`
-- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportOptionsTest.java`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-api/src/main/java/org/apache/paimon/CoreOptions.java`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeRejectReason.java`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/NativeIOOptions.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportOptions.java`
+- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportOptionsTest.java`
 
 - [ ] **Step 1: Write failing tests for export option defaults and validation**
 
@@ -141,7 +161,7 @@ class NativeExportOptionsTest {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportOptionsTest test
 ```
 
@@ -369,7 +389,7 @@ public final class NativeExportOptions {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportOptionsTest test
 ```
 
@@ -387,17 +407,127 @@ git commit -m "feat: add native export options"
 
 ---
 
+### Task 1A: Core ServiceLoader SPI Boundary
+
+**Files:**
+
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportProviderFactory.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportProvider.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportContext.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportPreflightResult.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportPlanDescriptor.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export/NativeExportTaskResult.java`
+- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-core/src/test/java/org/apache/paimon/operation/nativeio/export/NativeExportProviderSpiTest.java`
+
+- [ ] **Step 1: Write failing SPI contract tests**
+
+Add a core test that asserts the SPI DTOs are serializable and do not depend on native implementation packages:
+
+```java
+package org.apache.paimon.operation.nativeio.export;
+
+import org.junit.jupiter.api.Test;
+
+import java.io.Serializable;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class NativeExportProviderSpiTest {
+
+    @Test
+    void spiDtosAreSerializableAndCoreOnly() {
+        assertThat(Serializable.class).isAssignableFrom(NativeExportContext.class);
+        assertThat(Serializable.class).isAssignableFrom(NativeExportPreflightResult.class);
+        assertThat(Serializable.class).isAssignableFrom(NativeExportPlanDescriptor.class);
+        assertThat(Serializable.class).isAssignableFrom(NativeExportTaskResult.class);
+        assertThat(NativeExportProvider.class.getName()).startsWith("org.apache.paimon.operation.nativeio.export");
+        assertThat(NativeExportProviderFactory.class.getName()).startsWith("org.apache.paimon.operation.nativeio.export");
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run:
+
+```bash
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
+./mvnw -pl paimon-core -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportProviderSpiTest test
+```
+
+Expected: compilation fails because the SPI package does not exist.
+
+- [ ] **Step 3: Implement core SPI interfaces**
+
+Create `NativeExportProviderFactory`:
+
+```java
+package org.apache.paimon.operation.nativeio.export;
+
+/** Factory discovered by ServiceLoader for optional native export support. */
+public interface NativeExportProviderFactory {
+
+    NativeExportProvider create();
+}
+```
+
+Create `NativeExportProvider`:
+
+```java
+package org.apache.paimon.operation.nativeio.export;
+
+import java.io.Serializable;
+import java.util.List;
+
+/** Optional native export provider used by Spark procedure code through core SPI only. */
+public interface NativeExportProvider extends Serializable {
+
+    NativeExportPreflightResult preflight(NativeExportContext context);
+
+    NativeExportPlanDescriptor plan(NativeExportContext context);
+
+    NativeExportTaskResult executeTask(byte[] taskPayload) throws Exception;
+}
+```
+
+Create DTOs with final fields, constructor validation, and getters. Keep them limited to core-visible types: strings, primitive values, `Options`, serializable split descriptors already visible from core, opaque `byte[]` task payloads, and stable reject reason. Do not put Spark `JavaSparkContext`, JNR pointer, Arrow vector, or native request JSON into these DTOs.
+
+- [ ] **Step 4: Add ServiceLoader discovery helper test**
+
+Add a small static helper in `NativeExportProviderFactory` or a separate core utility that discovers factories with the current thread context classloader first, then falls back to the defining classloader. The test should use an empty classloader and assert empty discovery returns an empty list, not an exception.
+
+- [ ] **Step 5: Run core SPI tests**
+
+Run:
+
+```bash
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
+./mvnw -pl paimon-core -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportProviderSpiTest test
+```
+
+Expected: SPI tests pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add paimon-core/src/main/java/org/apache/paimon/operation/nativeio/export \
+  paimon-core/src/test/java/org/apache/paimon/operation/nativeio/export/NativeExportProviderSpiTest.java
+git commit -m "feat: add native export provider spi"
+```
+
+---
+
 ### Task 2: Java Request, Result, Metrics, and Redacted JSON
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportMetrics.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportFile.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportTask.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportObjectStoreOptions.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportResult.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportJson.java`
-- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportJsonTest.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportMetrics.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportFile.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportTask.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportObjectStoreOptions.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportResult.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportJson.java`
+- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportJsonTest.java`
 
 - [ ] **Step 1: Write failing JSON round-trip and redaction tests**
 
@@ -510,7 +640,7 @@ class NativeExportJsonTest {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportJsonTest test
 ```
 
@@ -602,7 +732,7 @@ Implement `NativeExportObjectStoreOptions` with tests for:
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportJsonTest test
 ```
 
@@ -622,9 +752,9 @@ git commit -m "feat: add native export request models"
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPredicateJson.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportApplicability.java`
-- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportPredicateJsonTest.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPredicateJson.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportApplicability.java`
+- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/NativeExportPredicateJsonTest.java`
 
 - [ ] **Step 1: Write failing predicate tests**
 
@@ -713,7 +843,7 @@ class NativeExportPredicateJsonTest {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportPredicateJsonTest test
 ```
 
@@ -804,7 +934,7 @@ Literal encoding must be type-stable:
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=NativeExportPredicateJsonTest test
 ```
 
@@ -825,10 +955,10 @@ git commit -m "feat: convert export predicates for native path"
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export_runtime.rs`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/Cargo.toml`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export_runtime.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/Cargo.toml`
 
 - [ ] **Step 1: Write failing Rust tests for request/result parsing**
 
@@ -939,7 +1069,7 @@ mod tests {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c export::tests::parses_export_request export::tests::serializes_export_result
 ```
 
@@ -1101,7 +1231,7 @@ Implement `Exporter`, `exporter_new`, `exporter_free`, `export_parquet_ffi`, and
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c export::tests
 ```
 
@@ -1123,10 +1253,10 @@ git commit -m "feat: add native export ffi contract"
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export_object_store.rs`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export_object_store.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/lib.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
 
 - [ ] **Step 1: Write failing buffered reader tests**
 
@@ -1182,7 +1312,7 @@ mod tests {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c buffered_reader::tests::merges_small_sequential_reads
 ```
 
@@ -1288,7 +1418,7 @@ Move reusable range source logic behind a type implementing `RangeSource`, backe
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c buffered_reader::tests
 ```
 
@@ -1310,9 +1440,9 @@ git commit -m "feat: add object store buffered export reads"
 
 **Files:**
 
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust/paimon-native-io-c/src/multipart_writer.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/export.rs`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/buffered_reader.rs`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust/paimon-native-io-c/src/multipart_writer.rs`
 
 - [ ] **Step 1: Write failing local export pipeline test**
 
@@ -1364,7 +1494,7 @@ Implement `write_test_parquet_with_id_score` and `read_test_output_rows` in the 
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c export::tests::exports_local_parquet_with_projection_predicate_and_dv
 ```
 
@@ -1415,7 +1545,7 @@ part-native-${ordinal}-${uuid}.parquet
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c export::tests
 ```
 
@@ -1436,10 +1566,10 @@ git commit -m "feat: implement native parquet export pipeline"
 
 **Files:**
 
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/jnr/LibPaimonNativeIO.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/PaimonNativeExporter.java`
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportRunner.java`
-- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/PaimonNativeExporterTest.java`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/jnr/LibPaimonNativeIO.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/PaimonNativeExporter.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportRunner.java`
+- Test: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/test/java/org/apache/paimon/nativeio/export/PaimonNativeExporterTest.java`
 
 - [ ] **Step 1: Write failing wrapper tests using a fake library**
 
@@ -1464,7 +1594,7 @@ void exporterParsesNativeResult() throws Exception {
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=PaimonNativeExporterTest test
 ```
 
@@ -1517,7 +1647,7 @@ Keep runner free of Spark classes so it is easy to test.
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip -Dtest=PaimonNativeExporterTest test
 ```
 
@@ -1539,9 +1669,12 @@ git commit -m "feat: wrap native parquet export ffi"
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPlanner.java`
-- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java`
-- Test: existing Spark procedure tests or new tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-spark/paimon-spark-common/src/test/scala/`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPlanner.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderFactoryImpl.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderImpl.java`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/src/main/resources/META-INF/services/org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory`
+- Modify: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java`
+- Test: existing Spark procedure tests or new tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-spark/paimon-spark-common/src/test/scala/`
 
 - [ ] **Step 1: Write failing task-count unit test**
 
@@ -1555,7 +1688,35 @@ assertThat(nativeTaskCount(1, 100)).isEqualTo(1);
 
 Expected: current Java export `numPartitions` still considers `target_file_size`; native count logic does not exist.
 
-- [ ] **Step 2: Implement NativeExportPlanner preflight**
+- [ ] **Step 2: Implement native provider registration**
+
+Create `NativeExportProviderFactoryImpl`:
+
+```java
+package org.apache.paimon.nativeio.export;
+
+import org.apache.paimon.operation.nativeio.export.NativeExportProvider;
+import org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory;
+
+/** ServiceLoader entry point for paimon-native-io export support. */
+public final class NativeExportProviderFactoryImpl implements NativeExportProviderFactory {
+
+    @Override
+    public NativeExportProvider create() {
+        return new NativeExportProviderImpl();
+    }
+}
+```
+
+Register the implementation in `META-INF/services/org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory`:
+
+```text
+org.apache.paimon.nativeio.export.NativeExportProviderFactoryImpl
+```
+
+The provider factory constructor must not load the native library. It may allocate Java-only helper objects only.
+
+- [ ] **Step 3: Implement NativeExportPlanner preflight**
 
 `NativeExportPlanner` responsibilities:
 
@@ -1572,11 +1733,40 @@ Expected: current Java export `numPartitions` still considers `target_file_size`
 
 Preflight must reject credential-provider-only configurations that cannot be serialized into the native request, bucket mismatch between `obs://bucket/path` and explicit bucket option, and unsupported native library availability from `PaimonJnrLoader.current().loadFailure()`.
 
-- [ ] **Step 3: Implement conservative DV conversion**
+- [ ] **Step 4: Implement conservative DV conversion**
 
 For the first implementation, support only deleted-position lists that can be extracted safely from current `DeletionVector` APIs. If the current API does not expose iteration, add a small package-private helper next to existing DV code and test it. If large bitmap serialization is not available yet, reject with `EXPORT_UNSUPPORTED_DV` instead of expanding unbounded data.
 
-- [ ] **Step 4: Integrate strategy in ExportParquetProcedure**
+- [ ] **Step 5: Implement NativeExportProviderImpl**
+
+`NativeExportProviderImpl` bridges the core SPI to native implementation classes:
+
+```java
+public final class NativeExportProviderImpl implements NativeExportProvider {
+
+    @Override
+    public NativeExportPreflightResult preflight(NativeExportContext context) {
+        return new NativeExportPlanner().preflight(context);
+    }
+
+    @Override
+    public NativeExportPlanDescriptor plan(NativeExportContext context) {
+        NativeExportPlan plan = new NativeExportPlanner().plan(context);
+        return plan.toDescriptor();
+    }
+
+    @Override
+    public NativeExportTaskResult executeTask(byte[] taskPayload) throws Exception {
+        NativeExportTask task = NativeExportJson.taskFromPayload(taskPayload);
+        NativeExportResult result = new NativeExportRunner().run(task);
+        return NativeExportTaskResult.fromNativeResult(result);
+    }
+}
+```
+
+`NativeExportPlan.toDescriptor()` serializes each `NativeExportTask` into an opaque `byte[]` payload using the same versioned JSON contract. Do not make `paimon-spark-common` import `org.apache.paimon.nativeio.export.NativeExportRunner`; Spark procedure only sees `NativeExportProvider`, `NativeExportPlanDescriptor`, and `NativeExportTaskResult`.
+
+- [ ] **Step 6: Integrate strategy in ExportParquetProcedure**
 
 Refactor the existing `export` method:
 
@@ -1596,23 +1786,32 @@ Rename existing body helpers:
 - existing map/mapPartitions path -> `javaExport`
 - native path -> `nativeExport`
 
-Native path uses:
+Native path must discover providers through the core SPI:
 
 ```java
-List<NativeExportResult> results =
-        jsc.parallelize(tasks, nativeTaskCount(parallelism, tasks.size()))
-                .map(task -> new NativeExportRunner().run(task))
+List<NativeExportProviderFactory> factories =
+        NativeExportProviderFactory.discover(Thread.currentThread().getContextClassLoader());
+```
+
+No provider means `NO_PROVIDER` and Java fallback unless `native-io.export.fail-on-fallback=true`.
+
+If the SPI execution contract carries task payloads back to Spark procedure, the native path uses only core SPI DTOs:
+
+```java
+List<NativeExportTaskResult> results =
+        jsc.parallelize(plan.taskPayloads(), nativeTaskCount(parallelism, plan.taskPayloads().size()))
+                .map(payload -> provider.executeTask(payload))
                 .collect();
 ```
 
 Then sum `rowsOutput`, log aggregated metrics when enabled, write `_SUCCESS`, and return row count.
 
-- [ ] **Step 5: Run Java tests**
+- [ ] **Step 7: Run Java tests**
 
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-spark/paimon-spark-3.4 -am -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip test
 ```
 
@@ -1622,10 +1821,13 @@ Expected: Spark module tests pass. If the module path differs in this checkout, 
 ./mvnw -pl :paimon-spark-3.4_2.12 -am -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip test
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportPlanner.java \
+  paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderFactoryImpl.java \
+  paimon-native-io/src/main/java/org/apache/paimon/nativeio/export/NativeExportProviderImpl.java \
+  paimon-native-io/src/main/resources/META-INF/services/org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory \
   paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java \
   paimon-spark/paimon-spark-common/src/test
 git commit -m "feat: route export_parquet to native fast path"
@@ -1637,8 +1839,8 @@ git commit -m "feat: route export_parquet to native fast path"
 
 **Files:**
 
-- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon/dev/native-io-export-benchmark/README.md`
-- Modify or create E2E tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-e2e-tests/`
+- Create: `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/dev/native-io-export-benchmark/README.md`
+- Modify or create E2E tests under `/Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-e2e-tests/`
 
 - [ ] **Step 1: Add benchmark runbook**
 
@@ -1702,9 +1904,9 @@ For each output path, compare:
 Run:
 
 ```bash
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus
 ./mvnw -pl paimon-native-io,paimon-core,paimon-api -am -DskipITs -Dcheckstyle.skip -Drat.skip -Dspotless.check.skip test
-cd /Users/opay-20240095/IdeaProjects/nativeio/paimon/paimon-native-io/rust
+cd /Users/opay-20240095/IdeaProjects/nativeio/paimon-plus/paimon-native-io/rust
 cargo test -p paimon-native-io-c
 ```
 
@@ -1732,6 +1934,7 @@ git commit -m "test: document native export benchmark"
 ## Self-Review Checklist
 
 - Spec coverage:
+  - Core ServiceLoader SPI boundary: Task 1A, Task 8.
   - Options and applicability: Task 1, Task 3, Task 8.
   - Java request/result and redaction: Task 2, Task 7.
   - Rust FFI: Task 4.
@@ -1739,6 +1942,7 @@ git commit -m "test: document native export benchmark"
   - Native read/filter/DV/write pipeline: Task 6.
   - `ExportParquetProcedure` strategy and `target_file_size` concurrency: Task 8.
   - Metrics and benchmark: Task 2, Task 6, Task 9.
+  - LakeSoul native IO reference points: File Structure reference list, Task 4 runtime, Task 5 object_store reader, Task 6 multipart writer.
 - Placeholder scan:
   - The plan intentionally rejects unsupported behavior instead of leaving open-ended implementation gaps.
   - Each task has a failing test, implementation target, verification command, and commit command.

@@ -24,10 +24,14 @@ import org.apache.paimon.operation.nativeio.NativeRejectReason;
 import org.apache.paimon.operation.nativeio.export.NativeExportContext;
 import org.apache.paimon.operation.nativeio.export.NativeExportPlanDescriptor;
 import org.apache.paimon.operation.nativeio.export.NativeExportPreflightResult;
+import org.apache.paimon.operation.nativeio.export.NativeExportSourceFile;
 import org.apache.paimon.options.Options;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /** Driver-side native export planner. */
 public final class NativeExportPlanner {
@@ -63,10 +67,30 @@ public final class NativeExportPlanner {
             return NativeExportPreflightResult.rejected(
                     NativeRejectReason.MISSING_OBS_CONFIG, "missing required OBS configuration");
         }
+        if (context.plannedSplitCount() > 0 && context.sourceFiles().isEmpty()) {
+            return NativeExportPreflightResult.rejected(
+                    NativeRejectReason.NOT_RAW_CONVERTIBLE,
+                    "planned splits cannot be converted to native parquet source files");
+        }
+        for (NativeExportSourceFile file : context.sourceFiles()) {
+            if (!"parquet".equalsIgnoreCase(file.format())) {
+                return NativeExportPreflightResult.rejected(
+                        NativeRejectReason.NON_PARQUET_FILE,
+                        "native export only supports parquet data files: " + file.path());
+            }
+            if (!file.path().toLowerCase(Locale.ROOT).startsWith("obs://")
+                    && !file.path().toLowerCase(Locale.ROOT).startsWith("file:")) {
+                return NativeExportPreflightResult.rejected(
+                        NativeRejectReason.NON_OBS_PATH,
+                        "native export requires obs:// data files: " + file.path());
+            }
+        }
+        NativeApplicability predicate = NativeExportPredicateJson.validate(context.predicate());
+        if (!predicate.applicable()) {
+            return NativeExportPreflightResult.rejected(predicate.reason(), predicate.detail());
+        }
 
-        return NativeExportPreflightResult.rejected(
-                NativeRejectReason.EXPORT_SPLIT_PLANNING_UNIMPLEMENTED,
-                "native export split planning is not implemented in this build");
+        return NativeExportPreflightResult.success();
     }
 
     public NativeExportPlanDescriptor plan(NativeExportContext context) {
@@ -74,6 +98,45 @@ public final class NativeExportPlanner {
         if (!result.applicable()) {
             throw new IllegalStateException(result.reason() + ": " + result.detail());
         }
-        return new NativeExportPlanDescriptor(Collections.emptyList());
+        if (context.sourceFiles().isEmpty()) {
+            return new NativeExportPlanDescriptor(Collections.emptyList());
+        }
+
+        NativeExportOptions exportOptions = NativeExportOptions.from(context.options());
+        NativeIOOptions nativeIOOptions = NativeIOOptions.from(context.options());
+        Map<String, String> objectStoreOptions = nativeIOOptions.objectStoreOptions();
+        List<byte[]> payloads = new ArrayList<>();
+        for (NativeExportSourceFile sourceFile : context.sourceFiles()) {
+            NativeExportFile file =
+                    new NativeExportFile(
+                            sourceFile.path(),
+                            sourceFile.rowCount(),
+                            sourceFile.fileSize(),
+                            sourceFile.schemaId(),
+                            sourceFile.partition(),
+                            sourceFile.deletedPositions());
+            NativeExportTask task =
+                    new NativeExportTask(
+                            context.outputPath(),
+                            context.compression(),
+                            context.targetFileSizeBytes() == null
+                                    ? Long.MAX_VALUE
+                                    : context.targetFileSizeBytes(),
+                            exportOptions.readBufferSizeBytes(),
+                            exportOptions.readConcurrency(),
+                            exportOptions.writerBatchSize(),
+                            exportOptions.writerRowGroupSize(),
+                            exportOptions.multipartPartSizeBytes(),
+                            exportOptions.memoryLimitBytes(),
+                            exportOptions.runtimeThreads(),
+                            exportOptions.metadataCacheEnabled(),
+                            context.projectedFieldNames(),
+                            NativeExportPredicateJson.FORMAT,
+                            NativeExportPredicateJson.toJson(context.predicate()),
+                            objectStoreOptions,
+                            Collections.singletonList(file));
+            payloads.add(NativeExportJson.taskToPayload(task));
+        }
+        return new NativeExportPlanDescriptor(payloads);
     }
 }

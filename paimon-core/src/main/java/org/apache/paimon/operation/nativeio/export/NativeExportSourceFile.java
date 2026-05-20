@@ -16,10 +16,7 @@
  * limitations under the License.
  */
 
-package org.apache.paimon.nativeio.export;
-
-import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
-import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
+package org.apache.paimon.operation.nativeio.export;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -28,27 +25,29 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Data file entry for a native export task. */
-public final class NativeExportFile implements Serializable {
+/** Core-visible source data file for native export planning. */
+public final class NativeExportSourceFile implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     private final String path;
+    private final String format;
     private final long rowCount;
     private final long fileSize;
     private final long schemaId;
     private final Map<String, String> partition;
     private final List<Long> deletedPositions;
 
-    @JsonCreator
-    public NativeExportFile(
-            @JsonProperty("path") String path,
-            @JsonProperty("row_count") long rowCount,
-            @JsonProperty("file_size") long fileSize,
-            @JsonProperty("schema_id") long schemaId,
-            @JsonProperty("partition") Map<String, String> partition,
-            @JsonProperty("positions") List<Long> deletedPositions) {
-        this.path = path;
+    public NativeExportSourceFile(
+            String path,
+            String format,
+            long rowCount,
+            long fileSize,
+            long schemaId,
+            Map<String, String> partition,
+            List<Long> deletedPositions) {
+        this.path = requireNonEmpty(path, "path");
+        this.format = requireNonEmpty(format, "format");
         this.rowCount = rowCount;
         this.fileSize = fileSize;
         this.schemaId = schemaId;
@@ -64,33 +63,38 @@ public final class NativeExportFile implements Serializable {
                                         : deletedPositions));
     }
 
-    @JsonProperty("path")
     public String path() {
         return path;
     }
 
-    @JsonProperty("row_count")
+    public String format() {
+        return format;
+    }
+
     public long rowCount() {
         return rowCount;
     }
 
-    @JsonProperty("file_size")
     public long fileSize() {
         return fileSize;
     }
 
-    @JsonProperty("schema_id")
     public long schemaId() {
         return schemaId;
     }
 
-    @JsonProperty("partition")
     public Map<String, String> partition() {
         return partition;
     }
 
-    @JsonProperty("positions")
     public List<Long> deletedPositions() {
         return deletedPositions;
+    }
+
+    private static String requireNonEmpty(String value, String fieldName) {
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalArgumentException(fieldName + " must not be empty");
+        }
+        return value;
     }
 }
