@@ -157,6 +157,20 @@ tools/native-io/package-jars.sh
 PAIMON_NATIVE_IO_DOCKER_PLATFORM=linux/amd64 tools/native-io/package-jars.sh
 ```
 
+如果线上环境需要从零生成 CentOS 7 兼容的 x86_64 Native IO 构建镜像，并用该镜像打包 Spark 3.4、OBS 插件和 Native IO：
+
+```bash
+tools/native-io/package-centos7-jars.sh
+```
+
+脚本默认构建本地镜像 `paimon-nativeio-centos7:local`，再调用 `tools/native-io/package-jars.sh`。如果本地镜像已经存在，可跳过镜像构建：
+
+```bash
+PAIMON_NATIVE_IO_BUILD_IMAGE=0 tools/native-io/package-centos7-jars.sh
+```
+
+可通过 `PAIMON_NATIVE_IO_DOCKER_IMAGE` 或 `PAIMON_NATIVE_IO_CENTOS7_DOCKER_IMAGE` 指定本地镜像 tag。
+
 格式化代码：
 
 ```bash
