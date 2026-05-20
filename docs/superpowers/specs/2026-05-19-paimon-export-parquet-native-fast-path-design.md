@@ -4,7 +4,7 @@
 **状态**：待评审  
 **目标读者**：Paimon native IO / Spark SQL 维护者  
 
-> 当前实现状态：native export SPI、配置校验、JNR FFI、JSON request/result 合约、Spark split 到 raw Parquet source file 的规划、DV position 下沉、基础 predicate JSON 转换，以及 Rust 本地/OBS Parquet 读写 pipeline 已落到代码中。当前实现仍是第一阶段 fast path：OBS 写出使用临时本地文件后单 PUT，暂未实现 multipart upload；`target_file_size` 已在 native writer 内按 batch 内存估算做文件滚动，尚不是基于最终压缩后对象大小的精确滚动。
+> 当前实现状态：native export SPI、配置校验、JNR FFI、JSON request/result 合约、Spark split 到 raw Parquet source file 的规划、DV position 下沉、基础 predicate JSON 转换，以及 Rust 本地/OBS Parquet 读写 pipeline 已落到代码中。当前实现仍是第一阶段 fast path：OBS 写出使用临时本地文件后单 PUT，暂未实现 multipart upload；`target_file_size` 已在 native writer 内按 batch 内存估算做文件滚动，尚不是基于最终压缩后对象大小的精确滚动。Rust export 读 Parquet 时会裁剪到输出列和 predicate 列，并在 OBS range reader 中汇总 read request/bytes 指标。
 
 ---
 
