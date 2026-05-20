@@ -542,10 +542,18 @@ fn build_file_batch_reader<R: ChunkReader + 'static>(
     let mut builder =
         ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| e.to_string())?;
     if let Some(target_columns) = target_columns {
-        let mask = ProjectionMask::columns(
-            builder.parquet_schema(),
-            target_columns.iter().map(String::as_str),
-        );
+        let parquet_schema = builder.parquet_schema();
+        let available_columns: HashSet<String> = parquet_schema
+            .columns()
+            .iter()
+            .map(|column| column.path().string())
+            .collect();
+        let selected_columns: Vec<&str> = target_columns
+            .iter()
+            .map(String::as_str)
+            .filter(|column| available_columns.contains(*column))
+            .collect();
+        let mask = ProjectionMask::columns(parquet_schema, selected_columns);
         builder = builder.with_projection(mask);
     }
     let reader = builder
@@ -1017,8 +1025,12 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
     let mut next_output_ordinal = 0usize;
 
     for (file_ordinal, file) in task.files.iter().enumerate() {
-        let (schema, mut export_reader) =
-            build_export_reader(file, task.writer_batch_size, &task.object_store_options)?;
+        let (schema, mut export_reader) = build_export_reader(
+            file,
+            &task,
+            task.writer_batch_size,
+            &task.object_store_options,
+        )?;
         let _ = schema;
         let reader = &mut export_reader.reader;
         let _ = file_ordinal;
@@ -1280,16 +1292,18 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 
 fn build_export_reader(
     file: &ExportFile,
+    task: &ExportTask,
     batch_size: usize,
     options: &HashMap<String, String>,
 ) -> Result<(SchemaRef, ExportReader), String> {
+    let read_columns = export_read_columns(task);
     if file.path.starts_with("obs://") {
         let metrics = Arc::new(ObsReadMetrics::default());
         let (schema, reader) = build_file_batch_reader(
             ObsObjectChunkReader::new_with_metrics(&file.path, options, Some(metrics.clone()))?,
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
-            None,
+            Some(&read_columns),
         )?;
         Ok((
             schema,
@@ -1303,7 +1317,7 @@ fn build_export_reader(
             open_local(&file.path)?,
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
-            None,
+            Some(&read_columns),
         )?;
         Ok((
             schema,
@@ -1312,6 +1326,32 @@ fn build_export_reader(
                 obs_metrics: None,
             },
         ))
+    }
+}
+
+fn export_read_columns(task: &ExportTask) -> Vec<String> {
+    let mut columns = Vec::new();
+    for column in &task.projection {
+        push_unique_column(&mut columns, column);
+    }
+    collect_predicate_fields(&task.predicate, &mut columns);
+    columns
+}
+
+fn collect_predicate_fields(predicate: &Value, columns: &mut Vec<String>) {
+    if let Some(field) = predicate.get("field").and_then(Value::as_str) {
+        push_unique_column(columns, field);
+    }
+    if let Some(children) = predicate.get("children").and_then(Value::as_array) {
+        for child in children {
+            collect_predicate_fields(child, columns);
+        }
+    }
+}
+
+fn push_unique_column(columns: &mut Vec<String>, column: &str) {
+    if !columns.iter().any(|existing| existing == column) {
+        columns.push(column.to_string());
     }
 }
 
@@ -1799,6 +1839,87 @@ mod tests {
         );
         assert!(result["metrics"]["writer_rolls"].as_u64().unwrap() > 0);
         assert!(result["metrics"]["peak_buffered_bytes"].as_u64().unwrap() > 0);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_read_columns_include_predicate_fields() {
+        let task = ExportTask {
+            output_path: "/tmp/out".to_string(),
+            compression: "zstd".to_string(),
+            target_file_size_bytes: u64::MAX,
+            writer_batch_size: 1024,
+            writer_row_group_size: 1024,
+            memory_limit_bytes: 1024 * 1024,
+            projection: vec!["id".to_string(), "dt".to_string()],
+            predicate_format: "paimon-json-v1".to_string(),
+            predicate: serde_json::json!({
+                "op": "and",
+                "children": [
+                    {"op": "gt", "field": "score", "literal": {"type": "BIGINT", "value": 10}},
+                    {"op": "eq", "field": "dt", "literal": {"type": "VARCHAR", "value": "2026-05-06"}}
+                ]
+            }),
+            object_store_options: HashMap::new(),
+            files: Vec::new(),
+        };
+
+        assert_eq!(
+            export_read_columns(&task),
+            vec!["id".to_string(), "dt".to_string(), "score".to_string()]
+        );
+    }
+
+    #[test]
+    fn native_export_can_filter_on_non_output_column_after_projection_pushdown() {
+        let input =
+            write_i64_parquet_columns(vec![("id", vec![1, 2, 3]), ("score", vec![5, 20, 7])]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-filter-only-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 4,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({
+                "op": "gt",
+                "field": "score",
+                "literal": {"type": "BIGINT", "value": 10}
+            }).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 3,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+
+        let result: Value =
+            serde_json::from_str(&export_parquet(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(1));
+        let output_file = result["files_written"][0]["path"].as_str().unwrap();
+        let (schema, mut file_reader) =
+            build_file_batch_reader(open_local(output_file).unwrap(), 8, "__row_index", None)
+                .unwrap();
+        assert!(schema.field_with_name("score").is_err());
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        let id = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.value(0), 2);
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_dir_all(output_dir);
