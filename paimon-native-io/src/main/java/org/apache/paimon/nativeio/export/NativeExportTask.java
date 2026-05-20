@@ -39,6 +39,8 @@ public final class NativeExportTask implements Serializable {
     private final long targetFileSizeBytes;
     private final long readBufferSizeBytes;
     private final int readConcurrency;
+    private final long obsRequestTimeoutMillis;
+    private final long obsConnectTimeoutMillis;
     private final int writerBatchSize;
     private final int writerRowGroupSize;
     private final long multipartPartSizeBytes;
@@ -57,6 +59,8 @@ public final class NativeExportTask implements Serializable {
             long targetFileSizeBytes,
             long readBufferSizeBytes,
             int readConcurrency,
+            long obsRequestTimeoutMillis,
+            long obsConnectTimeoutMillis,
             int writerBatchSize,
             int writerRowGroupSize,
             long multipartPartSizeBytes,
@@ -75,6 +79,8 @@ public final class NativeExportTask implements Serializable {
                 targetFileSizeBytes,
                 readBufferSizeBytes,
                 readConcurrency,
+                obsRequestTimeoutMillis,
+                obsConnectTimeoutMillis,
                 writerBatchSize,
                 writerRowGroupSize,
                 multipartPartSizeBytes,
@@ -96,6 +102,8 @@ public final class NativeExportTask implements Serializable {
             @JsonProperty("target_file_size_bytes") long targetFileSizeBytes,
             @JsonProperty("read_buffer_size_bytes") long readBufferSizeBytes,
             @JsonProperty("read_concurrency") int readConcurrency,
+            @JsonProperty("obs_request_timeout_ms") long obsRequestTimeoutMillis,
+            @JsonProperty("obs_connect_timeout_ms") long obsConnectTimeoutMillis,
             @JsonProperty("writer_batch_size") int writerBatchSize,
             @JsonProperty("writer_row_group_size") int writerRowGroupSize,
             @JsonProperty("multipart_part_size_bytes") long multipartPartSizeBytes,
@@ -113,6 +121,10 @@ public final class NativeExportTask implements Serializable {
         this.targetFileSizeBytes = targetFileSizeBytes;
         this.readBufferSizeBytes = readBufferSizeBytes;
         this.readConcurrency = readConcurrency;
+        this.obsRequestTimeoutMillis =
+                obsRequestTimeoutMillis <= 0 ? 30000L : obsRequestTimeoutMillis;
+        this.obsConnectTimeoutMillis =
+                obsConnectTimeoutMillis <= 0 ? 10000L : obsConnectTimeoutMillis;
         this.writerBatchSize = writerBatchSize;
         this.writerRowGroupSize = writerRowGroupSize;
         this.multipartPartSizeBytes = multipartPartSizeBytes;
@@ -163,6 +175,16 @@ public final class NativeExportTask implements Serializable {
     @JsonProperty("read_concurrency")
     public int readConcurrency() {
         return readConcurrency;
+    }
+
+    @JsonProperty("obs_request_timeout_ms")
+    public long obsRequestTimeoutMillis() {
+        return obsRequestTimeoutMillis;
+    }
+
+    @JsonProperty("obs_connect_timeout_ms")
+    public long obsConnectTimeoutMillis() {
+        return obsConnectTimeoutMillis;
     }
 
     @JsonProperty("writer_batch_size")
@@ -228,6 +250,8 @@ public final class NativeExportTask implements Serializable {
                 targetFileSizeBytes,
                 readBufferSizeBytes,
                 readConcurrency,
+                obsRequestTimeoutMillis,
+                obsConnectTimeoutMillis,
                 writerBatchSize,
                 writerRowGroupSize,
                 multipartPartSizeBytes,

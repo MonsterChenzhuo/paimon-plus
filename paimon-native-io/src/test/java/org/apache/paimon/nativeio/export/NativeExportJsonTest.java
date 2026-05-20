@@ -51,6 +51,8 @@ class NativeExportJsonTest {
                         536870912L,
                         8388608L,
                         4,
+                        30000L,
+                        10000L,
                         8192,
                         250000,
                         67108864L,
@@ -66,6 +68,8 @@ class NativeExportJsonTest {
         String json = NativeExportJson.toJson(task);
         assertThat(json).contains("\"output_path\":\"obs://bucket/export\"");
         assertThat(json).contains("\"target_file_size_bytes\":536870912");
+        assertThat(json).contains("\"obs_request_timeout_ms\":30000");
+        assertThat(json).contains("\"obs_connect_timeout_ms\":10000");
         assertThat(json).contains("\"writer_row_group_size\":250000");
         assertThat(json).contains("\"memory_limit_bytes\":536870912");
         assertThat(json).contains("\"runtime_threads\":4");

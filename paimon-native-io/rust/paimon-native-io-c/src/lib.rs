@@ -5,7 +5,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{
@@ -60,6 +61,8 @@ const RUNTIME_THREAD_ENV: &[&str] = &[
     "PAIMON_NATIVE_IO_RUNTIME_THREADS",
 ];
 const DEFAULT_RUNTIME_THREADS: usize = 4;
+const DEFAULT_OBS_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_OBS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 static GLOBAL_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
@@ -111,7 +114,15 @@ struct ObsObjectInner {
     key: String,
     len: u64,
     runtime_threads: usize,
+    read_buffer_size_bytes: usize,
+    range_cache: Mutex<Option<ObsRangeCache>>,
     metrics: Option<Arc<ObsReadMetrics>>,
+}
+
+#[derive(Clone, Debug)]
+struct ObsRangeCache {
+    start: u64,
+    bytes: Bytes,
 }
 
 struct ObsObjectRead {
@@ -345,6 +356,18 @@ fn global_runtime_with_threads(
 }
 
 fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String> {
+    build_obs_client_with_timeouts(
+        options,
+        DEFAULT_OBS_REQUEST_TIMEOUT_MS,
+        DEFAULT_OBS_CONNECT_TIMEOUT_MS,
+    )
+}
+
+fn build_obs_client_with_timeouts(
+    options: &HashMap<String, String>,
+    request_timeout_ms: u64,
+    connect_timeout_ms: u64,
+) -> Result<Client, String> {
     let access_key = option_or_env(options, OBS_ACCESS_KEY_OPTIONS, OBS_ACCESS_KEY_ENV)
         .ok_or_else(|| "missing fs.obs.access.key or OBS_ACCESS_KEY_ID".to_string())?;
     let secret_key = option_or_env(options, OBS_SECRET_KEY_OPTIONS, OBS_SECRET_KEY_ENV)
@@ -360,7 +383,9 @@ fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String>
 
     let mut builder = Config::builder()
         .credentials(credentials)
-        .endpoint(endpoint.clone());
+        .endpoint(endpoint.clone())
+        .timeout(Duration::from_millis(request_timeout_ms.max(1)))
+        .connect_timeout(Duration::from_millis(connect_timeout_ms.max(1)));
 
     if endpoint.starts_with("http://") {
         builder = builder.secure(false);
@@ -372,7 +397,15 @@ fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String>
 
 impl ObsObjectChunkReader {
     fn new(path: &str, options: &HashMap<String, String>) -> Result<Self, String> {
-        Self::new_with_runtime_metrics(path, options, None, runtime_worker_threads())
+        Self::new_with_runtime_metrics(
+            path,
+            options,
+            None,
+            runtime_worker_threads(),
+            8 * 1024 * 1024,
+            DEFAULT_OBS_REQUEST_TIMEOUT_MS,
+            DEFAULT_OBS_CONNECT_TIMEOUT_MS,
+        )
     }
 
     fn new_with_runtime_metrics(
@@ -380,9 +413,13 @@ impl ObsObjectChunkReader {
         options: &HashMap<String, String>,
         metrics: Option<Arc<ObsReadMetrics>>,
         runtime_threads: usize,
+        read_buffer_size_bytes: usize,
+        request_timeout_ms: u64,
+        connect_timeout_ms: u64,
     ) -> Result<Self, String> {
         let location = ObsObjectLocation::parse(path)?;
-        let client = build_obs_client(options)?;
+        let client =
+            build_obs_client_with_timeouts(options, request_timeout_ms, connect_timeout_ms)?;
         let runtime_threads = runtime_threads.max(1);
         let len = global_runtime_with_threads(runtime_threads)?
             .block_on(async {
@@ -393,7 +430,12 @@ impl ObsObjectChunkReader {
                     .send()
                     .await
             })
-            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                format!(
+                    "OBS head_object failed for obs://{}/{}: {}",
+                    location.bucket, location.key, e
+                )
+            })?
             .content_length()
             .ok_or_else(|| "OBS head_object response missing Content-Length".to_string())?;
 
@@ -404,6 +446,8 @@ impl ObsObjectChunkReader {
                 key: location.key,
                 len,
                 runtime_threads,
+                read_buffer_size_bytes,
+                range_cache: Mutex::new(None),
                 metrics,
             }),
         })
@@ -423,7 +467,23 @@ impl ObsObjectChunkReader {
             )));
         }
 
+        let mut cache =
+            self.inner.range_cache.lock().map_err(|e| {
+                ParquetError::General(format!("OBS range cache lock poisoned: {}", e))
+            })?;
+        read_buffered_range(
+            &mut cache,
+            self.inner.len,
+            self.inner.read_buffer_size_bytes,
+            start,
+            length,
+            |fetch_start, fetch_length| self.fetch_range_uncached(fetch_start, fetch_length),
+        )
+    }
+
+    fn fetch_range_uncached(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
         let range = range_header(start, length);
+        let range_for_error = range.clone();
         if let Some(metrics) = &self.inner.metrics {
             metrics.requests.fetch_add(1, Ordering::Relaxed);
         }
@@ -439,7 +499,12 @@ impl ObsObjectChunkReader {
                     .send()
                     .await
             })
-            .map_err(|e| ParquetError::General(e.to_string()))?
+            .map_err(|e| {
+                ParquetError::General(format!(
+                    "OBS get_object failed for obs://{}/{} range {}: {}",
+                    self.inner.bucket, self.inner.key, range_for_error, e
+                ))
+            })?
             .into_body();
         if bytes.len() != length {
             return Err(ParquetError::EOF(format!(
@@ -456,6 +521,56 @@ impl ObsObjectChunkReader {
         }
         Ok(bytes)
     }
+}
+
+fn read_buffered_range<F>(
+    cache: &mut Option<ObsRangeCache>,
+    object_len: u64,
+    read_buffer_size_bytes: usize,
+    start: u64,
+    length: usize,
+    mut fetch: F,
+) -> ParquetResult<Bytes>
+where
+    F: FnMut(u64, usize) -> ParquetResult<Bytes>,
+{
+    if length == 0 {
+        return Ok(Bytes::new());
+    }
+    if let Some(cache) = cache.as_ref() {
+        let cache_end = cache.start + cache.bytes.len() as u64;
+        let request_end = start
+            .checked_add(length as u64)
+            .ok_or_else(|| ParquetError::General("OBS range overflow".to_string()))?;
+        if start >= cache.start && request_end <= cache_end {
+            let offset = (start - cache.start) as usize;
+            return Ok(cache.bytes.slice(offset..offset + length));
+        }
+    }
+
+    let fetch_length = if length >= read_buffer_size_bytes {
+        length
+    } else {
+        let remaining = object_len.saturating_sub(start);
+        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
+        read_buffer_size_bytes.max(length).min(remaining)
+    };
+    let bytes = fetch(start, fetch_length)?;
+    if bytes.len() < length {
+        return Err(ParquetError::EOF(format!(
+            "Expected buffered read to return at least {} bytes at offset {}, got {}",
+            length,
+            start,
+            bytes.len()
+        )));
+    }
+    if length < read_buffer_size_bytes {
+        *cache = Some(ObsRangeCache {
+            start,
+            bytes: bytes.clone(),
+        });
+    }
+    Ok(bytes.slice(0..length))
 }
 
 impl Length for ObsObjectChunkReader {
@@ -853,6 +968,8 @@ struct ExportTask {
     target_file_size_bytes: u64,
     read_buffer_size_bytes: u64,
     read_concurrency: usize,
+    obs_request_timeout_ms: u64,
+    obs_connect_timeout_ms: u64,
     writer_batch_size: usize,
     writer_row_group_size: usize,
     multipart_part_size_bytes: u64,
@@ -930,6 +1047,14 @@ fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
             .get("read_concurrency")
             .and_then(Value::as_u64)
             .unwrap_or(4) as usize,
+        obs_request_timeout_ms: root
+            .get("obs_request_timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_OBS_REQUEST_TIMEOUT_MS),
+        obs_connect_timeout_ms: root
+            .get("obs_connect_timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_OBS_CONNECT_TIMEOUT_MS),
         writer_batch_size: root
             .get("writer_batch_size")
             .and_then(Value::as_u64)
@@ -991,9 +1116,26 @@ struct ActiveExportWriter {
     local_output: String,
     multipart_part_size_bytes: u64,
     runtime_threads: usize,
+    obs_request_timeout_ms: u64,
+    obs_connect_timeout_ms: u64,
+    cleanup: TempFileCleanup,
     writer: ArrowWriter<File>,
     rows: u64,
     buffered_bytes: u64,
+}
+
+#[derive(Debug)]
+struct TempFileCleanup {
+    path: String,
+    enabled: bool,
+}
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1077,16 +1219,38 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
     let mut files_written = Vec::new();
     let mut next_output_ordinal = 0usize;
 
+    export_log(format!(
+        "start output_path={} files={} projection={} request_timeout_ms={} connect_timeout_ms={} runtime_threads={}",
+        task.output_path,
+        task.files.len(),
+        task.projection.len(),
+        task.obs_request_timeout_ms,
+        task.obs_connect_timeout_ms,
+        task.runtime_threads
+    ));
+
     for (file_ordinal, file) in task.files.iter().enumerate() {
+        export_log(format!(
+            "file_start ordinal={} path={}",
+            file_ordinal, file.path
+        ));
+        let reader_start = std::time::Instant::now();
         let (schema, mut export_reader) = build_export_reader(
             file,
             &task,
             task.writer_batch_size,
             &task.object_store_options,
         )?;
+        export_log(format!(
+            "reader_ready ordinal={} elapsed_ms={}",
+            file_ordinal,
+            elapsed_ms(reader_start)
+        ));
         let _ = schema;
         let reader = &mut export_reader.reader;
-        let _ = file_ordinal;
+        let mut file_row_groups = 0u64;
+        let mut file_rows_read = 0u64;
+        let mut file_rows_output = 0u64;
         let mut writer: Option<ActiveExportWriter> = None;
 
         loop {
@@ -1097,10 +1261,12 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             };
             decode_ms += elapsed_ms(decode_start);
             parquet_row_groups_read += 1;
+            file_row_groups += 1;
             let batch = append_row_index(batch, DEFAULT_ROW_INDEX_COLUMN, reader.row_offset)?;
             reader.row_offset += batch.num_rows() as i64;
             let input_rows = batch.num_rows();
             rows_read += input_rows as u64;
+            file_rows_read += input_rows as u64;
             let filter_start = std::time::Instant::now();
             let (batch, filtered_by_dv) = apply_export_filters(batch, file, &task.predicate)?;
             filter_ms += elapsed_ms(filter_start);
@@ -1108,10 +1274,17 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             predicate_filtered_rows +=
                 input_rows.saturating_sub(filtered_by_dv + batch.num_rows()) as u64;
             if batch.num_rows() == 0 {
+                if file_row_groups == 1 || file_row_groups % 100 == 0 {
+                    export_log(format!(
+                        "file_progress ordinal={} row_groups={} rows_read={} rows_output={}",
+                        file_ordinal, file_row_groups, file_rows_read, file_rows_output
+                    ));
+                }
                 continue;
             }
             let projected = project_export_batch(batch, &task.projection, &file.partition)?;
             rows_output += projected.num_rows() as u64;
+            file_rows_output += projected.num_rows() as u64;
             write_projected_export_batch(
                 projected,
                 &task,
@@ -1126,6 +1299,12 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
                 &mut obs_write_ms,
                 &mut multipart_finish_ms,
             )?;
+            if file_row_groups == 1 || file_row_groups % 100 == 0 {
+                export_log(format!(
+                    "file_progress ordinal={} row_groups={} rows_read={} rows_output={}",
+                    file_ordinal, file_row_groups, file_rows_read, file_rows_output
+                ));
+            }
         }
 
         if let Some(writer) = writer.take() {
@@ -1145,7 +1324,19 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             obs_read_retries += metrics.retries.load(Ordering::Relaxed);
             obs_read_bytes += metrics.bytes.load(Ordering::Relaxed);
         }
+        export_log(format!(
+            "file_done ordinal={} row_groups={} rows_read={} rows_output={}",
+            file_ordinal, file_row_groups, file_rows_read, file_rows_output
+        ));
     }
+
+    export_log(format!(
+        "done output_path={} rows_read={} rows_output={} files_written={}",
+        task.output_path,
+        rows_read,
+        rows_output,
+        files_written.len()
+    ));
 
     Ok(serde_json::json!({
         "rows_output": rows_output,
@@ -1181,6 +1372,12 @@ fn validate_export_task_options(task: &ExportTask) -> Result<(), String> {
     }
     if task.read_concurrency == 0 {
         return Err("INVALID_EXPORT_CONFIG: read_concurrency must be positive".to_string());
+    }
+    if task.obs_request_timeout_ms == 0 {
+        return Err("INVALID_EXPORT_CONFIG: obs_request_timeout_ms must be positive".to_string());
+    }
+    if task.obs_connect_timeout_ms == 0 {
+        return Err("INVALID_EXPORT_CONFIG: obs_connect_timeout_ms must be positive".to_string());
     }
     if task.writer_batch_size == 0 {
         return Err("INVALID_EXPORT_CONFIG: writer_batch_size must be positive".to_string());
@@ -1288,6 +1485,10 @@ fn create_export_writer(
 ) -> Result<ActiveExportWriter, String> {
     let output_path = output_part_path(&task.output_path, ordinal)?;
     let local_output = local_output_path(&output_path)?;
+    export_log(format!(
+        "writer_create output_path={} local_output={}",
+        output_path, local_output
+    ));
     if let Some(parent) = std::path::Path::new(&local_output).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1306,9 +1507,15 @@ fn create_export_writer(
     .map_err(|e| e.to_string())?;
     Ok(ActiveExportWriter {
         output_path,
+        cleanup: TempFileCleanup {
+            path: local_output.clone(),
+            enabled: task.output_path.starts_with("obs://"),
+        },
         local_output,
         multipart_part_size_bytes: task.multipart_part_size_bytes,
         runtime_threads: task.runtime_threads,
+        obs_request_timeout_ms: task.obs_request_timeout_ms,
+        obs_connect_timeout_ms: task.obs_connect_timeout_ms,
         writer,
         rows: 0,
         buffered_bytes: 0,
@@ -1353,10 +1560,17 @@ fn finish_export_writer(
         local_output,
         multipart_part_size_bytes,
         runtime_threads,
+        obs_request_timeout_ms,
+        obs_connect_timeout_ms,
+        cleanup: _cleanup,
         writer,
         rows,
         ..
     } = writer;
+    export_log(format!(
+        "writer_finish_start output_path={} rows={}",
+        output_path, rows
+    ));
     let encode_start = std::time::Instant::now();
     writer.close().map_err(|e| e.to_string())?;
     *encode_ms += elapsed_ms(encode_start);
@@ -1365,18 +1579,30 @@ fn finish_export_writer(
         .len();
     if output_path.starts_with("obs://") {
         let obs_start = std::time::Instant::now();
+        export_log(format!(
+            "upload_start output_path={} local_output={} bytes={}",
+            output_path, local_output, bytes
+        ));
         let stats = upload_local_file_to_obs(
             &local_output,
             &output_path,
             object_store_options,
             multipart_part_size_bytes,
             runtime_threads,
+            obs_request_timeout_ms,
+            obs_connect_timeout_ms,
         )?;
         *obs_write_ms += elapsed_ms(obs_start);
         *obs_write_requests += stats.requests;
         *obs_write_bytes += stats.bytes;
         *multipart_finish_ms += stats.multipart_finish_ms;
-        let _ = std::fs::remove_file(&local_output);
+        export_log(format!(
+            "upload_done output_path={} requests={} bytes={} elapsed_ms={}",
+            output_path,
+            stats.requests,
+            stats.bytes,
+            elapsed_ms(obs_start)
+        ));
     }
     files_written.push(serde_json::json!({
         "path": output_path,
@@ -1421,6 +1647,10 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
+fn export_log(message: impl AsRef<str>) {
+    eprintln!("[paimon-native-export] {}", message.as_ref());
+}
+
 fn build_export_reader(
     file: &ExportFile,
     task: &ExportTask,
@@ -1436,6 +1666,9 @@ fn build_export_reader(
                 options,
                 Some(metrics.clone()),
                 task.runtime_threads,
+                task.read_buffer_size_bytes as usize,
+                task.obs_request_timeout_ms,
+                task.obs_connect_timeout_ms,
             )?,
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
@@ -1754,12 +1987,14 @@ fn upload_local_file_to_obs(
     options: &HashMap<String, String>,
     multipart_part_size_bytes: u64,
     runtime_threads: usize,
+    request_timeout_ms: u64,
+    connect_timeout_ms: u64,
 ) -> Result<UploadStats, String> {
     let (bucket, key) = parse_obs_prefix(output_path)?;
     let bytes = std::fs::metadata(local_path)
         .map_err(|e| e.to_string())?
         .len();
-    let client = build_obs_client(options)?;
+    let client = build_obs_client_with_timeouts(options, request_timeout_ms, connect_timeout_ms)?;
     if bytes <= multipart_part_size_bytes {
         let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
         global_runtime_with_threads(runtime_threads)?.block_on(async {
@@ -1771,7 +2006,7 @@ fn upload_local_file_to_obs(
                 .content_type("application/octet-stream")
                 .send()
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("OBS put_object failed for {}: {}", output_path, e))
                 .map(|_| UploadStats {
                     requests: 1,
                     bytes,
@@ -1848,7 +2083,12 @@ fn upload_local_file_to_obs_multipart(
             .content_type("application/octet-stream")
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                format!(
+                    "OBS initiate_multipart_upload failed for obs://{}/{}: {}",
+                    bucket, key, e
+                )
+            })?;
         let upload_id = initiate.upload_id().to_string();
         let mut stats = UploadStats {
             requests: 1,
@@ -1870,7 +2110,12 @@ fn upload_local_file_to_obs_multipart(
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| {
+                        format!(
+                            "OBS upload_part failed for obs://{}/{} part {}: {}",
+                            bucket, key, range.part_number, e
+                        )
+                    })?;
                 stats.requests += 1;
                 stats.bytes += range.length as u64;
                 completed_parts.push(CompletedPart::new(range.part_number, part.etag()));
@@ -1885,7 +2130,12 @@ fn upload_local_file_to_obs_multipart(
                 .parts(completed_parts)
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    format!(
+                        "OBS complete_multipart_upload failed for obs://{}/{}: {}",
+                        bucket, key, e
+                    )
+                })?;
             stats.requests += 1;
             stats.multipart_finish_ms += elapsed_ms(finish_start);
             Ok(stats)
@@ -2157,6 +2407,8 @@ mod tests {
             "target_file_size_bytes": 536870912u64,
             "read_buffer_size_bytes": 16 * 1024 * 1024u64,
             "read_concurrency": 8,
+            "obs_request_timeout_ms": 45000u64,
+            "obs_connect_timeout_ms": 12000u64,
             "writer_batch_size": 4096,
             "writer_row_group_size": 131072,
             "multipart_part_size_bytes": 32 * 1024 * 1024u64,
@@ -2173,12 +2425,48 @@ mod tests {
         let task = parse_export_task(&request.to_string()).unwrap();
         assert_eq!(task.read_buffer_size_bytes, 16 * 1024 * 1024);
         assert_eq!(task.read_concurrency, 8);
+        assert_eq!(task.obs_request_timeout_ms, 45000);
+        assert_eq!(task.obs_connect_timeout_ms, 12000);
         assert_eq!(task.writer_batch_size, 4096);
         assert_eq!(task.writer_row_group_size, 131072);
         assert_eq!(task.multipart_part_size_bytes, 32 * 1024 * 1024);
         assert_eq!(task.memory_limit_bytes, 256 * 1024 * 1024);
         assert_eq!(task.runtime_threads, 6);
         assert!(!task.metadata_cache_enabled);
+    }
+
+    #[test]
+    fn buffered_range_reads_reuse_cached_obs_ranges() {
+        let data = Bytes::from((0..200u8).collect::<Vec<_>>());
+        let mut cache = None;
+        let mut fetches = Vec::new();
+
+        let first =
+            read_buffered_range(&mut cache, data.len() as u64, 32, 4, 8, |start, length| {
+                fetches.push((start, length));
+                Ok(data.slice(start as usize..start as usize + length))
+            })
+            .unwrap();
+        assert_eq!(&first[..], &data[4..12]);
+        assert_eq!(fetches, vec![(4, 32)]);
+
+        let second =
+            read_buffered_range(&mut cache, data.len() as u64, 32, 12, 8, |start, length| {
+                fetches.push((start, length));
+                Ok(data.slice(start as usize..start as usize + length))
+            })
+            .unwrap();
+        assert_eq!(&second[..], &data[12..20]);
+        assert_eq!(fetches, vec![(4, 32)]);
+
+        let third =
+            read_buffered_range(&mut cache, data.len() as u64, 32, 40, 4, |start, length| {
+                fetches.push((start, length));
+                Ok(data.slice(start as usize..start as usize + length))
+            })
+            .unwrap();
+        assert_eq!(&third[..], &data[40..44]);
+        assert_eq!(fetches, vec![(4, 32), (40, 32)]);
     }
 
     #[test]
@@ -2303,6 +2591,8 @@ mod tests {
             target_file_size_bytes: u64::MAX,
             read_buffer_size_bytes: 8 * 1024 * 1024,
             read_concurrency: 4,
+            obs_request_timeout_ms: DEFAULT_OBS_REQUEST_TIMEOUT_MS,
+            obs_connect_timeout_ms: DEFAULT_OBS_CONNECT_TIMEOUT_MS,
             writer_batch_size: 1024,
             writer_row_group_size: 1024,
             multipart_part_size_bytes: 64 * 1024 * 1024,
@@ -2342,6 +2632,8 @@ mod tests {
             target_file_size_bytes: u64::MAX,
             read_buffer_size_bytes: 8 * 1024 * 1024,
             read_concurrency: 4,
+            obs_request_timeout_ms: 45_000,
+            obs_connect_timeout_ms: 12_000,
             writer_batch_size: 1024,
             writer_row_group_size: 1024,
             multipart_part_size_bytes: 64 * 1024 * 1024,
@@ -2359,6 +2651,8 @@ mod tests {
         let writer = create_export_writer(&task, schema, 0).unwrap();
 
         assert_eq!(writer.runtime_threads, 7);
+        assert_eq!(writer.obs_request_timeout_ms, 45_000);
+        assert_eq!(writer.obs_connect_timeout_ms, 12_000);
         let _ = std::fs::remove_file(writer.local_output);
         let _ = std::fs::remove_dir_all(output_dir);
     }

@@ -124,6 +124,8 @@ public final class NativeExportPlanner {
                                     : context.targetFileSizeBytes(),
                             exportOptions.readBufferSizeBytes(),
                             exportOptions.readConcurrency(),
+                            exportOptions.obsRequestTimeoutMillis(),
+                            exportOptions.obsConnectTimeoutMillis(),
                             exportOptions.writerBatchSize(),
                             exportOptions.writerRowGroupSize(),
                             exportOptions.multipartPartSizeBytes(),

@@ -36,6 +36,8 @@ class NativeExportOptionsTest {
         assertThat(options.metricsEnabled()).isTrue();
         assertThat(options.readBufferSizeBytes()).isEqualTo(8L * 1024 * 1024);
         assertThat(options.readConcurrency()).isEqualTo(4);
+        assertThat(options.obsRequestTimeoutMillis()).isEqualTo(30000L);
+        assertThat(options.obsConnectTimeoutMillis()).isEqualTo(10000L);
         assertThat(options.writerBatchSize()).isEqualTo(8192);
         assertThat(options.writerRowGroupSize()).isEqualTo(250000);
         assertThat(options.multipartPartSizeBytes()).isEqualTo(64L * 1024 * 1024);
@@ -83,5 +85,15 @@ class NativeExportOptionsTest {
         raw.setString("native-io.export.runtime-threads", "0");
         assertThat(NativeExportOptions.from(raw).valid().detail())
                 .contains("native-io.export.runtime-threads");
+
+        raw.setString("native-io.export.runtime-threads", "4");
+        raw.setString("native-io.export.obs.request-timeout", "0 ms");
+        assertThat(NativeExportOptions.from(raw).valid().detail())
+                .contains("native-io.export.obs.request-timeout");
+
+        raw.setString("native-io.export.obs.request-timeout", "30 s");
+        raw.setString("native-io.export.obs.connect-timeout", "0 ms");
+        assertThat(NativeExportOptions.from(raw).valid().detail())
+                .contains("native-io.export.obs.connect-timeout");
     }
 }

@@ -452,6 +452,18 @@ public class CoreOptions implements Serializable {
                     .defaultValue(4)
                     .withDescription("Maximum per-task native OBS read concurrency for export.");
 
+    public static final ConfigOption<Duration> NATIVE_IO_EXPORT_OBS_REQUEST_TIMEOUT =
+            key("native-io.export.obs.request-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(30))
+                    .withDescription("Request timeout for native OBS export read and write calls.");
+
+    public static final ConfigOption<Duration> NATIVE_IO_EXPORT_OBS_CONNECT_TIMEOUT =
+            key("native-io.export.obs.connect-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofSeconds(10))
+                    .withDescription("Connect timeout for native OBS export read and write calls.");
+
     public static final ConfigOption<Integer> NATIVE_IO_EXPORT_WRITER_BATCH_SIZE =
             key("native-io.export.writer.batch-size")
                     .intType()

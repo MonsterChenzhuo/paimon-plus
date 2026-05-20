@@ -30,6 +30,8 @@ public final class NativeExportOptions {
     private static final long MAX_READ_BUFFER_BYTES = 128L * 1024 * 1024;
     private static final int MIN_READ_CONCURRENCY = 1;
     private static final int MAX_READ_CONCURRENCY = 64;
+    private static final long MIN_OBS_TIMEOUT_MILLIS = 1000;
+    private static final long MAX_OBS_TIMEOUT_MILLIS = 60L * 60 * 1000;
     private static final int MIN_WRITER_BATCH_SIZE = 1;
     private static final int MAX_WRITER_BATCH_SIZE = 65536;
     private static final int MIN_WRITER_ROW_GROUP_SIZE = 1024;
@@ -75,6 +77,14 @@ public final class NativeExportOptions {
         return options.get(CoreOptions.NATIVE_IO_EXPORT_OBS_READ_CONCURRENCY);
     }
 
+    public long obsRequestTimeoutMillis() {
+        return options.get(CoreOptions.NATIVE_IO_EXPORT_OBS_REQUEST_TIMEOUT).toMillis();
+    }
+
+    public long obsConnectTimeoutMillis() {
+        return options.get(CoreOptions.NATIVE_IO_EXPORT_OBS_CONNECT_TIMEOUT).toMillis();
+    }
+
     public int writerBatchSize() {
         return options.get(CoreOptions.NATIVE_IO_EXPORT_WRITER_BATCH_SIZE);
     }
@@ -112,6 +122,16 @@ public final class NativeExportOptions {
         int readConcurrency = readConcurrency();
         if (readConcurrency < MIN_READ_CONCURRENCY || readConcurrency > MAX_READ_CONCURRENCY) {
             return invalid("native-io.export.obs.read-concurrency must be between 1 and 64");
+        }
+        long obsRequestTimeoutMillis = obsRequestTimeoutMillis();
+        if (obsRequestTimeoutMillis < MIN_OBS_TIMEOUT_MILLIS
+                || obsRequestTimeoutMillis > MAX_OBS_TIMEOUT_MILLIS) {
+            return invalid("native-io.export.obs.request-timeout must be between 1 s and 1 h");
+        }
+        long obsConnectTimeoutMillis = obsConnectTimeoutMillis();
+        if (obsConnectTimeoutMillis < MIN_OBS_TIMEOUT_MILLIS
+                || obsConnectTimeoutMillis > MAX_OBS_TIMEOUT_MILLIS) {
+            return invalid("native-io.export.obs.connect-timeout must be between 1 s and 1 h");
         }
         int writerBatchSize = writerBatchSize();
         if (writerBatchSize < MIN_WRITER_BATCH_SIZE || writerBatchSize > MAX_WRITER_BATCH_SIZE) {
