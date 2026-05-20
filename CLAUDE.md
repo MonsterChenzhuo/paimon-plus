@@ -64,10 +64,17 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
 
 本地快速迭代可用 `-Pfast-build` 跳过 checkstyle、spotless、enforcer 和 rat；最终验证时不要只依赖 fast-build。
 
-打包也必须在 `monster830/paimon-plus:spark344-java8` 镜像内执行，例如：
+打包也必须在 `monster830/paimon-plus:spark344-java8` 镜像内执行。Spark 3.4 包的标准命令是：
 
 ```bash
-mvn -Pfast-build -DskipTests package
+mvn clean install -DskipTests -Pfast-build,native-io,spark3 \
+  -pl paimon-spark/paimon-spark-3.4 -am
+```
+
+产物位置：
+
+```text
+paimon-spark/paimon-spark-3.4/target/paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar
 ```
 
 ## Native IO 设计注意事项
