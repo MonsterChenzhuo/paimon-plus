@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +15,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use bytes::Bytes;
-use huaweicloud_sdk_rust_obs::{Client, Config, Credentials};
+use huaweicloud_sdk_rust_obs::{Client, CompletedPart, Config, Credentials};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
@@ -27,6 +27,7 @@ use serde_json::Value;
 use url::Url;
 
 const DEFAULT_ROW_INDEX_COLUMN: &str = "__paimon_native_row_index";
+const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 const OBS_ACCESS_KEY_OPTIONS: &[&str] = &["fs.obs.access.key", "fs.obs.accessKey", "fs.obs.ak"];
 const OBS_ACCESS_KEY_ENV: &[&str] = &[
     "OBS_ACCESS_KEY_ID",
@@ -843,9 +844,14 @@ struct ExportTask {
     output_path: String,
     compression: String,
     target_file_size_bytes: u64,
+    read_buffer_size_bytes: u64,
+    read_concurrency: usize,
     writer_batch_size: usize,
     writer_row_group_size: usize,
+    multipart_part_size_bytes: u64,
     memory_limit_bytes: u64,
+    runtime_threads: usize,
+    metadata_cache_enabled: bool,
     projection: Vec<String>,
     predicate_format: String,
     predicate: Value,
@@ -909,6 +915,14 @@ fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
             .get("target_file_size_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(u64::MAX),
+        read_buffer_size_bytes: root
+            .get("read_buffer_size_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(8 * 1024 * 1024),
+        read_concurrency: root
+            .get("read_concurrency")
+            .and_then(Value::as_u64)
+            .unwrap_or(4) as usize,
         writer_batch_size: root
             .get("writer_batch_size")
             .and_then(Value::as_u64)
@@ -917,10 +931,22 @@ fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
             .get("writer_row_group_size")
             .and_then(Value::as_u64)
             .unwrap_or(250000) as usize,
+        multipart_part_size_bytes: root
+            .get("multipart_part_size_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(64 * 1024 * 1024),
         memory_limit_bytes: root
             .get("memory_limit_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(512 * 1024 * 1024),
+        runtime_threads: root
+            .get("runtime_threads")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_RUNTIME_THREADS as u64) as usize,
+        metadata_cache_enabled: root
+            .get("metadata_cache_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         projection: root
             .get("projection")
             .and_then(Value::as_array)
@@ -956,9 +982,24 @@ fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
 struct ActiveExportWriter {
     output_path: String,
     local_output: String,
+    multipart_part_size_bytes: u64,
     writer: ArrowWriter<File>,
     rows: u64,
     buffered_bytes: u64,
+}
+
+#[derive(Default)]
+struct UploadStats {
+    requests: u64,
+    bytes: u64,
+    multipart_finish_ms: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MultipartPartRange {
+    part_number: i32,
+    offset: u64,
+    length: usize,
 }
 
 fn parse_export_file(value: &Value) -> Result<ExportFile, String> {
@@ -998,6 +1039,7 @@ fn string_field(value: &Value, name: &str) -> Result<String, String> {
 
 fn export_parquet(request_json: &str) -> Result<String, String> {
     let task = parse_export_task(request_json)?;
+    validate_export_task_options(&task)?;
     if !task.compression.eq_ignore_ascii_case("zstd") {
         return Err(format!("UNSUPPORTED_COMPRESSION: {}", task.compression));
     }
@@ -1017,10 +1059,13 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
     let mut obs_read_requests = 0u64;
     let mut obs_read_retries = 0u64;
     let mut obs_read_bytes = 0u64;
+    let mut obs_write_requests = 0u64;
+    let mut obs_write_bytes = 0u64;
     let mut decode_ms = 0u64;
     let mut filter_ms = 0u64;
     let mut encode_ms = 0u64;
     let mut obs_write_ms = 0u64;
+    let mut multipart_finish_ms = 0u64;
     let mut files_written = Vec::new();
     let mut next_output_ordinal = 0usize;
 
@@ -1067,8 +1112,11 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
                 &mut files_written,
                 &mut writer_rolls,
                 &mut peak_buffered_bytes,
+                &mut obs_write_requests,
+                &mut obs_write_bytes,
                 &mut encode_ms,
                 &mut obs_write_ms,
+                &mut multipart_finish_ms,
             )?;
         }
 
@@ -1077,8 +1125,11 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
                 writer,
                 &mut files_written,
                 &task.object_store_options,
+                &mut obs_write_requests,
+                &mut obs_write_bytes,
                 &mut encode_ms,
                 &mut obs_write_ms,
+                &mut multipart_finish_ms,
             )?;
         }
         if let Some(metrics) = export_reader.obs_metrics {
@@ -1103,16 +1154,51 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             "obs_read_requests": obs_read_requests,
             "obs_read_retries": obs_read_retries,
             "obs_read_bytes": obs_read_bytes,
-            "obs_write_requests": files_written.len(),
-            "obs_write_bytes": files_written.iter().map(|f| f.get("bytes").and_then(Value::as_u64).unwrap_or(0)).sum::<u64>(),
+            "obs_write_requests": obs_write_requests,
+            "obs_write_bytes": obs_write_bytes,
             "read_ms": 0,
             "decode_ms": decode_ms,
             "filter_ms": filter_ms,
             "encode_ms": encode_ms,
             "obs_write_ms": obs_write_ms,
-            "multipart_finish_ms": 0
+            "multipart_finish_ms": multipart_finish_ms
         }
-    }).to_string())
+    })
+    .to_string())
+}
+
+fn validate_export_task_options(task: &ExportTask) -> Result<(), String> {
+    if task.read_buffer_size_bytes == 0 {
+        return Err("INVALID_EXPORT_CONFIG: read_buffer_size_bytes must be positive".to_string());
+    }
+    if task.read_concurrency == 0 {
+        return Err("INVALID_EXPORT_CONFIG: read_concurrency must be positive".to_string());
+    }
+    if task.writer_batch_size == 0 {
+        return Err("INVALID_EXPORT_CONFIG: writer_batch_size must be positive".to_string());
+    }
+    if task.writer_row_group_size == 0 {
+        return Err("INVALID_EXPORT_CONFIG: writer_row_group_size must be positive".to_string());
+    }
+    if task.multipart_part_size_bytes == 0 {
+        return Err(
+            "INVALID_EXPORT_CONFIG: multipart_part_size_bytes must be positive".to_string(),
+        );
+    }
+    if task.multipart_part_size_bytes < MIN_MULTIPART_PART_SIZE_BYTES {
+        return Err(format!(
+            "INVALID_EXPORT_CONFIG: multipart_part_size_bytes must be at least {} bytes",
+            MIN_MULTIPART_PART_SIZE_BYTES
+        ));
+    }
+    if task.memory_limit_bytes == 0 {
+        return Err("INVALID_EXPORT_CONFIG: memory_limit_bytes must be positive".to_string());
+    }
+    if task.runtime_threads == 0 {
+        return Err("INVALID_EXPORT_CONFIG: runtime_threads must be positive".to_string());
+    }
+    let _metadata_cache_enabled = task.metadata_cache_enabled;
+    Ok(())
 }
 
 fn write_projected_export_batch(
@@ -1123,8 +1209,11 @@ fn write_projected_export_batch(
     files_written: &mut Vec<Value>,
     writer_rolls: &mut u64,
     peak_buffered_bytes: &mut u64,
+    obs_write_requests: &mut u64,
+    obs_write_bytes: &mut u64,
     encode_ms: &mut u64,
     obs_write_ms: &mut u64,
+    multipart_finish_ms: &mut u64,
 ) -> Result<(), String> {
     while batch.num_rows() > 0 {
         if writer.is_none() {
@@ -1145,8 +1234,11 @@ fn write_projected_export_batch(
                 finished,
                 files_written,
                 &task.object_store_options,
+                obs_write_requests,
+                obs_write_bytes,
                 encode_ms,
                 obs_write_ms,
+                multipart_finish_ms,
             )?;
             *writer_rolls += 1;
             continue;
@@ -1173,8 +1265,11 @@ fn write_projected_export_batch(
                         finished,
                         files_written,
                         &task.object_store_options,
+                        obs_write_requests,
+                        obs_write_bytes,
                         encode_ms,
                         obs_write_ms,
+                        multipart_finish_ms,
                     )?;
                     *writer_rolls += 1;
                 }
@@ -1219,6 +1314,7 @@ fn create_export_writer(
     Ok(ActiveExportWriter {
         output_path,
         local_output,
+        multipart_part_size_bytes: task.multipart_part_size_bytes,
         writer,
         rows: 0,
         buffered_bytes: 0,
@@ -1247,12 +1343,16 @@ fn finish_export_writer(
     writer: ActiveExportWriter,
     files_written: &mut Vec<Value>,
     object_store_options: &HashMap<String, String>,
+    obs_write_requests: &mut u64,
+    obs_write_bytes: &mut u64,
     encode_ms: &mut u64,
     obs_write_ms: &mut u64,
+    multipart_finish_ms: &mut u64,
 ) -> Result<(), String> {
     let ActiveExportWriter {
         output_path,
         local_output,
+        multipart_part_size_bytes,
         writer,
         rows,
         ..
@@ -1265,8 +1365,16 @@ fn finish_export_writer(
         .len();
     if output_path.starts_with("obs://") {
         let obs_start = std::time::Instant::now();
-        upload_local_file_to_obs(&local_output, &output_path, object_store_options)?;
+        let stats = upload_local_file_to_obs(
+            &local_output,
+            &output_path,
+            object_store_options,
+            multipart_part_size_bytes,
+        )?;
         *obs_write_ms += elapsed_ms(obs_start);
+        *obs_write_requests += stats.requests;
+        *obs_write_bytes += stats.bytes;
+        *multipart_finish_ms += stats.multipart_finish_ms;
         let _ = std::fs::remove_file(&local_output);
     }
     files_written.push(serde_json::json!({
@@ -1616,21 +1724,153 @@ fn upload_local_file_to_obs(
     local_path: &str,
     output_path: &str,
     options: &HashMap<String, String>,
-) -> Result<(), String> {
+    multipart_part_size_bytes: u64,
+) -> Result<UploadStats, String> {
     let (bucket, key) = parse_obs_prefix(output_path)?;
-    let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::metadata(local_path)
+        .map_err(|e| e.to_string())?
+        .len();
     let client = build_obs_client(options)?;
+    if bytes <= multipart_part_size_bytes {
+        let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
+        global_runtime()?.block_on(async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(body)
+                .content_type("application/octet-stream")
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .map(|_| UploadStats {
+                    requests: 1,
+                    bytes,
+                    multipart_finish_ms: 0,
+                })
+        })
+    } else {
+        upload_local_file_to_obs_multipart(
+            local_path,
+            &bucket,
+            &key,
+            client,
+            multipart_part_size_bytes,
+        )
+    }
+}
+
+fn multipart_part_ranges(
+    file_size: u64,
+    multipart_part_size_bytes: u64,
+) -> Result<Vec<MultipartPartRange>, String> {
+    if multipart_part_size_bytes == 0 {
+        return Err("multipart part size must be positive".to_string());
+    }
+    let mut ranges = Vec::new();
+    let mut offset = 0u64;
+    let mut part_number = 1i32;
+    while offset < file_size {
+        if part_number > 10000 {
+            return Err("multipart upload would exceed 10000 parts".to_string());
+        }
+        let remaining = file_size - offset;
+        let length = remaining.min(multipart_part_size_bytes);
+        ranges.push(MultipartPartRange {
+            part_number,
+            offset,
+            length: usize::try_from(length)
+                .map_err(|_| "multipart part size exceeds usize".to_string())?,
+        });
+        offset += length;
+        part_number += 1;
+    }
+    Ok(ranges)
+}
+
+fn read_local_file_range(file: &mut File, offset: u64, length: usize) -> Result<Vec<u8>, String> {
+    let mut body = vec![0u8; length];
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
+    file.read_exact(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+fn upload_local_file_to_obs_multipart(
+    local_path: &str,
+    bucket: &str,
+    key: &str,
+    client: Client,
+    multipart_part_size_bytes: u64,
+) -> Result<UploadStats, String> {
+    let ranges = multipart_part_ranges(
+        std::fs::metadata(local_path)
+            .map_err(|e| e.to_string())?
+            .len(),
+        multipart_part_size_bytes,
+    )?;
     global_runtime()?.block_on(async {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(&key)
-            .body(body)
+        let initiate = client
+            .initiate_multipart_upload()
+            .bucket(bucket)
+            .key(key)
             .content_type("application/octet-stream")
             .send()
             .await
-            .map_err(|e| e.to_string())
-            .map(|_| ())
+            .map_err(|e| e.to_string())?;
+        let upload_id = initiate.upload_id().to_string();
+        let mut stats = UploadStats {
+            requests: 1,
+            bytes: 0,
+            multipart_finish_ms: 0,
+        };
+
+        let upload_result = async {
+            let mut file = File::open(local_path).map_err(|e| e.to_string())?;
+            let mut completed_parts = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let body = read_local_file_range(&mut file, range.offset, range.length)?;
+                let part = client
+                    .upload_part()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(range.part_number)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                stats.requests += 1;
+                stats.bytes += range.length as u64;
+                completed_parts.push(CompletedPart::new(range.part_number, part.etag()));
+            }
+
+            let finish_start = std::time::Instant::now();
+            client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .parts(completed_parts)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            stats.requests += 1;
+            stats.multipart_finish_ms += elapsed_ms(finish_start);
+            Ok(stats)
+        }
+        .await;
+
+        if upload_result.is_err() {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
+        upload_result
     })
 }
 
@@ -1799,6 +2039,121 @@ mod tests {
     }
 
     #[test]
+    fn native_export_local_output_does_not_report_obs_write_metrics() {
+        let input = write_i64_parquet_columns(vec![("id", vec![1, 2, 3])]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-local-metrics-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 3,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 3,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+
+        let result: Value =
+            serde_json::from_str(&export_parquet(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(3));
+        assert_eq!(result["metrics"]["obs_write_requests"].as_u64(), Some(0));
+        assert_eq!(result["metrics"]["obs_write_bytes"].as_u64(), Some(0));
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn multipart_part_ranges_cover_file_in_order() {
+        assert_eq!(
+            multipart_part_ranges(10, 4).unwrap(),
+            vec![
+                MultipartPartRange {
+                    part_number: 1,
+                    offset: 0,
+                    length: 4
+                },
+                MultipartPartRange {
+                    part_number: 2,
+                    offset: 4,
+                    length: 4
+                },
+                MultipartPartRange {
+                    part_number: 3,
+                    offset: 8,
+                    length: 2
+                }
+            ]
+        );
+        assert!(multipart_part_ranges(0, 4).unwrap().is_empty());
+        assert!(multipart_part_ranges(10, 0).is_err());
+    }
+
+    #[test]
+    fn parse_export_task_preserves_native_tuning_options() {
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": "obs://bucket/out",
+            "compression": "zstd",
+            "target_file_size_bytes": 536870912u64,
+            "read_buffer_size_bytes": 16 * 1024 * 1024u64,
+            "read_concurrency": 8,
+            "writer_batch_size": 4096,
+            "writer_row_group_size": 131072,
+            "multipart_part_size_bytes": 32 * 1024 * 1024u64,
+            "memory_limit_bytes": 256 * 1024 * 1024u64,
+            "runtime_threads": 6,
+            "metadata_cache_enabled": false,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": []
+        });
+
+        let task = parse_export_task(&request.to_string()).unwrap();
+        assert_eq!(task.read_buffer_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(task.read_concurrency, 8);
+        assert_eq!(task.writer_batch_size, 4096);
+        assert_eq!(task.writer_row_group_size, 131072);
+        assert_eq!(task.multipart_part_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(task.memory_limit_bytes, 256 * 1024 * 1024);
+        assert_eq!(task.runtime_threads, 6);
+        assert!(!task.metadata_cache_enabled);
+    }
+
+    #[test]
+    fn native_export_rejects_invalid_multipart_part_size() {
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": "obs://bucket/out",
+            "compression": "zstd",
+            "multipart_part_size_bytes": 1,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": []
+        });
+
+        let error = export_parquet(&request.to_string()).unwrap_err();
+        assert!(error.contains("multipart_part_size_bytes must be at least"));
+    }
+
+    #[test]
     fn native_export_rolls_output_files_by_target_size() {
         let input = write_i64_parquet_columns(vec![("id", (0..20).collect())]);
         let mut output_dir = std::env::temp_dir();
@@ -1850,9 +2205,14 @@ mod tests {
             output_path: "/tmp/out".to_string(),
             compression: "zstd".to_string(),
             target_file_size_bytes: u64::MAX,
+            read_buffer_size_bytes: 8 * 1024 * 1024,
+            read_concurrency: 4,
             writer_batch_size: 1024,
             writer_row_group_size: 1024,
+            multipart_part_size_bytes: 64 * 1024 * 1024,
             memory_limit_bytes: 1024 * 1024,
+            runtime_threads: DEFAULT_RUNTIME_THREADS,
+            metadata_cache_enabled: true,
             projection: vec!["id".to_string(), "dt".to_string()],
             predicate_format: "paimon-json-v1".to_string(),
             predicate: serde_json::json!({
