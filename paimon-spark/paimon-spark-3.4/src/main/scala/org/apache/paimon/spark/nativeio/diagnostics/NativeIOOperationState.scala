@@ -59,4 +59,26 @@ case class NativeIOOperationState(
   }
 
   def elapsedMs(now: Long): Long = math.max(0L, now - startTime)
+
+  def stuckElapsedMs(now: Long): Long = {
+    if (currentPhase.isDefined) {
+      phaseElapsedMs(now)
+    } else {
+      elapsedMs(now)
+    }
+  }
+
+  def phaseOrStatus: String = {
+    currentPhase.map(_.name()).getOrElse("NO_NATIVE_PHASE")
+  }
+
+  def diagnosis: String = {
+    if (currentPhase.isDefined) {
+      "Native phase is active and has not completed."
+    } else if (operationName == "spark-task") {
+      "Spark task is active, but no native phase event has been received yet."
+    } else {
+      "Native operation is active, but no phase event has been received yet."
+    }
+  }
 }

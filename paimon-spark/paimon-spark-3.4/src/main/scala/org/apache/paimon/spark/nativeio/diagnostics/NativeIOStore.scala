@@ -59,7 +59,7 @@ class NativeIOStore(maxEvents: Int, stuckThresholdMs: Long) {
 
   def stuckOperations(now: Long): Seq[NativeIOOperationState] = synchronized {
     activeOperations(now)
-      .filter(state => state.currentPhase.isDefined && state.phaseElapsedMs(now) >= stuckThresholdMs)
+      .filter(state => state.stuckElapsedMs(now) >= stuckThresholdMs)
   }
 
   def completedOperations: Seq[NativeIOOperationState] = synchronized {

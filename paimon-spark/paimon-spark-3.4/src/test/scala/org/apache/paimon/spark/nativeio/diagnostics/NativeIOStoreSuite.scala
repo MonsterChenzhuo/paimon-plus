@@ -90,11 +90,32 @@ class NativeIOStoreSuite extends FunSuite {
     assert(store.timeline.map(_.eventTime()) == Seq(2000L, 3000L))
   }
 
+  test("marks active spark task without native phase as stuck") {
+    val store = new NativeIOStore(maxEvents = 16, stuckThresholdMs = 30000L)
+
+    store.record(
+      event("task-1", 1000L, NativeIOEventType.TASK_RECEIVED, "spark-task")
+        .withStageId(2)
+        .withTaskAttemptId(9L)
+        .withExecutorId("3")
+        .build())
+
+    val active = store.activeOperations(32000L)
+    assert(active.size == 1)
+    assert(active.head.phaseOrStatus == "NO_NATIVE_PHASE")
+    assert(active.head.stuckElapsedMs(32000L) == 31000L)
+    assert(active.head.diagnosis.contains("no native phase event"))
+
+    val stuck = store.stuckOperations(32000L)
+    assert(stuck.map(_.operationId) == Seq("task-1"))
+  }
+
   private def event(
       operationId: String,
       eventTime: Long,
-      eventType: NativeIOEventType): NativeIOEvent.Builder = {
+      eventType: NativeIOEventType,
+      operationName: String = "native-export-parquet"): NativeIOEvent.Builder = {
     NativeIOEvent
-      .builder(operationId + "-" + eventTime, eventTime, eventType, operationId, "native-export-parquet")
+      .builder(operationId + "-" + eventTime, eventTime, eventType, operationId, operationName)
   }
 }

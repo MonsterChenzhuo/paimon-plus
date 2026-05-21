@@ -111,9 +111,9 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
           <tr>
             <th>{title}</th>
             <th>Active</th>
-            <th>Max Phase Elapsed</th>
+            <th>Max Elapsed</th>
             <th>Executors</th>
-            <th>Current Phases</th>
+            <th>Current Phase / Status</th>
           </tr>
         </thead>
         <tbody>
@@ -122,9 +122,9 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
               <tr>
                 <td>{key}</td>
                 <td>{states.size}</td>
-                <td>{formatDuration(states.map(_.phaseElapsedMs(now)).foldLeft(0L)(math.max))}</td>
+                <td>{formatDuration(states.map(_.stuckElapsedMs(now)).foldLeft(0L)(math.max))}</td>
                 <td>{states.flatMap(_.executorId).distinct.sorted.mkString(", ")}</td>
-                <td>{states.flatMap(_.currentPhase).distinct.map(_.name()).sorted.mkString(", ")}</td>
+                <td>{states.map(_.phaseOrStatus).distinct.sorted.mkString(", ")}</td>
               </tr>
           }}
         </tbody>
@@ -146,8 +146,10 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
             <th>Stage</th>
             <th>Task</th>
             <th>Executor</th>
-            <th>Phase</th>
-            <th>Phase Elapsed</th>
+            <th>Phase / Status</th>
+            <th>Elapsed</th>
+            <th>Last Event Age</th>
+            <th>Diagnosis</th>
             <th>File</th>
             <th>Object Request</th>
             <th>Rows</th>
@@ -157,7 +159,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
         </thead>
         <tbody>
           {if (operations.isEmpty) {
-            <tr><td colspan="12">No data</td></tr>
+            <tr><td colspan="14">No data</td></tr>
           } else {
             operations.map(operationRow(_, now))
           }}
@@ -173,8 +175,10 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       <td>{stageName(state)}</td>
       <td>{taskName(state)}</td>
       <td>{state.executorId.getOrElse("-")}<br/><small>{state.host.getOrElse("-")}</small></td>
-      <td>{state.currentPhase.map(_.name()).getOrElse("-")}</td>
-      <td>{formatDuration(state.phaseElapsedMs(now))}</td>
+      <td>{state.phaseOrStatus}</td>
+      <td>{formatDuration(state.stuckElapsedMs(now))}</td>
+      <td>{formatDuration(math.max(0L, now - state.lastEventTime))}</td>
+      <td>{state.diagnosis}</td>
       <td>{state.filePath.getOrElse(state.outputPath.getOrElse("-"))}</td>
       <td>{state.objectOperation.getOrElse("-")}<br/><small>{state.objectRequestId.getOrElse("-")}</small></td>
       <td>{state.rows.map(_.toString).getOrElse("-")}</td>
