@@ -154,6 +154,10 @@ public final class NativeExportOptions {
                 || memoryLimitBytes > MAX_MEMORY_LIMIT_BYTES) {
             return invalid("native-io.export.memory-limit must be between 64 MB and 16 GB");
         }
+        if (memoryLimitBytes < multipartPartSizeBytes) {
+            return invalid(
+                    "native-io.export.memory-limit must be greater than or equal to native-io.export.writer.multipart-part-size");
+        }
         int runtimeThreads = runtimeThreads();
         if (runtimeThreads < MIN_RUNTIME_THREADS || runtimeThreads > MAX_RUNTIME_THREADS) {
             return invalid("native-io.export.runtime-threads must be between 1 and 64");

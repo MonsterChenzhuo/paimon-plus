@@ -27,6 +27,8 @@ import org.apache.paimon.operation.nativeio.export.NativeExportPreflightResult;
 import org.apache.paimon.operation.nativeio.export.NativeExportSourceFile;
 import org.apache.paimon.options.Options;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -58,10 +60,12 @@ public final class NativeExportPlanner {
                     NativeRejectReason.EXPORT_UNSUPPORTED_COMPRESSION,
                     "native export currently supports zstd compression only");
         }
-        if (!context.outputPath().toLowerCase(Locale.ROOT).startsWith("obs://")) {
+        String outputPathError = obsPathError(context.outputPath());
+        if (outputPathError != null) {
             return NativeExportPreflightResult.rejected(
                     NativeRejectReason.NON_OBS_PATH,
-                    "native export requires an obs:// output path");
+                    "native export requires an obs:// output path without query or fragment: "
+                            + outputPathError);
         }
         if (!nativeIOOptions.hasRequiredObsConfig()) {
             return NativeExportPreflightResult.rejected(
@@ -78,11 +82,20 @@ public final class NativeExportPlanner {
                         NativeRejectReason.NON_PARQUET_FILE,
                         "native export only supports parquet data files: " + file.path());
             }
-            if (!file.path().toLowerCase(Locale.ROOT).startsWith("obs://")
-                    && !file.path().toLowerCase(Locale.ROOT).startsWith("file:")) {
+            String path = file.path();
+            String lowerPath = path.toLowerCase(Locale.ROOT);
+            if (lowerPath.startsWith("obs://")) {
+                String sourcePathError = obsPathError(path);
+                if (sourcePathError != null) {
+                    return NativeExportPreflightResult.rejected(
+                            NativeRejectReason.NON_OBS_PATH,
+                            "native export requires obs:// data files without query or fragment: "
+                                    + sourcePathError);
+                }
+            } else if (!lowerPath.startsWith("file:")) {
                 return NativeExportPreflightResult.rejected(
                         NativeRejectReason.NON_OBS_PATH,
-                        "native export requires obs:// data files: " + file.path());
+                        "native export requires obs:// data files: " + path);
             }
         }
         NativeApplicability predicate = NativeExportPredicateJson.validate(context.predicate());
@@ -140,5 +153,24 @@ public final class NativeExportPlanner {
             payloads.add(NativeExportJson.taskToPayload(task));
         }
         return new NativeExportPlanDescriptor(payloads);
+    }
+
+    private static String obsPathError(String path) {
+        URI uri;
+        try {
+            uri = new URI(path);
+        } catch (URISyntaxException e) {
+            return "invalid URI " + path + ": " + e.getMessage();
+        }
+        if (!"obs".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
+            return "not an obs:// path: " + path;
+        }
+        if (uri.getQuery() != null) {
+            return "query is not supported in OBS path: " + path;
+        }
+        if (uri.getFragment() != null) {
+            return "fragment is not supported in OBS path: " + path;
+        }
+        return null;
     }
 }

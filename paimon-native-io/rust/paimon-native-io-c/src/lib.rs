@@ -1001,6 +1001,12 @@ fn parse_obs_prefix(path: &str) -> Result<(String, String), String> {
             url.scheme()
         ));
     }
+    if url.query().is_some() {
+        return Err("OBS prefix must not contain query parameters".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("OBS prefix must not contain fragment".to_string());
+    }
     let bucket = url
         .host_str()
         .ok_or_else(|| "OBS path missing bucket".to_string())?;
@@ -1297,12 +1303,11 @@ impl ObsMultipartWriter {
             .map_err(|_| "multipart part size exceeds usize".to_string())?;
         let (bucket, key) = parse_obs_prefix(output_path)?;
         let runtime_threads = runtime_threads.max(1);
-        let memory_part_cap_u64 = memory_limit_bytes
-            .checked_div(multipart_part_size_bytes.max(1))
-            .unwrap_or(0)
-            .max(1);
-        let memory_part_cap = usize::try_from(memory_part_cap_u64).unwrap_or(usize::MAX);
-        let max_inflight_parts = runtime_threads.min(memory_part_cap).max(1);
+        let max_inflight_parts = multipart_max_inflight_parts(
+            runtime_threads,
+            memory_limit_bytes,
+            multipart_part_size_bytes,
+        );
         export_log(format!(
             "multipart_writer_config output_path={} part_size={} max_inflight_parts={} memory_limit_bytes={}",
             output_path, multipart_part_size_bytes, max_inflight_parts, memory_limit_bytes
@@ -1581,6 +1586,20 @@ impl ObsMultipartWriter {
     fn write_ms(&self) -> u64 {
         self.stats.write_ms
     }
+}
+
+fn multipart_max_inflight_parts(
+    runtime_threads: usize,
+    memory_limit_bytes: u64,
+    multipart_part_size_bytes: u64,
+) -> usize {
+    let runtime_threads = runtime_threads.max(1);
+    let memory_part_cap_u64 = memory_limit_bytes
+        .checked_div(multipart_part_size_bytes.max(1))
+        .unwrap_or(0)
+        .max(1);
+    let memory_part_cap = usize::try_from(memory_part_cap_u64).unwrap_or(usize::MAX);
+    runtime_threads.min(memory_part_cap).max(1)
 }
 
 impl Write for ObsMultipartWriter {
@@ -1967,6 +1986,16 @@ fn validate_export_task_options(task: &ExportTask) -> Result<(), String> {
     }
     if task.memory_limit_bytes == 0 {
         return Err("INVALID_EXPORT_CONFIG: memory_limit_bytes must be positive".to_string());
+    }
+    if task.memory_limit_bytes < task.multipart_part_size_bytes {
+        return Err(
+            "INVALID_EXPORT_CONFIG: memory_limit_bytes must be greater than or equal to multipart_part_size_bytes"
+                .to_string(),
+        );
+    }
+    if task.output_path.to_lowercase().starts_with("obs://") {
+        parse_obs_prefix(&task.output_path)
+            .map_err(|e| format!("INVALID_EXPORT_CONFIG: invalid output_path: {}", e))?;
     }
     if task.runtime_threads == 0 {
         return Err("INVALID_EXPORT_CONFIG: runtime_threads must be positive".to_string());
@@ -2883,6 +2912,70 @@ mod tests {
     }
 
     #[test]
+    fn native_export_rejects_memory_limit_smaller_than_multipart_part_size() {
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": "obs://bucket/out",
+            "compression": "zstd",
+            "multipart_part_size_bytes": 128 * 1024 * 1024u64,
+            "memory_limit_bytes": 64 * 1024 * 1024u64,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": []
+        });
+
+        let error = export_parquet(&request.to_string()).unwrap_err();
+        assert!(error.contains("memory_limit_bytes"));
+        assert!(error.contains("multipart_part_size_bytes"));
+    }
+
+    #[test]
+    fn native_export_rejects_obs_output_path_with_query_or_fragment() {
+        let base_request = serde_json::json!({
+            "request_version": 1,
+            "output_path": "obs://bucket/out",
+            "compression": "zstd",
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": []
+        });
+
+        let mut query_request = base_request.clone();
+        query_request["output_path"] = serde_json::json!("obs://bucket/out?version=1");
+        let query_error = export_parquet(&query_request.to_string()).unwrap_err();
+        assert!(query_error.contains("query"));
+
+        let mut fragment_request = base_request;
+        fragment_request["output_path"] = serde_json::json!("obs://bucket/out#fragment");
+        let fragment_error = export_parquet(&fragment_request.to_string()).unwrap_err();
+        assert!(fragment_error.contains("fragment"));
+    }
+
+    #[test]
+    fn multipart_inflight_part_cap_respects_runtime_threads_and_memory_limit() {
+        assert_eq!(
+            multipart_max_inflight_parts(8, 128 * 1024 * 1024, 64 * 1024 * 1024),
+            2
+        );
+        assert_eq!(
+            multipart_max_inflight_parts(2, 512 * 1024 * 1024, 64 * 1024 * 1024),
+            2
+        );
+        assert_eq!(
+            multipart_max_inflight_parts(8, 32 * 1024 * 1024, 64 * 1024 * 1024),
+            1
+        );
+        assert_eq!(
+            multipart_max_inflight_parts(0, 128 * 1024 * 1024, 64 * 1024 * 1024),
+            1
+        );
+    }
+
+    #[test]
     fn buffered_range_reads_reuse_cached_obs_ranges() {
         let data = Bytes::from((0..200u8).collect::<Vec<_>>());
         let mut cache = None;
@@ -2985,7 +3078,7 @@ mod tests {
             "target_file_size_bytes": 64,
             "writer_batch_size": 20,
             "writer_row_group_size": 4,
-            "memory_limit_bytes": 1024,
+            "memory_limit_bytes": 64 * 1024 * 1024u64,
             "projection": ["id"],
             "predicate_format": "paimon-json-v1",
             "predicate_json": serde_json::json!({"op":"true"}).to_string(),
@@ -3036,7 +3129,7 @@ mod tests {
             "target_file_size_bytes": 8192,
             "writer_batch_size": 2000,
             "writer_row_group_size": 2000,
-            "memory_limit_bytes": 1024 * 1024,
+            "memory_limit_bytes": 64 * 1024 * 1024u64,
             "projection": ["payload"],
             "predicate_format": "paimon-json-v1",
             "predicate_json": serde_json::json!({"op":"true"}).to_string(),
@@ -3212,6 +3305,15 @@ mod tests {
         let (bucket, prefix) = parse_obs_prefix("obs://bucket-a/").unwrap();
         assert_eq!(bucket, "bucket-a");
         assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn rejects_obs_prefix_with_query_or_fragment() {
+        let query_error = super::parse_obs_prefix("obs://bucket-a/export?version=1").unwrap_err();
+        assert!(query_error.contains("query"));
+
+        let fragment_error = super::parse_obs_prefix("obs://bucket-a/export#fragment").unwrap_err();
+        assert!(fragment_error.contains("fragment"));
     }
 
     #[test]

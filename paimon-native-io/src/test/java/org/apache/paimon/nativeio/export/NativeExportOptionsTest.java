@@ -96,4 +96,17 @@ class NativeExportOptionsTest {
         assertThat(NativeExportOptions.from(raw).valid().detail())
                 .contains("native-io.export.obs.connect-timeout");
     }
+
+    @Test
+    void rejectsMultipartPartSizeLargerThanMemoryLimit() {
+        Options raw = new Options();
+        raw.setString("native-io.export.enabled", "true");
+        raw.setString("native-io.export.writer.multipart-part-size", "128 mb");
+        raw.setString("native-io.export.memory-limit", "64 mb");
+
+        assertThat(NativeExportOptions.from(raw).valid().applicable()).isFalse();
+        assertThat(NativeExportOptions.from(raw).valid().detail())
+                .contains("memory-limit")
+                .contains("multipart-part-size");
+    }
 }
