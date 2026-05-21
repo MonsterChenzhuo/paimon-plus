@@ -42,6 +42,7 @@ import org.apache.paimon.spark.procedure.FastForwardProcedure;
 import org.apache.paimon.spark.procedure.MarkPartitionDoneProcedure;
 import org.apache.paimon.spark.procedure.MigrateDatabaseProcedure;
 import org.apache.paimon.spark.procedure.MigrateTableProcedure;
+import org.apache.paimon.spark.procedure.NativeIOBenchmarkProcedure;
 import org.apache.paimon.spark.procedure.Procedure;
 import org.apache.paimon.spark.procedure.ProcedureBuilder;
 import org.apache.paimon.spark.procedure.PurgeFilesProcedure;
@@ -125,6 +126,7 @@ public class SparkProcedures {
         procedureBuilders.put("rewrite_file_index", RewriteFileIndexProcedure::builder);
         procedureBuilders.put("export_parquet", ExportParquetProcedure::builder);
         procedureBuilders.put("copy", CopyFilesProcedure::builder);
+        procedureBuilders.put("native_io_benchmark", NativeIOBenchmarkProcedure::builder);
         return procedureBuilders.build();
     }
 }
