@@ -22,6 +22,7 @@ package org.apache.spark.ui
 import org.apache.paimon.spark.nativeio.diagnostics.NativeIOStore
 
 class NativeIOTab(parent: SparkUI, store: NativeIOStore) extends SparkUITab(parent, "native-io") {
+  attachPage(new NativeIOPage(this, store, "", "Summary"))
   attachPage(new NativeIOPage(this, store, "summary", "Summary"))
   attachPage(new NativeIOPage(this, store, "sql", "Per SQL"))
   attachPage(new NativeIOPage(this, store, "stage", "Per Stage"))
