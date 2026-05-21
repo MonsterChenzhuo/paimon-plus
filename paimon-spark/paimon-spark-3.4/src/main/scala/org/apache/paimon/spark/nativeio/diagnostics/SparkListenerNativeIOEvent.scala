@@ -17,17 +17,9 @@
  * under the License.
  */
 
-package org.apache.spark
+package org.apache.spark.scheduler
 
-import org.apache.paimon.spark.nativeio.diagnostics.{NativeIOEventEnvelope, NativeIOStore}
-import org.apache.spark.rpc.{RpcEnv, ThreadSafeRpcEndpoint}
+import org.apache.spark.annotation.DeveloperApi
 
-class NativeIOEndpoint(override val rpcEnv: RpcEnv, store: NativeIOStore)
-    extends ThreadSafeRpcEndpoint {
-
-  override def receive: PartialFunction[Any, Unit] = {
-    case NativeIOEventEnvelope(event) =>
-      store.record(event)
-      NativeIORpcSupport.postToEventLog(event)
-  }
-}
+@DeveloperApi
+case class SparkListenerNativeIOEvent(eventJson: String) extends SparkListenerEvent

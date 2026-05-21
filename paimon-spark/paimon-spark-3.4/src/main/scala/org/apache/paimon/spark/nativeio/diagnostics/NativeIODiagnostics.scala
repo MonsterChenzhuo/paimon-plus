@@ -50,7 +50,9 @@ object NativeIODiagnostics {
   def record(event: NativeIOEvent): Unit = {
     val enriched = enrichFromSparkTask(event)
     installedStore match {
-      case Some(store) => store.record(enriched)
+      case Some(store) =>
+        store.record(enriched)
+        NativeIORpcSupport.postToEventLog(enriched)
       case None => sendToDriver(enriched)
     }
   }

@@ -19,10 +19,10 @@
 
 package org.apache.spark
 
-import org.apache.paimon.operation.nativeio.diagnostics.NativeIOEvent
+import org.apache.paimon.operation.nativeio.diagnostics.{NativeIOEvent, NativeIOEventJson}
 import org.apache.paimon.spark.nativeio.diagnostics.{NativeIOEventEnvelope, NativeIOStore}
 import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef}
-import org.apache.spark.scheduler.NativeIOLifecycleListener
+import org.apache.spark.scheduler.{NativeIOLifecycleListener, SparkListenerNativeIOEvent}
 
 object NativeIORpcSupport {
 
@@ -30,8 +30,10 @@ object NativeIORpcSupport {
 
   @volatile private var driverEndpointRef: Option[RpcEndpointRef] = None
   @volatile private var listenerInstalled = false
+  @volatile private var driverSparkContext: Option[SparkContext] = None
 
   def setupDriver(sparkContext: SparkContext, store: NativeIOStore): Unit = synchronized {
+    driverSparkContext = Some(sparkContext)
     val env = SparkEnv.get
     if (env != null && driverEndpointRef.isEmpty) {
       driverEndpointRef = Some(env.rpcEnv.setupEndpoint(EndpointName, new NativeIOEndpoint(env.rpcEnv, store)))
@@ -77,6 +79,16 @@ object NativeIORpcSupport {
             driverEndpointRef
           }
         }
+      }
+    }
+
+  def postToEventLog(event: NativeIOEvent): Unit = {
+    try {
+      driverSparkContext.foreach { sc =>
+        sc.listenerBus.post(SparkListenerNativeIOEvent(NativeIOEventJson.toJson(event)))
+      }
+    } catch {
+      case _: Throwable =>
     }
   }
 }

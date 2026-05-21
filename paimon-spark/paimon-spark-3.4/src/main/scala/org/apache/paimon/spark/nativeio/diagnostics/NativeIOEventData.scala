@@ -17,17 +17,16 @@
  * under the License.
  */
 
-package org.apache.spark
+package org.apache.spark.status
 
-import org.apache.paimon.spark.nativeio.diagnostics.{NativeIOEventEnvelope, NativeIOStore}
-import org.apache.spark.rpc.{RpcEnv, ThreadSafeRpcEndpoint}
+import org.apache.spark.status.KVUtils.KVIndexParam
+import org.apache.spark.util.kvstore.KVIndex
 
-class NativeIOEndpoint(override val rpcEnv: RpcEnv, store: NativeIOStore)
-    extends ThreadSafeRpcEndpoint {
+class NativeIOEventData(
+    @KVIndexParam val eventId: String,
+    val eventTime: Long,
+    val eventJson: String) {
 
-  override def receive: PartialFunction[Any, Unit] = {
-    case NativeIOEventEnvelope(event) =>
-      store.record(event)
-      NativeIORpcSupport.postToEventLog(event)
-  }
+  @KVIndex("eventTime")
+  private def eventTimeIndex: Long = eventTime
 }
