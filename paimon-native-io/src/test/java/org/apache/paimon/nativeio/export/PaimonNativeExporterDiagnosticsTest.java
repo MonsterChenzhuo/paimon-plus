@@ -26,7 +26,6 @@ import org.apache.paimon.operation.nativeio.diagnostics.NativeIOEventType;
 import jnr.ffi.Pointer;
 import jnr.ffi.Runtime;
 import jnr.ffi.byref.PointerByReference;
-
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -41,7 +40,8 @@ class PaimonNativeExporterDiagnosticsTest {
     @Test
     void forwardsNativeDiagnosticCallbackEvents() {
         List<NativeIOEvent> events = new ArrayList<>();
-        PaimonNativeExporter exporter = new PaimonNativeExporter(new CallbackLibrary(), events::add);
+        PaimonNativeExporter exporter =
+                new PaimonNativeExporter(new CallbackLibrary(), events::add);
 
         assertThatThrownBy(() -> exporter.exportParquet(sampleTask()))
                 .isInstanceOf(java.io.IOException.class)

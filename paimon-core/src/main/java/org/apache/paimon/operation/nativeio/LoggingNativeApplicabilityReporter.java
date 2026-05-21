@@ -52,7 +52,7 @@ public final class LoggingNativeApplicabilityReporter implements NativeApplicabi
         }
 
         if (applicability.applicable()) {
-            LOG.info("Paimon native IO is enabled for eligible raw Parquet splits.");
+            LOG.info("Paimon native IO is enabled for eligible Parquet reads.");
         } else if (options.enabled()) {
             LOG.info(
                     "Paimon native IO falls back to Java reader. reason={}, detail={}",

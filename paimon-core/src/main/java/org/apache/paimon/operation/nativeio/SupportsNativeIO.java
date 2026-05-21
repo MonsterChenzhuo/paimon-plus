@@ -86,6 +86,46 @@ public final class SupportsNativeIO {
             boolean rowTrackingEnabled,
             NativeIOOptions options,
             Path actualDataPath) {
+        NativeApplicability physicalFileApplicability =
+                checkNativePhysicalFile(
+                        file,
+                        readType,
+                        rowTrackingEnabled,
+                        hasFilterTopNLimitPushDown(mapping),
+                        options,
+                        actualDataPath);
+        if (!physicalFileApplicability.applicable()) {
+            return physicalFileApplicability;
+        }
+        if (mapping != null
+                && (mapping.getPartitionPair() != null || !mapping.getSystemFields().isEmpty())) {
+            return NativeApplicability.rejected(
+                    NativeRejectReason.PARTITION_OR_SYSTEM_FIELDS,
+                    "native IO does not support partition, system, or row tracking fields yet");
+        }
+        if (mapping != null) {
+            if (!mapping.hasIdentityIndexMapping() || !mapping.hasNoCastMapping()) {
+                return NativeApplicability.rejected(
+                        NativeRejectReason.SCHEMA_CAST_OR_REORDER,
+                        "native IO does not support schema cast or field reordering yet");
+            }
+            RowType actualReadRowType = mapping.getActualReadRowType();
+            if (actualReadRowType != null && !Objects.equals(actualReadRowType, readType)) {
+                return NativeApplicability.rejected(
+                        NativeRejectReason.READ_TYPE_MISMATCH,
+                        "native IO physical read type differs from requested read type");
+            }
+        }
+        return NativeApplicability.yes();
+    }
+
+    public static NativeApplicability checkNativePhysicalFile(
+            DataFileMeta file,
+            RowType readType,
+            boolean rowTrackingEnabled,
+            boolean hasFilterTopNLimitPushDown,
+            NativeIOOptions options,
+            Path actualDataPath) {
         if (!"parquet".equalsIgnoreCase(file.fileFormat())) {
             return NativeApplicability.rejected(
                     NativeRejectReason.NON_PARQUET_FILE,
@@ -112,35 +152,24 @@ public final class SupportsNativeIO {
                     NativeRejectReason.UNSUPPORTED_TYPE,
                     "native IO does not support at least one requested field type");
         }
-        if (rowTrackingEnabled
-                || (mapping != null
-                        && (mapping.getPartitionPair() != null
-                                || !mapping.getSystemFields().isEmpty()))) {
+        if (rowTrackingEnabled) {
             return NativeApplicability.rejected(
                     NativeRejectReason.PARTITION_OR_SYSTEM_FIELDS,
                     "native IO does not support partition, system, or row tracking fields yet");
         }
-        if (mapping != null) {
-            if (!mapping.hasIdentityIndexMapping() || !mapping.hasNoCastMapping()) {
-                return NativeApplicability.rejected(
-                        NativeRejectReason.SCHEMA_CAST_OR_REORDER,
-                        "native IO does not support schema cast or field reordering yet");
-            }
-            RowType actualReadRowType = mapping.getActualReadRowType();
-            if (actualReadRowType != null && !Objects.equals(actualReadRowType, readType)) {
-                return NativeApplicability.rejected(
-                        NativeRejectReason.READ_TYPE_MISMATCH,
-                        "native IO physical read type differs from requested read type");
-            }
-            if (mapping.getDataFilters() != null && !mapping.getDataFilters().isEmpty()
-                    || mapping.getTopN() != null
-                    || mapping.getLimit() != null) {
-                return NativeApplicability.rejected(
-                        NativeRejectReason.DATA_FILTER_TOPN_LIMIT,
-                        "native IO does not support filter, topN, or limit pushdown yet");
-            }
+        if (hasFilterTopNLimitPushDown) {
+            return NativeApplicability.rejected(
+                    NativeRejectReason.DATA_FILTER_TOPN_LIMIT,
+                    "native IO does not support filter, topN, or limit pushdown yet");
         }
         return NativeApplicability.yes();
+    }
+
+    private static boolean hasFilterTopNLimitPushDown(@Nullable FormatReaderMapping mapping) {
+        return mapping != null
+                && (mapping.getDataFilters() != null && !mapping.getDataFilters().isEmpty()
+                        || mapping.getTopN() != null
+                        || mapping.getLimit() != null);
     }
 
     private static boolean hasQueryOrFragment(URI uri) {

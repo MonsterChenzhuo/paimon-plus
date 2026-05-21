@@ -109,7 +109,7 @@ class NativeRawFileSplitReadProviderTest {
     }
 
     @Test
-    void rejectsNonDeletionVectorTableBeforeMatchingSplits() {
+    void allowsNonDeletionVectorTablesForRawConvertibleSplits() {
         Options options = new Options();
         options.setString(CoreOptions.NATIVE_IO_ENABLED.key(), "true");
         options.setString(CoreOptions.NATIVE_IO_INTERNAL_ENGINE.key(), "spark");
@@ -130,8 +130,7 @@ class NativeRawFileSplitReadProviderTest {
         NativeApplicability applicability =
                 new NativeRawFileSplitRead(context).currentReadConfigApplicability();
 
-        assertThat(applicability.applicable()).isFalse();
-        assertThat(applicability.reason()).isEqualTo(NativeRejectReason.NOT_DV_TABLE);
+        assertThat(applicability.applicable()).isTrue();
     }
 
     @Test

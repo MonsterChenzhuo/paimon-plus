@@ -141,7 +141,12 @@ public final class NativeIOEvent implements Serializable {
 
     public static Builder builder(
             NativeIOEventType eventType, String operationId, String operationName) {
-        return builder(UUID.randomUUID().toString(), System.currentTimeMillis(), eventType, operationId, operationName);
+        return builder(
+                UUID.randomUUID().toString(),
+                System.currentTimeMillis(),
+                eventType,
+                operationId,
+                operationName);
     }
 
     public Builder toBuilder() {

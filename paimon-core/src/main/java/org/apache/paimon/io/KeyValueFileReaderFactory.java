@@ -27,9 +27,15 @@ import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.format.FormatKey;
 import org.apache.paimon.format.FormatReaderContext;
+import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.OrcFormatReaderContext;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.operation.nativeio.LoggingNativeApplicabilityReporter;
+import org.apache.paimon.operation.nativeio.NativeApplicabilityReporter;
+import org.apache.paimon.operation.nativeio.NativeFormatReaderContext;
+import org.apache.paimon.operation.nativeio.NativeFormatReaderFactoryProviderLoader;
+import org.apache.paimon.operation.nativeio.NativeIOOptions;
 import org.apache.paimon.partition.PartitionUtils;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.FileRecordReader;
@@ -71,6 +77,9 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
     private final Map<FormatKey, FormatReaderMapping> formatReaderMappings;
     private final BinaryRow partition;
     private final DeletionVector.Factory dvFactory;
+    private final CoreOptions coreOptions;
+    private final NativeIOOptions nativeIOOptions;
+    private final NativeApplicabilityReporter nativeApplicabilityReporter;
 
     protected KeyValueFileReaderFactory(
             FileIO fileIO,
@@ -96,6 +105,10 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
         this.partition = partition;
         this.formatReaderMappings = new HashMap<>();
         this.dvFactory = dvFactory;
+        this.coreOptions = coreOptions;
+        this.nativeIOOptions = NativeIOOptions.from(coreOptions.toConfiguration());
+        this.nativeApplicabilityReporter =
+                LoggingNativeApplicabilityReporter.create(nativeIOOptions);
     }
 
     public TableSchema schema() {
@@ -143,10 +156,13 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
         Path filePath = pathFactory.toPath(file);
 
         long fileSize = file.fileSize();
+        FormatReaderFactory readerFactory =
+                nativeReaderFactory(file, formatReaderMapping, filePath)
+                        .orElse(formatReaderMapping.getReaderFactory());
         FileRecordReader<InternalRow> fileRecordReader =
                 new DataFileRecordReader(
                         schema.logicalRowType(),
-                        formatReaderMapping.getReaderFactory(),
+                        readerFactory,
                         orcPoolSize == null
                                 ? new FormatReaderContext(fileIO, filePath, fileSize)
                                 : new OrcFormatReaderContext(
@@ -169,6 +185,29 @@ public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
         }
 
         return new KeyValueDataFileRecordReader(fileRecordReader, keyType, valueType, file.level());
+    }
+
+    private Optional<FormatReaderFactory> nativeReaderFactory(
+            DataFileMeta file, FormatReaderMapping formatReaderMapping, Path filePath) {
+        RowType actualReadRowType = formatReaderMapping.getActualReadRowType();
+        if (actualReadRowType == null) {
+            return Optional.empty();
+        }
+        return NativeFormatReaderFactoryProviderLoader.tryCreate(
+                new NativeFormatReaderContext(
+                        file,
+                        actualReadRowType,
+                        coreOptions.rowTrackingEnabled(),
+                        hasFilterTopNLimitPushDown(formatReaderMapping),
+                        nativeIOOptions,
+                        filePath,
+                        nativeApplicabilityReporter));
+    }
+
+    private static boolean hasFilterTopNLimitPushDown(FormatReaderMapping mapping) {
+        return mapping.getDataFilters() != null && !mapping.getDataFilters().isEmpty()
+                || mapping.getTopN() != null
+                || mapping.getLimit() != null;
     }
 
     public static Builder builder(

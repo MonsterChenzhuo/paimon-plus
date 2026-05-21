@@ -136,11 +136,6 @@ public class NativeRawFileSplitRead implements SplitRead<InternalRow> {
     }
 
     NativeApplicability currentReadConfigApplicability() {
-        if (!context.coreOptions().deletionVectorsEnabled()) {
-            return NativeApplicability.rejected(
-                    NativeRejectReason.NOT_DV_TABLE,
-                    "native IO PoC only supports deletion-vector primary-key tables");
-        }
         if (forceKeepDelete) {
             return NativeApplicability.rejected(
                     NativeRejectReason.FORCE_KEEP_DELETE, "force keep delete is enabled");
