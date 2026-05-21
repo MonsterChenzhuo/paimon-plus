@@ -126,6 +126,27 @@ docker run --rm -it \
 mvn clean install -DskipTests
 ```
 
+本地快速构建可使用 `fast-build` profile 跳过 checkstyle、spotless、enforcer 和 RAT license 检查：
+
+```bash
+mvn clean install -DskipTests -Pfast-build
+```
+
+如果需要同时构建 Native IO Rust native library，并打进 `paimon-native-io` artifact，需要额外启用 `native-io` profile：
+
+```bash
+mvn clean install -DskipTests -Pfast-build,native-io
+```
+
+构建 Spark 3.4 模块及其依赖，并同时启用 Native IO native library：
+
+```bash
+mvn clean install -DskipTests \
+  -Pfast-build,native-io,spark3 \
+  -Dspark.version=3.4.4 \
+  -pl paimon-spark/paimon-spark-3.4 -am
+```
+
 快速打包：
 
 ```bash

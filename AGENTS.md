@@ -58,6 +58,27 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
 本地迭代时可使用 `-Pfast-build` 跳过 checkstyle、spotless、enforcer 和 rat 检查；最终验证不要依赖该选项：
 
 ```shell
+mvn clean install -DskipTests -Pfast-build
+```
+
+如果需要同时构建 Native IO Rust native library，并打进 `paimon-native-io` artifact，需要额外启用 `native-io` profile：
+
+```shell
+mvn clean install -DskipTests -Pfast-build,native-io
+```
+
+如果需要构建 Spark 3.4 模块及其依赖，并同时启用 Native IO native library：
+
+```shell
+mvn clean install -DskipTests \
+  -Pfast-build,native-io,spark3 \
+  -Dspark.version=3.4.4 \
+  -pl paimon-spark/paimon-spark-3.4 -am
+```
+
+单模块测试示例：
+
+```shell
 mvn -pl <module> -Pfast-build -Dtest=TestClassName#methodName test
 ```
 
