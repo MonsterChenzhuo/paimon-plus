@@ -105,6 +105,7 @@ class NativeIOStoreSuite extends FunSuite {
     assert(active.head.phaseOrStatus == "NO_NATIVE_PHASE")
     assert(active.head.stuckElapsedMs(32000L) == 31000L)
     assert(active.head.diagnosis.contains("no native phase event"))
+    assert(active.head.diagnosis.contains("legacy paimon_exporter_export_parquet"))
 
     val stuck = store.stuckOperations(32000L)
     assert(stuck.map(_.operationId) == Seq("task-1"))
