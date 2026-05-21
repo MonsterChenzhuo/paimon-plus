@@ -13,7 +13,10 @@ CALL sys.export_parquet(
   parallelism => 32,
   compression => 'zstd',
   overwrite => true,
-  target_file_size => '128 MB'
+  target_file_size => '128 MB',
+  partitioned_output => true,
+  partition_job_parallelism => 4,
+  compact_output => true
 );
 ```
 
@@ -46,6 +49,9 @@ CALL sys.export_parquet(
 | `compression` | `STRING` | 否 | `'zstd'` | Parquet 压缩 codec，直接传给 Parquet writer。 |
 | `overwrite` | `BOOLEAN` | 否 | `false` | 输出目录已存在时是否删除后重写。 |
 | `target_file_size` | `STRING` | 否 | 空，表示按 Paimon split 写文件 | 目标 Parquet 文件大小，例如 `'128 MB'`。配置后会启用滚动写文件。 |
+| `partitioned_output` | `BOOLEAN` | 否 | `false` | 是否按 Paimon 分区分别输出到 `output_path/分区路径`。 |
+| `partition_job_parallelism` | `INT` | 否 | `1` | `partitioned_output=true` 时，并发提交分区导出 job 的上限。 |
+| `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否在当前 Spark 会话提交合并 job，将该导出目录合并为一个 Parquet 文件。 |
 
 ## Native fast path
 
@@ -246,6 +252,64 @@ CALL sys.export_parquet(
 - 大表导出到对象存储时，可以根据 executor 资源、对象存储写吞吐和目标文件大小综合设置。
 - 若希望控制最终文件大小，优先设置 `target_file_size`，不要只依赖 `parallelism`。
 
+### partitioned_output 和 partition_job_parallelism
+
+`partitioned_output => true` 时，procedure 会按 Paimon split 中的分区值分组导出。每个分区写到一个独立目录，目录名使用 Paimon 标准分区路径，例如：
+
+```text
+s3://bucket/export/orders/
+  dt=2026-05-01/
+  dt=2026-05-02/
+  dt=2026-05-03/
+```
+
+`partition_job_parallelism` 控制 driver 侧最多同时提交多少个分区导出 job。每个分区导出 job 内部仍受 `parallelism` 控制。
+
+注意：
+
+- 该能力只支持分区表。
+- 是否导出哪些分区由 `where` 过滤和 Paimon scan 规划结果决定。
+- 目录命名只包含实际有 split 的分区；没有被 Paimon scan 规划到 split 的分区不会创建目录。
+
+示例：
+
+```sql
+CALL sys.export_parquet(
+  table => 'default.orders',
+  columns => 'order_id,user_id,amount',
+  output_path => 's3://bucket/export/orders_range',
+  where => "dt >= '2026-05-01' and dt <= '2026-05-06'",
+  partitioned_output => true,
+  partition_job_parallelism => 4,
+  parallelism => 32,
+  overwrite => true
+);
+```
+
+### compact_output
+
+`compact_output => true` 表示导出完成后，对外部 Parquet 输出目录执行一次文件合并。它不是 Paimon 表 compaction，也不会修改源 Paimon 表。
+
+执行方式：
+
+- 普通导出：导出 job 完成后，对 `output_path` 提交一个 Spark 合并 job。
+- 分区导出：每个分区目录的导出 job 完成后，对该分区目录提交一个 Spark 合并 job。
+
+合并 job 会读取对应输出目录的 Parquet 文件，`coalesce(1)` 后写入临时兄弟目录，再替换原输出目录。合并后该导出目录下只保留一个 `part-*.parquet` 和 `_SUCCESS`。
+
+示例：
+
+```sql
+CALL sys.export_parquet(
+  table => 'default.orders',
+  columns => '*',
+  output_path => 's3://bucket/export/orders_single_file',
+  where => "dt = '2026-05-14'",
+  compact_output => true,
+  overwrite => true
+);
+```
+
 ### compression
 
 `compression` 控制 Parquet 文件压缩方式，默认是 `zstd`。
@@ -368,6 +432,33 @@ CALL sys.export_parquet(
 );
 ```
 
+### 按分区目录导出日期范围并合并每个分区
+
+```sql
+CALL sys.export_parquet(
+  table => 'default.orders',
+  columns => 'order_id,user_id,amount',
+  output_path => 's3://bucket/export/orders_range',
+  where => "dt >= '2026-05-01' and dt <= '2026-05-06'",
+  partitioned_output => true,
+  partition_job_parallelism => 4,
+  compact_output => true,
+  overwrite => true
+);
+```
+
+输出目录示例：
+
+```text
+s3://bucket/export/orders_range/
+  dt=2026-05-01/
+    part-....parquet
+    _SUCCESS
+  dt=2026-05-02/
+    part-....parquet
+    _SUCCESS
+```
+
 ### 控制压缩格式和文件大小
 
 ```sql
@@ -391,10 +482,12 @@ CALL sys.export_parquet(
 3. 根据 `where` 生成 Paimon predicate。
 4. 读取列会自动包含输出列和过滤列。
 5. 使用 Paimon scan 规划 splits。
-6. 准备输出目录，必要时按 `overwrite` 删除旧目录。
-7. Spark 根据 split 和参数启动导出任务。
-8. 每个任务读取 Paimon split，应用过滤条件，写出 Parquet 文件。
-9. driver 汇总写出行数，并创建 `_SUCCESS` 文件。
+6. 如果启用 `partitioned_output`，按 split 的分区值分组，生成分区输出目录。
+7. 准备输出目录，必要时按 `overwrite` 删除旧目录。
+8. Spark 根据 split 和参数启动导出任务。
+9. 每个任务读取 Paimon split，应用过滤条件，写出 Parquet 文件。
+10. 如果启用 `compact_output`，导出 job 完成后提交合并 job，将对应导出目录合并成单个 Parquet 文件。
+11. driver 汇总写出行数，并创建 `_SUCCESS` 文件。
 
 ## 输出文件与文件数
 

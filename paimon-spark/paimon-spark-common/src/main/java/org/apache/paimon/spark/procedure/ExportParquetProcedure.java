@@ -20,11 +20,13 @@ package org.apache.paimon.spark.procedure;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.parquet.ParquetWriterFactory;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.operation.nativeio.NativeRejectReason;
@@ -53,12 +55,15 @@ import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CloseableIterator;
+import org.apache.paimon.utils.InternalRowPartitionComputer;
+import org.apache.paimon.utils.PartitionPathUtils;
 import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.Projection;
 import org.apache.paimon.utils.StringUtils;
 
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -87,14 +92,19 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 
 import scala.collection.JavaConverters;
@@ -131,7 +141,10 @@ public class ExportParquetProcedure extends BaseProcedure {
                 ProcedureParameter.optional("parallelism", IntegerType),
                 ProcedureParameter.optional("compression", StringType),
                 ProcedureParameter.optional("overwrite", BooleanType),
-                ProcedureParameter.optional("target_file_size", StringType)
+                ProcedureParameter.optional("target_file_size", StringType),
+                ProcedureParameter.optional("partitioned_output", BooleanType),
+                ProcedureParameter.optional("partition_job_parallelism", IntegerType),
+                ProcedureParameter.optional("compact_output", BooleanType)
             };
 
     private static final StructType OUTPUT_TYPE =
@@ -168,6 +181,9 @@ public class ExportParquetProcedure extends BaseProcedure {
         String compression = args.isNullAt(5) ? "zstd" : args.getString(5);
         boolean overwrite = !args.isNullAt(6) && args.getBoolean(6);
         Long targetFileSize = args.isNullAt(7) ? null : parseTargetFileSize(args.getString(7));
+        boolean partitionedOutput = !args.isNullAt(8) && args.getBoolean(8);
+        int partitionJobParallelism = args.isNullAt(9) ? 1 : Math.max(1, args.getInt(9));
+        boolean compactOutput = !args.isNullAt(10) && args.getBoolean(10);
 
         Table table = loadSparkTable(tableIdent).getTable();
         try {
@@ -180,7 +196,10 @@ public class ExportParquetProcedure extends BaseProcedure {
                             parallelism,
                             compression,
                             overwrite,
-                            targetFileSize);
+                            targetFileSize,
+                            partitionedOutput,
+                            partitionJobParallelism,
+                            compactOutput);
             return new InternalRow[] {newInternalRow(true, rows)};
         } catch (Exception e) {
             throw new RuntimeException("Failed to export parquet files", e);
@@ -195,7 +214,10 @@ public class ExportParquetProcedure extends BaseProcedure {
             int parallelism,
             String compression,
             boolean overwrite,
-            @Nullable Long targetFileSize)
+            @Nullable Long targetFileSize,
+            boolean partitionedOutput,
+            int partitionJobParallelism,
+            boolean compactOutput)
             throws Exception {
         RowType tableRowType = table.rowType();
         int[] outputProjection = parseOutputProjection(tableRowType, columns);
@@ -221,18 +243,71 @@ public class ExportParquetProcedure extends BaseProcedure {
 
         final ReadBuilder finalReadBuilder = readBuilder;
         List<Split> plannedSplits = finalReadBuilder.newScan().plan().splits();
-        final List<SerializedSplit> splits =
+        Path outputDir = new Path(trimTrailingSlash(outputPath));
+
+        if (partitionedOutput) {
+            Preconditions.checkArgument(
+                    !table.partitionKeys().isEmpty(),
+                    "partitioned_output requires a partitioned table.");
+            return partitionedExport(
+                    table,
+                    finalReadBuilder,
+                    plannedSplits,
+                    outputDir,
+                    outputType,
+                    projectedPredicate,
+                    outputProjection.length,
+                    parallelism,
+                    partitionJobParallelism,
+                    compression,
+                    overwrite,
+                    targetFileSize,
+                    compactOutput);
+        }
+
+        long rows =
+                exportPlannedSplits(
+                        table,
+                        finalReadBuilder,
+                        plannedSplits,
+                        outputDir,
+                        outputType,
+                        projectedPredicate,
+                        outputProjection.length,
+                        parallelism,
+                        compression,
+                        overwrite,
+                        targetFileSize);
+        if (compactOutput) {
+            compactOutputDirectory(table, outputDir, compression);
+        }
+        return rows;
+    }
+
+    private long exportPlannedSplits(
+            Table table,
+            ReadBuilder readBuilder,
+            List<Split> plannedSplits,
+            Path outputDir,
+            RowType outputType,
+            @Nullable Predicate projectedPredicate,
+            int outputFieldCount,
+            int parallelism,
+            String compression,
+            boolean overwrite,
+            @Nullable Long targetFileSize)
+            throws Exception {
+        List<SerializedSplit> splits =
                 plannedSplits.stream()
                         .map(ExportParquetProcedure::copySplit)
                         .map(ExportParquetProcedure::serializeSplit)
                         .collect(Collectors.toList());
-        final Path outputDir = new Path(trimTrailingSlash(outputPath));
         FileIO outputFileIO = outputFileIO(table, outputDir);
 
         Optional<NativeExportAttempt> nativeExportAttempt =
                 nativeExportAttempt(
                         table,
-                        outputPath,
+                        outputDir.toString(),
                         compression,
                         targetFileSize,
                         outputType,
@@ -251,7 +326,9 @@ public class ExportParquetProcedure extends BaseProcedure {
                     attempt.preflight.reason(),
                     attempt.preflight.detail());
             if (!attempt.context.options().get(CoreOptions.NATIVE_IO_EXPORT_FALLBACK_ENABLED)
-                    || attempt.context.options().get(CoreOptions.NATIVE_IO_EXPORT_FAIL_ON_FALLBACK)) {
+                    || attempt.context
+                            .options()
+                            .get(CoreOptions.NATIVE_IO_EXPORT_FAIL_ON_FALLBACK)) {
                 throw new UnsupportedOperationException(
                         "Native export is enabled but not applicable. reason="
                                 + attempt.preflight.reason()
@@ -264,16 +341,280 @@ public class ExportParquetProcedure extends BaseProcedure {
 
         return javaExport(
                 table,
-                finalReadBuilder,
+                readBuilder,
                 splits,
                 plannedSplits,
                 outputDir,
                 outputType,
                 projectedPredicate,
-                outputProjection.length,
+                outputFieldCount,
                 parallelism,
                 compression,
                 targetFileSize);
+    }
+
+    private long partitionedExport(
+            Table table,
+            ReadBuilder readBuilder,
+            List<Split> plannedSplits,
+            Path outputDir,
+            RowType outputType,
+            @Nullable Predicate projectedPredicate,
+            int outputFieldCount,
+            int parallelism,
+            int partitionJobParallelism,
+            String compression,
+            boolean overwrite,
+            @Nullable Long targetFileSize,
+            boolean compactOutput)
+            throws Exception {
+        FileIO outputFileIO = outputFileIO(table, outputDir);
+        prepareOutputDirectory(outputFileIO, outputDir, overwrite);
+
+        List<PartitionExportPlan> partitions =
+                partitionExportPlans(table, plannedSplits, outputDir);
+        if (partitions.isEmpty()) {
+            outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
+            return 0L;
+        }
+
+        int jobParallelism =
+                Math.max(1, Math.min(Math.max(1, partitionJobParallelism), partitions.size()));
+        long rows;
+        if (jobParallelism == 1) {
+            rows = 0L;
+            for (PartitionExportPlan partition : partitions) {
+                rows +=
+                        exportPartition(
+                                table,
+                                readBuilder,
+                                partition,
+                                outputType,
+                                projectedPredicate,
+                                outputFieldCount,
+                                parallelism,
+                                compression,
+                                targetFileSize,
+                                compactOutput);
+            }
+        } else {
+            rows =
+                    exportPartitionsConcurrently(
+                            table,
+                            readBuilder,
+                            partitions,
+                            outputType,
+                            projectedPredicate,
+                            outputFieldCount,
+                            parallelism,
+                            jobParallelism,
+                            compression,
+                            targetFileSize,
+                            compactOutput);
+        }
+
+        outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
+        return rows;
+    }
+
+    private long exportPartitionsConcurrently(
+            Table table,
+            ReadBuilder readBuilder,
+            List<PartitionExportPlan> partitions,
+            RowType outputType,
+            @Nullable Predicate projectedPredicate,
+            int outputFieldCount,
+            int parallelism,
+            int jobParallelism,
+            String compression,
+            @Nullable Long targetFileSize,
+            boolean compactOutput)
+            throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(jobParallelism);
+        try {
+            List<Future<Long>> futures = new ArrayList<>(partitions.size());
+            for (PartitionExportPlan partition : partitions) {
+                futures.add(
+                        executor.submit(
+                                new Callable<Long>() {
+                                    @Override
+                                    public Long call() throws Exception {
+                                        return exportPartition(
+                                                table,
+                                                readBuilder,
+                                                partition,
+                                                outputType,
+                                                projectedPredicate,
+                                                outputFieldCount,
+                                                parallelism,
+                                                compression,
+                                                targetFileSize,
+                                                compactOutput);
+                                    }
+                                }));
+            }
+
+            long rows = 0L;
+            for (Future<Long> future : futures) {
+                rows += future.get();
+            }
+            return rows;
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+            throw new RuntimeException(cause);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private long exportPartition(
+            Table table,
+            ReadBuilder readBuilder,
+            PartitionExportPlan partition,
+            RowType outputType,
+            @Nullable Predicate projectedPredicate,
+            int outputFieldCount,
+            int parallelism,
+            String compression,
+            @Nullable Long targetFileSize,
+            boolean compactOutput)
+            throws Exception {
+        LOG.info(
+                "Exporting partition for sys.export_parquet. partition={}, outputPath={}, splits={}",
+                partition.partitionPath,
+                partition.outputDir,
+                partition.splits.size());
+        long rows =
+                exportPlannedSplits(
+                        table,
+                        readBuilder,
+                        partition.splits,
+                        partition.outputDir,
+                        outputType,
+                        projectedPredicate,
+                        outputFieldCount,
+                        parallelism,
+                        compression,
+                        false,
+                        targetFileSize);
+        if (compactOutput) {
+            compactOutputDirectory(table, partition.outputDir, compression);
+        }
+        return rows;
+    }
+
+    private static List<PartitionExportPlan> partitionExportPlans(
+            Table table, List<Split> splits, Path outputDir) {
+        CoreOptions options = new CoreOptions(table.options());
+        RowType partitionType = table.rowType().project(table.partitionKeys());
+        InternalRowPartitionComputer partitionComputer =
+                new InternalRowPartitionComputer(
+                        options.partitionDefaultName(),
+                        partitionType,
+                        table.partitionKeys().toArray(new String[0]),
+                        options.legacyPartitionName());
+        Map<String, PartitionExportPlan> plans = new LinkedHashMap<>();
+        for (Split split : splits) {
+            String partitionPath =
+                    trimTrailingSlash(
+                            PartitionPathUtils.generatePartitionPath(
+                                    partitionComputer.generatePartValues(splitPartition(split))));
+            PartitionExportPlan plan = plans.get(partitionPath);
+            if (plan == null) {
+                plan = new PartitionExportPlan(partitionPath, new Path(outputDir, partitionPath));
+                plans.put(partitionPath, plan);
+            }
+            plan.splits.add(split);
+        }
+        return new ArrayList<>(plans.values());
+    }
+
+    private static BinaryRow splitPartition(Split split) {
+        if (split instanceof DataSplit) {
+            return ((DataSplit) split).partition();
+        }
+        if (split instanceof IncrementalSplit) {
+            return ((IncrementalSplit) split).partition();
+        }
+        throw new UnsupportedOperationException(
+                "partitioned_output only supports DataSplit and IncrementalSplit, but got "
+                        + split.getClass().getName());
+    }
+
+    private void compactOutputDirectory(Table table, Path outputDir, String compression)
+            throws IOException {
+        FileIO fileIO = outputFileIO(table, outputDir);
+        int parquetFiles = parquetFileCount(fileIO, outputDir);
+        if (parquetFiles <= 1) {
+            return;
+        }
+
+        Path parent = outputDir.getParent();
+        Preconditions.checkArgument(
+                parent != null, "Cannot compact root output directory: %s", outputDir);
+        Path tempDir =
+                new Path(
+                        parent,
+                        "." + outputDir.getName() + "-compact-" + UUID.randomUUID().toString());
+        Path backupDir =
+                new Path(
+                        parent, "." + outputDir.getName() + "-before-compact-" + UUID.randomUUID());
+        if (fileIO.exists(tempDir)) {
+            fileIO.delete(tempDir, true);
+        }
+        if (fileIO.exists(backupDir)) {
+            fileIO.delete(backupDir, true);
+        }
+
+        boolean committed = false;
+        boolean backedUp = false;
+        try {
+            spark().read()
+                    .parquet(outputDir.toString())
+                    .coalesce(1)
+                    .write()
+                    .mode(SaveMode.Overwrite)
+                    .option("compression", compression)
+                    .parquet(tempDir.toString());
+            if (!fileIO.rename(outputDir, backupDir)) {
+                throw new IOException(
+                        "Failed to backup output directory "
+                                + outputDir
+                                + " before compacting to "
+                                + backupDir);
+            }
+            backedUp = true;
+            if (!fileIO.rename(tempDir, outputDir)) {
+                fileIO.rename(backupDir, outputDir);
+                throw new IOException(
+                        "Failed to replace compacted output directory "
+                                + outputDir
+                                + " with "
+                                + tempDir);
+            }
+            committed = true;
+            fileIO.deleteQuietly(backupDir);
+        } finally {
+            if (!committed) {
+                fileIO.deleteQuietly(tempDir);
+                if (backedUp && !fileIO.exists(outputDir)) {
+                    fileIO.rename(backupDir, outputDir);
+                }
+            }
+        }
+    }
+
+    private static int parquetFileCount(FileIO fileIO, Path outputDir) throws IOException {
+        int count = 0;
+        for (FileStatus status : fileIO.listFiles(outputDir, false)) {
+            if (!status.isDir() && status.getPath().getName().endsWith(".parquet")) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private long javaExport(
@@ -1120,6 +1461,18 @@ public class ExportParquetProcedure extends BaseProcedure {
             } catch (IOException | ClassNotFoundException e) {
                 throw new RuntimeException("Failed to deserialize Paimon split.", e);
             }
+        }
+    }
+
+    private static class PartitionExportPlan {
+
+        private final String partitionPath;
+        private final Path outputDir;
+        private final List<Split> splits = new ArrayList<>();
+
+        private PartitionExportPlan(String partitionPath, Path outputDir) {
+            this.partitionPath = partitionPath;
+            this.outputDir = outputDir;
         }
     }
 

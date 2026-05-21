@@ -155,4 +155,72 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
       }
     }
   }
+
+  test("Paimon export parquet procedure: partitioned output compacts each partition") {
+    val random = ThreadLocalRandom.current().nextInt(100000)
+    withTable(s"tbl_part$random") {
+      sql(s"""
+             |CREATE TABLE tbl_part$random (
+             |  id INT,
+             |  name STRING,
+             |  dt STRING
+             |)
+             |PARTITIONED BY (dt)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO tbl_part$random VALUES
+             |  (1, 'a', '2026-05-01'),
+             |  (2, 'b', '2026-05-01'),
+             |  (3, 'c', '2026-05-03'),
+             |  (4, 'd', '2026-05-06'),
+             |  (5, 'e', '2026-05-07')
+             |""".stripMargin)
+
+      withTempDir {
+        dir =>
+          val output = new File(dir, "export-partitioned").getAbsolutePath
+
+          checkAnswer(
+            spark.sql(s"""
+                         |CALL sys.export_parquet(
+                         |  table => 'tbl_part$random',
+                         |  columns => 'id,name',
+                         |  output_path => '$output',
+                         |  where => "dt >= '2026-05-01' and dt <= '2026-05-06'",
+                         |  parallelism => 2,
+                         |  overwrite => true,
+                         |  target_file_size => '1 b',
+                         |  partitioned_output => true,
+                         |  partition_job_parallelism => 2,
+                         |  compact_output => true)
+                         |""".stripMargin),
+            Row(true, 4L) :: Nil
+          )
+
+          assertThat(new File(output, "_SUCCESS")).exists()
+          assertThat(new File(output, "dt=2026-05-01")).isDirectory()
+          assertThat(new File(output, "dt=2026-05-03")).isDirectory()
+          assertThat(new File(output, "dt=2026-05-06")).isDirectory()
+          assertThat(new File(output, "dt=2026-05-07")).doesNotExist()
+
+          Seq("2026-05-01", "2026-05-03", "2026-05-06").foreach {
+            dt =>
+              val partitionDir = new File(output, s"dt=$dt")
+              assertThat(partitionDir.listFiles().filter(_.getName.endsWith(".parquet")).length)
+                .isEqualTo(1)
+              assertThat(new File(partitionDir, "_SUCCESS")).exists()
+          }
+
+          val exported = spark.read.option("basePath", output).parquet(output)
+          assertThat(exported.schema.fieldNames).containsExactly("id", "name", "dt")
+          checkAnswer(
+            exported.orderBy("id"),
+            Row(1, "a", "2026-05-01") ::
+              Row(2, "b", "2026-05-01") ::
+              Row(3, "c", "2026-05-03") ::
+              Row(4, "d", "2026-05-06") :: Nil)
+      }
+    }
+  }
 }
