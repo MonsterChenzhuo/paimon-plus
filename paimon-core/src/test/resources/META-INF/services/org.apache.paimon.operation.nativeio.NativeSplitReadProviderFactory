@@ -1,1 +1,2 @@
+org.apache.paimon.operation.nativeio.EmptyNativeSplitReadProviderFactory
 org.apache.paimon.operation.nativeio.TestNativeSplitReadProviderFactory

@@ -20,34 +20,16 @@ package org.apache.paimon.operation.nativeio;
 
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.operation.SplitRead;
-import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.splitread.SplitReadProvider;
-import org.apache.paimon.utils.LazyField;
 
 import java.util.function.Consumer;
 
-/** Test ServiceLoader provider for {@link NativeSplitReadProviderLoaderTest}. */
-public class TestNativeSplitReadProviderFactory implements NativeSplitReadProviderFactory {
+/** Empty test ServiceLoader factory for {@link NativeSplitReadProviderLoaderTest}. */
+public class EmptyNativeSplitReadProviderFactory implements NativeSplitReadProviderFactory {
 
     @Override
     public SplitReadProvider create(
             NativeSplitReadContext context, Consumer<SplitRead<InternalRow>> splitReadConfig) {
-        if (!"__native_split_provider_test__".equals(context.engineName())) {
-            return null;
-        }
-        return new TestSplitReadProvider();
-    }
-
-    private static class TestSplitReadProvider implements SplitReadProvider {
-
-        @Override
-        public boolean match(Split split, Context context) {
-            return false;
-        }
-
-        @Override
-        public LazyField<? extends SplitRead<InternalRow>> get() {
-            return new LazyField<>(() -> null);
-        }
+        return null;
     }
 }

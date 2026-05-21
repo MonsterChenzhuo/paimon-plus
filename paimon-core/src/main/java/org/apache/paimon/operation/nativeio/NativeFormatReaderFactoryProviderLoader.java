@@ -61,13 +61,14 @@ public final class NativeFormatReaderFactoryProviderLoader {
         ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
         ClassLoader ownClassLoader = NativeFormatReaderFactoryProviderLoader.class.getClassLoader();
 
-        if (contextClassLoader != null) {
-            List<NativeFormatReaderFactoryProvider> providers = loadProviders(contextClassLoader);
-            if (!providers.isEmpty() || contextClassLoader == ownClassLoader) {
-                return providers;
-            }
+        if (contextClassLoader == null || contextClassLoader == ownClassLoader) {
+            return loadProviders(ownClassLoader);
         }
-        return loadProviders(ownClassLoader);
+
+        List<NativeFormatReaderFactoryProvider> providers =
+                new ArrayList<>(loadProviders(contextClassLoader));
+        providers.addAll(loadProviders(ownClassLoader));
+        return providers;
     }
 
     private static List<NativeFormatReaderFactoryProvider> loadProviders(ClassLoader classLoader) {

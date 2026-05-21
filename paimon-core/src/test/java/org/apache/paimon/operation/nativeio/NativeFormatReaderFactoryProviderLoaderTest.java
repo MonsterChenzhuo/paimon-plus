@@ -25,13 +25,21 @@ import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Collections;
+import java.util.Enumeration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class NativeFormatReaderFactoryProviderLoaderTest {
+
+    @TempDir private java.nio.file.Path tempDir;
 
     @Test
     void missingContextReturnsEmpty() {
@@ -54,6 +62,32 @@ class NativeFormatReaderFactoryProviderLoaderTest {
     @Test
     void triesNextProviderWhenFirstProviderReturnsEmpty() {
         assertThat(NativeFormatReaderFactoryProviderLoader.tryCreate(testContext())).isPresent();
+    }
+
+    @Test
+    void fallsBackToOwnClassLoaderWhenContextProvidersReturnEmpty() throws Exception {
+        java.nio.file.Path serviceFile =
+                tempDir.resolve(
+                        "META-INF/services/" + NativeFormatReaderFactoryProvider.class.getName());
+        Files.createDirectories(serviceFile.getParent());
+        Files.write(
+                serviceFile,
+                Collections.singletonList(EmptyNativeFormatReaderFactoryProvider.class.getName()),
+                StandardCharsets.UTF_8);
+
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        ClassLoader classLoader =
+                new ServiceOnlyClassLoader(
+                        NativeFormatReaderFactoryProviderLoader.class.getClassLoader(),
+                        serviceFile.toUri().toURL());
+        try {
+            Thread.currentThread().setContextClassLoader(classLoader);
+
+            assertThat(NativeFormatReaderFactoryProviderLoader.tryCreate(testContext()))
+                    .isPresent();
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
+        }
     }
 
     @Test
@@ -81,5 +115,26 @@ class NativeFormatReaderFactoryProviderLoaderTest {
                 NativeIOOptions.from(new Options()),
                 new Path("obs://bucket/data.parquet"),
                 NativeApplicabilityReporter.NO_OP);
+    }
+
+    private static class ServiceOnlyClassLoader extends ClassLoader {
+
+        private static final String SERVICE_NAME =
+                "META-INF/services/" + NativeFormatReaderFactoryProvider.class.getName();
+
+        private final URL serviceUrl;
+
+        private ServiceOnlyClassLoader(ClassLoader parent, URL serviceUrl) {
+            super(parent);
+            this.serviceUrl = serviceUrl;
+        }
+
+        @Override
+        public Enumeration<URL> getResources(String name) throws IOException {
+            if (SERVICE_NAME.equals(name)) {
+                return Collections.enumeration(Collections.singleton(serviceUrl));
+            }
+            return super.getResources(name);
+        }
     }
 }

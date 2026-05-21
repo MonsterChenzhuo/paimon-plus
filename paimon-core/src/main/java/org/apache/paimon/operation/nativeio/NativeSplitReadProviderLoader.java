@@ -24,7 +24,9 @@ import org.apache.paimon.table.source.splitread.SplitReadProvider;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceConfigurationError;
@@ -35,7 +37,7 @@ import java.util.function.Consumer;
 /** ClassLoader-safe loader for optional native split read providers. */
 public final class NativeSplitReadProviderLoader {
 
-    private static final Map<ClassLoader, Optional<NativeSplitReadProviderFactory>> CACHE =
+    private static final Map<ClassLoader, List<NativeSplitReadProviderFactory>> CACHE =
             Collections.synchronizedMap(new WeakHashMap<>());
 
     private NativeSplitReadProviderLoader() {}
@@ -45,51 +47,54 @@ public final class NativeSplitReadProviderLoader {
         if (context == null) {
             return Optional.empty();
         }
-        Optional<NativeSplitReadProviderFactory> factory = loadFactory();
-        if (!factory.isPresent()) {
-            return Optional.empty();
+        for (NativeSplitReadProviderFactory factory : loadFactories()) {
+            try {
+                SplitReadProvider provider = factory.create(context, config);
+                if (provider != null) {
+                    return Optional.of(provider);
+                }
+            } catch (LinkageError | RuntimeException e) {
+                // Try the next factory. Native IO is optional and must not break Java reads.
+            }
         }
-        try {
-            return Optional.ofNullable(factory.get().create(context, config));
-        } catch (LinkageError | RuntimeException e) {
-            return Optional.empty();
-        }
+        return Optional.empty();
     }
 
-    private static Optional<NativeSplitReadProviderFactory> loadFactory() {
+    private static List<NativeSplitReadProviderFactory> loadFactories() {
         ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
         ClassLoader ownClassLoader = NativeSplitReadProviderLoader.class.getClassLoader();
 
-        if (contextClassLoader != null) {
-            Optional<NativeSplitReadProviderFactory> factory = loadFactory(contextClassLoader);
-            if (factory.isPresent() || contextClassLoader == ownClassLoader) {
-                return factory;
-            }
+        if (contextClassLoader == null || contextClassLoader == ownClassLoader) {
+            return loadFactories(ownClassLoader);
         }
-        return loadFactory(ownClassLoader);
+
+        List<NativeSplitReadProviderFactory> factories =
+                new ArrayList<>(loadFactories(contextClassLoader));
+        factories.addAll(loadFactories(ownClassLoader));
+        return factories;
     }
 
-    private static Optional<NativeSplitReadProviderFactory> loadFactory(ClassLoader classLoader) {
-        Optional<NativeSplitReadProviderFactory> cached = CACHE.get(classLoader);
+    private static List<NativeSplitReadProviderFactory> loadFactories(ClassLoader classLoader) {
+        List<NativeSplitReadProviderFactory> cached = CACHE.get(classLoader);
         if (cached != null) {
             return cached;
         }
-        Optional<NativeSplitReadProviderFactory> loaded = discoverFactory(classLoader);
+        List<NativeSplitReadProviderFactory> loaded = discoverFactories(classLoader);
         CACHE.put(classLoader, loaded);
         return loaded;
     }
 
-    private static Optional<NativeSplitReadProviderFactory> discoverFactory(
-            ClassLoader classLoader) {
+    private static List<NativeSplitReadProviderFactory> discoverFactories(ClassLoader classLoader) {
         try {
             ServiceLoader<NativeSplitReadProviderFactory> loader =
                     ServiceLoader.load(NativeSplitReadProviderFactory.class, classLoader);
+            List<NativeSplitReadProviderFactory> factories = new ArrayList<>();
             for (NativeSplitReadProviderFactory factory : loader) {
-                return Optional.of(factory);
+                factories.add(factory);
             }
-            return Optional.empty();
+            return factories;
         } catch (ServiceConfigurationError | LinkageError | RuntimeException e) {
-            return Optional.empty();
+            return Collections.emptyList();
         }
     }
 }
