@@ -17,9 +17,6 @@
 # limitations under the License.
 ################################################################################
 
-ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux2014_x86_64
-FROM ${MANYLINUX_IMAGE}
-
 ARG JDK8_URL=https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse
 ARG MAVEN_VERSION=3.9.9
 ARG SPARK_VERSION=3.4.4
@@ -27,6 +24,25 @@ ARG SPARK_TGZ_URL=https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/s
 ARG SPARK_LOCAL_KIND=none
 ARG INSTALL_SPARK=0
 ARG RUST_TOOLCHAIN=stable
+ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux2014_x86_64
+
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS tool-downloads
+ARG JDK8_URL
+ARG MAVEN_VERSION
+RUN set -eux; \
+    apk add --no-cache curl gzip tar; \
+    mkdir -p /opt/java/openjdk /opt/maven; \
+    curl -fsSL "${JDK8_URL}" -o /tmp/jdk8.tar.gz; \
+    tar -xzf /tmp/jdk8.tar.gz -C /opt/java/openjdk --strip-components=1; \
+    curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; \
+    tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1
+
+FROM ${MANYLINUX_IMAGE}
+ARG SPARK_VERSION
+ARG SPARK_TGZ_URL
+ARG SPARK_LOCAL_KIND
+ARG INSTALL_SPARK
+ARG RUST_TOOLCHAIN
 
 ENV JAVA_HOME=/opt/java/openjdk
 ENV MAVEN_HOME=/opt/maven
@@ -37,17 +53,8 @@ ENV PATH=${MAVEN_HOME}/bin:${CARGO_HOME}/bin:${SPARK_HOME}/bin:${JAVA_HOME}/bin:
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN set -eux; \
-    mkdir -p "${JAVA_HOME}"; \
-    curl -fsSL "${JDK8_URL}" -o /tmp/jdk8.tar.gz; \
-    tar -xzf /tmp/jdk8.tar.gz -C "${JAVA_HOME}" --strip-components=1; \
-    rm -f /tmp/jdk8.tar.gz
-
-RUN set -eux; \
-    mkdir -p "${MAVEN_HOME}"; \
-    curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz; \
-    tar -xzf /tmp/maven.tgz -C "${MAVEN_HOME}" --strip-components=1; \
-    rm -f /tmp/maven.tgz
+COPY --from=tool-downloads /opt/java/openjdk /opt/java/openjdk
+COPY --from=tool-downloads /opt/maven /opt/maven
 
 COPY spark-local /tmp/spark-local
 
