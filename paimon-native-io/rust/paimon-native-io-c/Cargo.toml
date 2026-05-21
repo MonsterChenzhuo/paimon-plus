@@ -15,7 +15,7 @@ arrow-select.workspace = true
 bytes.workspace = true
 futures.workspace = true
 huaweicloud-sdk-rust-obs.workspace = true
-parquet.workspace = true
+parquet = { workspace = true, features = ["async"] }
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 url.workspace = true

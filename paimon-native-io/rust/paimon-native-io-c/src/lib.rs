@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
+use std::future::Future;
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,17 +15,25 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
     Int8Array, RecordBatch, RecordBatchReader, StringArray, StructArray,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
 use bytes::Bytes;
+use futures::future::{BoxFuture, FutureExt};
+use futures::StreamExt;
 use huaweicloud_sdk_rust_obs::{Client, CompletedPart, Config, Credentials};
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder, RowFilter,
+};
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStream};
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::ProjectionMask;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{ChunkReader, Length};
+use parquet::schema::types::SchemaDescriptor;
 use serde_json::Value;
 use url::Url;
 
@@ -63,6 +73,9 @@ const RUNTIME_THREAD_ENV: &[&str] = &[
 const DEFAULT_RUNTIME_THREADS: usize = 4;
 const DEFAULT_OBS_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_OBS_CONNECT_TIMEOUT_MS: u64 = 10_000;
+const READER_BATCH_CELL_BUDGET: usize = 256 * 1024;
+const MIN_READER_BATCH_ROWS: usize = 16;
+const RANGE_COALESCE_MAX_GAP_BYTES: u64 = 64 * 1024;
 
 static GLOBAL_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
@@ -204,6 +217,7 @@ struct ObsObjectInner {
     len: u64,
     runtime_threads: usize,
     read_buffer_size_bytes: usize,
+    read_concurrency: usize,
     range_cache: Mutex<Option<ObsRangeCache>>,
     metrics: Option<Arc<ObsReadMetrics>>,
 }
@@ -220,8 +234,33 @@ struct ObsObjectRead {
 }
 
 struct ExportReader {
-    reader: FileBatchReader,
+    reader: AsyncFileBatchReader,
     obs_metrics: Option<Arc<ObsReadMetrics>>,
+    late_materialization: bool,
+}
+
+struct AsyncFileBatchReader {
+    stream: ParquetRecordBatchStream<Box<dyn AsyncFileReader>>,
+    row_offset: i64,
+}
+
+struct LateMaterializationFilter {
+    predicate: Value,
+    partition: HashMap<String, String>,
+    predicate_columns: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CoalescedRangeSlice {
+    original_index: usize,
+    offset: usize,
+    length: usize,
+}
+
+#[derive(Debug)]
+struct CoalescedRange {
+    range: Range<u64>,
+    slices: Vec<CoalescedRangeSlice>,
 }
 
 impl ReaderConfig {
@@ -493,6 +532,7 @@ impl ObsObjectChunkReader {
             None,
             runtime_worker_threads(),
             8 * 1024 * 1024,
+            4,
             DEFAULT_OBS_REQUEST_TIMEOUT_MS,
             DEFAULT_OBS_CONNECT_TIMEOUT_MS,
         )
@@ -504,6 +544,7 @@ impl ObsObjectChunkReader {
         metrics: Option<Arc<ObsReadMetrics>>,
         runtime_threads: usize,
         read_buffer_size_bytes: usize,
+        read_concurrency: usize,
         request_timeout_ms: u64,
         connect_timeout_ms: u64,
     ) -> Result<Self, String> {
@@ -537,6 +578,7 @@ impl ObsObjectChunkReader {
                 len,
                 runtime_threads,
                 read_buffer_size_bytes,
+                read_concurrency: read_concurrency.max(1),
                 range_cache: Mutex::new(None),
                 metrics,
             }),
@@ -610,6 +652,284 @@ impl ObsObjectChunkReader {
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         }
         Ok(bytes)
+    }
+
+    async fn fetch_range_async(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let end = start
+            .checked_add(length as u64)
+            .ok_or_else(|| ParquetError::General("OBS range overflow".to_string()))?;
+        if start > self.inner.len || end > self.inner.len {
+            return Err(ParquetError::EOF(format!(
+                "Expected to read {} bytes at offset {}, while object has length {}",
+                length, start, self.inner.len
+            )));
+        }
+
+        let fetch_length = {
+            let cache = self.inner.range_cache.lock().map_err(|e| {
+                ParquetError::General(format!("OBS range cache lock poisoned: {}", e))
+            })?;
+            if let Some(cache) = cache.as_ref() {
+                let cache_end = cache.start + cache.bytes.len() as u64;
+                if start >= cache.start && end <= cache_end {
+                    let offset = (start - cache.start) as usize;
+                    return Ok(cache.bytes.slice(offset..offset + length));
+                }
+            }
+            if length >= self.inner.read_buffer_size_bytes {
+                length
+            } else {
+                let remaining = self.inner.len.saturating_sub(start);
+                let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
+                self.inner.read_buffer_size_bytes.max(length).min(remaining)
+            }
+        };
+
+        let bytes = self.fetch_range_uncached_async(start, fetch_length).await?;
+        if bytes.len() < length {
+            return Err(ParquetError::EOF(format!(
+                "Expected buffered read to return at least {} bytes at offset {}, got {}",
+                length,
+                start,
+                bytes.len()
+            )));
+        }
+        if length < self.inner.read_buffer_size_bytes {
+            let mut cache = self.inner.range_cache.lock().map_err(|e| {
+                ParquetError::General(format!("OBS range cache lock poisoned: {}", e))
+            })?;
+            *cache = Some(ObsRangeCache {
+                start,
+                bytes: bytes.clone(),
+            });
+        }
+        Ok(bytes.slice(0..length))
+    }
+
+    async fn fetch_range_exact_async(&self, range: Range<u64>) -> ParquetResult<Bytes> {
+        let length = range_length(&range)?;
+        if range.start > self.inner.len || range.end > self.inner.len {
+            return Err(ParquetError::EOF(format!(
+                "Expected to read range {}..{}, while object has length {}",
+                range.start, range.end, self.inner.len
+            )));
+        }
+        self.fetch_range_uncached_async(range.start, length).await
+    }
+
+    async fn fetch_range_uncached_async(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let range = range_header(start, length);
+        let range_for_error = range.clone();
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.requests.fetch_add(1, Ordering::Relaxed);
+        }
+        let bytes = self
+            .inner
+            .client
+            .get_object()
+            .bucket(&self.inner.bucket)
+            .key(&self.inner.key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|e| {
+                ParquetError::General(format!(
+                    "OBS get_object failed for obs://{}/{} range {}: {}",
+                    self.inner.bucket, self.inner.key, range_for_error, e
+                ))
+            })?
+            .into_body();
+        if bytes.len() != length {
+            return Err(ParquetError::EOF(format!(
+                "Expected to read {} bytes at offset {}, OBS returned {}",
+                length,
+                start,
+                bytes.len()
+            )));
+        }
+        if let Some(metrics) = &self.inner.metrics {
+            metrics
+                .bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(bytes)
+    }
+}
+
+fn range_length(range: &Range<u64>) -> ParquetResult<usize> {
+    if range.end < range.start {
+        return Err(ParquetError::General(format!(
+            "invalid byte range {}..{}",
+            range.start, range.end
+        )));
+    }
+    usize::try_from(range.end - range.start)
+        .map_err(|_| ParquetError::General("byte range length exceeds usize".to_string()))
+}
+
+async fn fetch_byte_ranges_concurrently<F, Fut>(
+    ranges: Vec<Range<u64>>,
+    concurrency: usize,
+    fetch: F,
+) -> ParquetResult<Vec<Bytes>>
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = ParquetResult<Bytes>>,
+{
+    let results = futures::stream::iter(ranges)
+        .map(fetch)
+        .buffered(concurrency.max(1))
+        .collect::<Vec<_>>()
+        .await;
+    results.into_iter().collect()
+}
+
+fn coalesce_byte_ranges(
+    ranges: Vec<Range<u64>>,
+    max_gap_bytes: u64,
+    max_merged_range_bytes: usize,
+) -> ParquetResult<Vec<CoalescedRange>> {
+    let max_merged_range_bytes = u64::try_from(max_merged_range_bytes.max(1))
+        .map_err(|_| ParquetError::General("max merged range exceeds u64".to_string()))?;
+    let mut indexed_ranges = ranges.into_iter().enumerate().collect::<Vec<_>>();
+    indexed_ranges.sort_by_key(|(_, range)| (range.start, range.end));
+
+    let mut coalesced = Vec::<CoalescedRange>::new();
+    for (original_index, range) in indexed_ranges {
+        let length = range_length(&range)?;
+        if let Some(current) = coalesced.last_mut() {
+            let current_end = current.range.end;
+            let merged_end = current_end.max(range.end);
+            let merged_len = merged_end.saturating_sub(current.range.start);
+            let gap = range.start.saturating_sub(current_end);
+            let contained = range.end <= current_end;
+            if contained || (gap <= max_gap_bytes && merged_len <= max_merged_range_bytes) {
+                let offset = usize::try_from(range.start.saturating_sub(current.range.start))
+                    .map_err(|_| {
+                        ParquetError::General("coalesced range offset exceeds usize".to_string())
+                    })?;
+                current.range.end = merged_end;
+                current.slices.push(CoalescedRangeSlice {
+                    original_index,
+                    offset,
+                    length,
+                });
+                continue;
+            }
+        }
+
+        coalesced.push(CoalescedRange {
+            range: range.clone(),
+            slices: vec![CoalescedRangeSlice {
+                original_index,
+                offset: 0,
+                length,
+            }],
+        });
+    }
+    Ok(coalesced)
+}
+
+async fn fetch_byte_ranges_coalesced<F, Fut>(
+    ranges: Vec<Range<u64>>,
+    concurrency: usize,
+    max_gap_bytes: u64,
+    max_merged_range_bytes: usize,
+    fetch: F,
+) -> ParquetResult<Vec<Bytes>>
+where
+    F: FnMut(Range<u64>) -> Fut,
+    Fut: Future<Output = ParquetResult<Bytes>>,
+{
+    let original_len = ranges.len();
+    let coalesced = coalesce_byte_ranges(ranges, max_gap_bytes, max_merged_range_bytes)?;
+    let merged_ranges = coalesced
+        .iter()
+        .map(|coalesced| coalesced.range.clone())
+        .collect::<Vec<_>>();
+    let merged_bytes = fetch_byte_ranges_concurrently(merged_ranges, concurrency, fetch).await?;
+    let mut results = vec![None; original_len];
+    for (coalesced, bytes) in coalesced.into_iter().zip(merged_bytes.into_iter()) {
+        for slice in coalesced.slices {
+            let end = slice.offset.checked_add(slice.length).ok_or_else(|| {
+                ParquetError::General("coalesced range slice overflow".to_string())
+            })?;
+            if end > bytes.len() {
+                return Err(ParquetError::EOF(format!(
+                    "Expected coalesced range {}..{} to contain slice {}..{}, got {} bytes",
+                    coalesced.range.start,
+                    coalesced.range.end,
+                    slice.offset,
+                    end,
+                    bytes.len()
+                )));
+            }
+            results[slice.original_index] = Some(bytes.slice(slice.offset..end));
+        }
+    }
+    results
+        .into_iter()
+        .map(|bytes| {
+            bytes.ok_or_else(|| ParquetError::General("missing coalesced range slice".to_string()))
+        })
+        .collect()
+}
+
+impl AsyncFileReader for ObsObjectChunkReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        async move {
+            let length = range_length(&range)?;
+            self.fetch_range_async(range.start, length).await
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        let reader = self.clone();
+        let concurrency = self.inner.read_concurrency;
+        let max_merged_range_bytes = self.inner.read_buffer_size_bytes;
+        async move {
+            fetch_byte_ranges_coalesced(
+                ranges,
+                concurrency,
+                RANGE_COALESCE_MAX_GAP_BYTES,
+                max_merged_range_bytes,
+                move |range| {
+                    let reader = reader.clone();
+                    async move { reader.fetch_range_exact_async(range).await }
+                },
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let file_size = self.inner.len;
+            let metadata_opts = options.map(|value| value.metadata_options().clone());
+            let page_index = options.map(|value| value.page_index()).unwrap_or(false);
+            let metadata_reader = ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::from(page_index))
+                .with_metadata_options(metadata_opts);
+            let metadata = metadata_reader
+                .load_and_finish(&mut *self, file_size)
+                .await?;
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
     }
 }
 
@@ -715,6 +1035,16 @@ fn open_local(path: &str) -> Result<File, String> {
     File::open(local_path).map_err(|e| e.to_string())
 }
 
+async fn open_local_async(path: &str) -> Result<tokio::fs::File, String> {
+    let local_path = path
+        .strip_prefix("file://")
+        .or_else(|| path.strip_prefix("file:"))
+        .unwrap_or(path);
+    tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn append_row_index(
     batch: RecordBatch,
     row_index_column: &str,
@@ -746,6 +1076,17 @@ fn schema_with_row_index(schema: SchemaRef, row_index_column: &str) -> SchemaRef
     Arc::new(Schema::new(fields))
 }
 
+fn adaptive_reader_batch_size(
+    configured_batch_size: usize,
+    projected_column_count: usize,
+) -> usize {
+    let configured_batch_size = configured_batch_size.max(1);
+    let projected_column_count = projected_column_count.max(1);
+    let budget_rows =
+        (READER_BATCH_CELL_BUDGET / projected_column_count).max(MIN_READER_BATCH_ROWS);
+    configured_batch_size.min(budget_rows)
+}
+
 fn build_file_batch_reader<R: ChunkReader + 'static>(
     reader: R,
     batch_size: usize,
@@ -754,6 +1095,7 @@ fn build_file_batch_reader<R: ChunkReader + 'static>(
 ) -> Result<(SchemaRef, FileBatchReader), String> {
     let mut builder =
         ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| e.to_string())?;
+    let mut projected_column_count = builder.parquet_schema().columns().len();
     if let Some(target_columns) = target_columns {
         let parquet_schema = builder.parquet_schema();
         let available_columns: HashSet<String> = parquet_schema
@@ -766,9 +1108,11 @@ fn build_file_batch_reader<R: ChunkReader + 'static>(
             .map(String::as_str)
             .filter(|column| available_columns.contains(*column))
             .collect();
+        projected_column_count = selected_columns.len();
         let mask = ProjectionMask::columns(parquet_schema, selected_columns);
         builder = builder.with_projection(mask);
     }
+    let batch_size = adaptive_reader_batch_size(batch_size, projected_column_count);
     let reader = builder
         .with_batch_size(batch_size)
         .build()
@@ -781,6 +1125,99 @@ fn build_file_batch_reader<R: ChunkReader + 'static>(
             row_offset: 0,
         },
     ))
+}
+
+async fn build_async_file_batch_reader(
+    reader: Box<dyn AsyncFileReader>,
+    batch_size: usize,
+    row_index_column: &str,
+    output_columns: &[String],
+    fallback_columns: &[String],
+    late_filter: Option<LateMaterializationFilter>,
+) -> Result<(SchemaRef, AsyncFileBatchReader, bool), String> {
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|e| e.to_string())?;
+    let row_filter = late_filter
+        .map(|filter| build_export_row_filter(builder.parquet_schema(), filter))
+        .transpose()?
+        .flatten();
+    let late_materialization = row_filter.is_some();
+    if let Some(row_filter) = row_filter {
+        builder = builder.with_row_filter(row_filter);
+    }
+    let target_columns = if late_materialization {
+        output_columns
+    } else {
+        fallback_columns
+    };
+    let mut projected_column_count = builder.parquet_schema().columns().len();
+    if !target_columns.is_empty() {
+        let parquet_schema = builder.parquet_schema();
+        let available_columns: HashSet<String> = parquet_schema
+            .columns()
+            .iter()
+            .map(|column| column.path().string())
+            .collect();
+        let selected_columns: Vec<&str> = target_columns
+            .iter()
+            .map(String::as_str)
+            .filter(|column| available_columns.contains(*column))
+            .collect();
+        projected_column_count = selected_columns.len();
+        let mask = ProjectionMask::columns(parquet_schema, selected_columns);
+        builder = builder.with_projection(mask);
+    }
+    let batch_size = adaptive_reader_batch_size(batch_size, projected_column_count);
+    let stream = builder
+        .with_batch_size(batch_size)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let schema = schema_with_row_index(stream.schema().clone(), row_index_column);
+    Ok((
+        schema,
+        AsyncFileBatchReader {
+            stream,
+            row_offset: 0,
+        },
+        late_materialization,
+    ))
+}
+
+fn build_export_row_filter(
+    parquet_schema: &SchemaDescriptor,
+    filter: LateMaterializationFilter,
+) -> Result<Option<RowFilter>, String> {
+    let available_columns: HashSet<String> = parquet_schema
+        .columns()
+        .iter()
+        .map(|column| column.path().string())
+        .collect();
+    let selected_columns: Vec<&str> = filter
+        .predicate_columns
+        .iter()
+        .map(String::as_str)
+        .filter(|column| available_columns.contains(*column))
+        .collect();
+    if selected_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let predicate = filter.predicate;
+    let partition = filter.partition;
+    let mask = ProjectionMask::columns(parquet_schema, selected_columns);
+    let arrow_predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+        let mut values = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            values.push(
+                eval_predicate(&predicate, &batch, &partition, row).map_err(|error| {
+                    ArrowError::ComputeError(format!("native export predicate failed: {}", error))
+                })?,
+            );
+        }
+        Ok(BooleanArray::from(values))
+    });
+    Ok(Some(RowFilter::new(vec![Box::new(arrow_predicate)])))
 }
 
 fn build_file_readers(config: &ReaderConfig) -> Result<(SchemaRef, Vec<FileBatchReader>), String> {
@@ -1937,6 +2374,7 @@ fn export_parquet_with_diagnostics(
         task.runtime_threads
     ));
 
+    let runtime = global_runtime_with_threads(task.runtime_threads)?;
     for (file_ordinal, file) in task.files.iter().enumerate() {
         export_log(format!(
             "file_start ordinal={} path={}",
@@ -1956,12 +2394,12 @@ fn export_parquet_with_diagnostics(
             object_operation: Some("open_reader"),
             ..Default::default()
         });
-        let (schema, mut export_reader) = build_export_reader(
+        let (schema, mut export_reader) = runtime.block_on(build_export_reader(
             file,
             &task,
             task.writer_batch_size,
             &task.object_store_options,
-        )?;
+        ))?;
         let reader_elapsed_ms = elapsed_ms(reader_start);
         diagnostics.emit(NativeDiagnosticEvent {
             event_type: "READER_READY",
@@ -1969,6 +2407,10 @@ fn export_parquet_with_diagnostics(
             file_path: Some(&file.path),
             object_operation: Some("open_reader"),
             duration_ms: Some(reader_elapsed_ms),
+            metrics_json: Some(format!(
+                "{{\"late_materialization\":{}}}",
+                export_reader.late_materialization
+            )),
             ..Default::default()
         });
         export_log(format!(
@@ -1978,118 +2420,189 @@ fn export_parquet_with_diagnostics(
         let _ = schema;
         let reader = &mut export_reader.reader;
         let mut file_row_groups = 0u64;
+        let mut file_batches = 0u64;
         let mut file_rows_read = 0u64;
         let mut file_rows_output = 0u64;
         let mut writer: Option<ActiveExportWriter> = None;
 
         loop {
-            let decode_start = std::time::Instant::now();
+            let row_group_index = file_row_groups;
+            let row_group_start = std::time::Instant::now();
             diagnostics.emit(NativeDiagnosticEvent {
                 event_type: "PHASE_START",
                 phase: Some("READ"),
                 file_path: Some(&file.path),
-                object_operation: Some("read_next_batch"),
+                object_operation: Some("read_next_row_group"),
+                metrics_json: Some(format!("{{\"row_group_index\":{}}}", row_group_index)),
                 ..Default::default()
             });
-            let batch = match reader.reader.next() {
-                Some(batch) => batch.map_err(|e| e.to_string())?,
-                None => break,
+            let mut row_group_reader = match runtime.block_on(reader.stream.next_row_group()) {
+                Ok(Some(row_group_reader)) => row_group_reader,
+                Ok(None) => break,
+                Err(error) => return Err(error.to_string()),
             };
-            let read_elapsed_ms = elapsed_ms(decode_start);
-            decode_ms += read_elapsed_ms;
+            let row_group_ready_elapsed_ms = elapsed_ms(row_group_start);
+            decode_ms += row_group_ready_elapsed_ms;
             parquet_row_groups_read += 1;
             file_row_groups += 1;
-            let batch = append_row_index(batch, DEFAULT_ROW_INDEX_COLUMN, reader.row_offset)?;
-            reader.row_offset += batch.num_rows() as i64;
-            let input_rows = batch.num_rows();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_PROGRESS",
+                phase: Some("READ"),
+                file_path: Some(&file.path),
+                object_operation: Some("read_row_group"),
+                duration_ms: Some(row_group_ready_elapsed_ms),
+                metrics_json: Some(format!("{{\"row_group_index\":{}}}", row_group_index)),
+                ..Default::default()
+            });
+
+            let mut row_group_batches = 0u64;
+            let mut row_group_rows_read = 0u64;
+            let mut row_group_rows_output = 0u64;
+            loop {
+                let row_group_batch_index = row_group_batches;
+                let file_batch_index = file_batches;
+                let decode_start = std::time::Instant::now();
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_START",
+                    phase: Some("READ"),
+                    file_path: Some(&file.path),
+                    object_operation: Some("read_next_batch"),
+                    metrics_json: Some(format!(
+                        "{{\"row_group_index\":{},\"row_group_batch_index\":{},\"batch_index\":{}}}",
+                        row_group_index, row_group_batch_index, file_batch_index
+                    )),
+                    ..Default::default()
+                });
+                let batch = match row_group_reader.next() {
+                    Some(batch) => batch.map_err(|e| e.to_string())?,
+                    None => break,
+                };
+                let read_elapsed_ms = elapsed_ms(decode_start);
+                decode_ms += read_elapsed_ms;
+                file_batches += 1;
+                row_group_batches += 1;
+                let batch = append_row_index(batch, DEFAULT_ROW_INDEX_COLUMN, reader.row_offset)?;
+                reader.row_offset += batch.num_rows() as i64;
+                let input_rows = batch.num_rows();
+                rows_read += input_rows as u64;
+                file_rows_read += input_rows as u64;
+                row_group_rows_read += input_rows as u64;
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_END",
+                    phase: Some("READ"),
+                    file_path: Some(&file.path),
+                    object_operation: Some("read_next_batch"),
+                    duration_ms: Some(read_elapsed_ms),
+                    rows: Some(input_rows as u64),
+                    metrics_json: Some(format!(
+                        "{{\"row_group_index\":{},\"row_group_batch_index\":{},\"batch_index\":{}}}",
+                        row_group_index, row_group_batch_index, file_batch_index
+                    )),
+                    ..Default::default()
+                });
+                let filter_start = std::time::Instant::now();
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_START",
+                    phase: Some("FILTER"),
+                    file_path: Some(&file.path),
+                    rows: Some(input_rows as u64),
+                    ..Default::default()
+                });
+                let (batch, filtered_by_dv) = if export_reader.late_materialization {
+                    (batch, 0)
+                } else {
+                    apply_export_filters(batch, file, &task.predicate)?
+                };
+                let filter_elapsed_ms = elapsed_ms(filter_start);
+                filter_ms += filter_elapsed_ms;
+                dv_filtered_rows += filtered_by_dv as u64;
+                predicate_filtered_rows +=
+                    input_rows.saturating_sub(filtered_by_dv + batch.num_rows()) as u64;
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_END",
+                    phase: Some("FILTER"),
+                    file_path: Some(&file.path),
+                    duration_ms: Some(filter_elapsed_ms),
+                    rows: Some(batch.num_rows() as u64),
+                    metrics_json: Some(format!(
+                        "{{\"dv_filtered_rows\":{},\"predicate_filtered_rows\":{}}}",
+                        filtered_by_dv,
+                        input_rows.saturating_sub(filtered_by_dv + batch.num_rows())
+                    )),
+                    ..Default::default()
+                });
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let projected = project_export_batch(batch, &task.projection, &file.partition)?;
+                rows_output += projected.num_rows() as u64;
+                file_rows_output += projected.num_rows() as u64;
+                row_group_rows_output += projected.num_rows() as u64;
+                let write_start = std::time::Instant::now();
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_START",
+                    phase: Some("WRITE"),
+                    file_path: Some(&file.path),
+                    rows: Some(projected.num_rows() as u64),
+                    ..Default::default()
+                });
+                write_projected_export_batch(
+                    projected,
+                    &task,
+                    &mut writer,
+                    &mut next_output_ordinal,
+                    &mut files_written,
+                    &mut writer_rolls,
+                    &mut peak_buffered_bytes,
+                    &mut obs_write_requests,
+                    &mut obs_write_bytes,
+                    &mut encode_ms,
+                    &mut obs_write_ms,
+                    &mut multipart_finish_ms,
+                )?;
+                diagnostics.emit(NativeDiagnosticEvent {
+                    event_type: "PHASE_END",
+                    phase: Some("WRITE"),
+                    file_path: Some(&file.path),
+                    duration_ms: Some(elapsed_ms(write_start)),
+                    rows: Some(file_rows_output),
+                    queue_depth: writer
+                        .as_ref()
+                        .map(|value| value.writer.multipart_inflight_parts()),
+                    peak_buffered_bytes: Some(peak_buffered_bytes),
+                    ..Default::default()
+                });
+            }
+
             diagnostics.emit(NativeDiagnosticEvent {
                 event_type: "PHASE_END",
                 phase: Some("READ"),
                 file_path: Some(&file.path),
-                object_operation: Some("read_next_batch"),
-                duration_ms: Some(read_elapsed_ms),
-                rows: Some(input_rows as u64),
-                ..Default::default()
-            });
-            rows_read += input_rows as u64;
-            file_rows_read += input_rows as u64;
-            let filter_start = std::time::Instant::now();
-            diagnostics.emit(NativeDiagnosticEvent {
-                event_type: "PHASE_START",
-                phase: Some("FILTER"),
-                file_path: Some(&file.path),
-                rows: Some(input_rows as u64),
-                ..Default::default()
-            });
-            let (batch, filtered_by_dv) = apply_export_filters(batch, file, &task.predicate)?;
-            let filter_elapsed_ms = elapsed_ms(filter_start);
-            filter_ms += filter_elapsed_ms;
-            dv_filtered_rows += filtered_by_dv as u64;
-            predicate_filtered_rows +=
-                input_rows.saturating_sub(filtered_by_dv + batch.num_rows()) as u64;
-            diagnostics.emit(NativeDiagnosticEvent {
-                event_type: "PHASE_END",
-                phase: Some("FILTER"),
-                file_path: Some(&file.path),
-                duration_ms: Some(filter_elapsed_ms),
-                rows: Some(batch.num_rows() as u64),
+                object_operation: Some("read_row_group"),
+                duration_ms: Some(elapsed_ms(row_group_start)),
+                rows: Some(row_group_rows_read),
                 metrics_json: Some(format!(
-                    "{{\"dv_filtered_rows\":{},\"predicate_filtered_rows\":{}}}",
-                    filtered_by_dv,
-                    input_rows.saturating_sub(filtered_by_dv + batch.num_rows())
+                    "{{\"row_group_index\":{},\"batches\":{},\"rows_output\":{}}}",
+                    row_group_index, row_group_batches, row_group_rows_output
                 )),
                 ..Default::default()
             });
-            if batch.num_rows() == 0 {
-                if file_row_groups == 1 || file_row_groups % 100 == 0 {
-                    export_log(format!(
-                        "file_progress ordinal={} row_groups={} rows_read={} rows_output={}",
-                        file_ordinal, file_row_groups, file_rows_read, file_rows_output
-                    ));
-                }
-                continue;
-            }
-            let projected = project_export_batch(batch, &task.projection, &file.partition)?;
-            rows_output += projected.num_rows() as u64;
-            file_rows_output += projected.num_rows() as u64;
-            let write_start = std::time::Instant::now();
             diagnostics.emit(NativeDiagnosticEvent {
-                event_type: "PHASE_START",
-                phase: Some("WRITE"),
+                event_type: "PHASE_PROGRESS",
+                phase: Some("READ"),
                 file_path: Some(&file.path),
-                rows: Some(projected.num_rows() as u64),
-                ..Default::default()
-            });
-            write_projected_export_batch(
-                projected,
-                &task,
-                &mut writer,
-                &mut next_output_ordinal,
-                &mut files_written,
-                &mut writer_rolls,
-                &mut peak_buffered_bytes,
-                &mut obs_write_requests,
-                &mut obs_write_bytes,
-                &mut encode_ms,
-                &mut obs_write_ms,
-                &mut multipart_finish_ms,
-            )?;
-            diagnostics.emit(NativeDiagnosticEvent {
-                event_type: "PHASE_END",
-                phase: Some("WRITE"),
-                file_path: Some(&file.path),
-                duration_ms: Some(elapsed_ms(write_start)),
-                rows: Some(file_rows_output),
-                queue_depth: writer
-                    .as_ref()
-                    .map(|value| value.writer.multipart_inflight_parts()),
-                peak_buffered_bytes: Some(peak_buffered_bytes),
+                object_operation: Some("read_next_batch"),
+                rows: Some(file_rows_read),
+                metrics_json: Some(format!(
+                    "{{\"row_groups\":{},\"batches\":{},\"rows_output\":{}}}",
+                    file_row_groups, file_batches, file_rows_output
+                )),
                 ..Default::default()
             });
             if file_row_groups == 1 || file_row_groups % 100 == 0 {
                 export_log(format!(
-                    "file_progress ordinal={} row_groups={} rows_read={} rows_output={}",
-                    file_ordinal, file_row_groups, file_rows_read, file_rows_output
+                    "file_progress ordinal={} row_groups={} batches={} rows_read={} rows_output={}",
+                    file_ordinal, file_row_groups, file_batches, file_rows_read, file_rows_output
                 ));
             }
         }
@@ -2128,8 +2641,8 @@ fn export_parquet_with_diagnostics(
             obs_read_bytes += metrics.bytes.load(Ordering::Relaxed);
         }
         export_log(format!(
-            "file_done ordinal={} row_groups={} rows_read={} rows_output={}",
-            file_ordinal, file_row_groups, file_rows_read, file_rows_output
+            "file_done ordinal={} row_groups={} batches={} rows_read={} rows_output={}",
+            file_ordinal, file_row_groups, file_batches, file_rows_read, file_rows_output
         ));
         diagnostics.emit(NativeDiagnosticEvent {
             event_type: "FILE_END",
@@ -2139,8 +2652,9 @@ fn export_parquet_with_diagnostics(
             bytes: Some(obs_read_bytes.saturating_add(obs_write_bytes)),
             peak_buffered_bytes: Some(peak_buffered_bytes),
             metrics_json: Some(format!(
-                "{{\"row_groups\":{},\"rows_read\":{},\"rows_output\":{},\"obs_read_requests\":{},\"obs_write_requests\":{}}}",
+                "{{\"row_groups\":{},\"batches\":{},\"rows_read\":{},\"rows_output\":{},\"obs_read_requests\":{},\"obs_write_requests\":{}}}",
                 file_row_groups,
+                file_batches,
                 file_rows_read,
                 file_rows_output,
                 obs_read_requests,
@@ -2521,51 +3035,93 @@ fn export_log(message: impl AsRef<str>) {
     eprintln!("[paimon-native-export] {}", message.as_ref());
 }
 
-fn build_export_reader(
+async fn build_export_reader(
     file: &ExportFile,
     task: &ExportTask,
     batch_size: usize,
     options: &HashMap<String, String>,
 ) -> Result<(SchemaRef, ExportReader), String> {
     let read_columns = export_read_columns(task);
+    let late_filter = export_late_materialization_filter(file, task);
     if file.path.starts_with("obs://") {
         let metrics = Arc::new(ObsReadMetrics::default());
-        let (schema, reader) = build_file_batch_reader(
-            ObsObjectChunkReader::new_with_runtime_metrics(
+        let (schema, reader, late_materialization) = build_async_file_batch_reader(
+            Box::new(ObsObjectChunkReader::new_with_runtime_metrics(
                 &file.path,
                 options,
                 Some(metrics.clone()),
                 task.runtime_threads,
                 task.read_buffer_size_bytes as usize,
+                task.read_concurrency,
                 task.obs_request_timeout_ms,
                 task.obs_connect_timeout_ms,
-            )?,
+            )?),
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
-            Some(&read_columns),
-        )?;
+            &task.projection,
+            &read_columns,
+            late_filter,
+        )
+        .await?;
         Ok((
             schema,
             ExportReader {
                 reader,
                 obs_metrics: Some(metrics),
+                late_materialization,
             },
         ))
     } else {
-        let (schema, reader) = build_file_batch_reader(
-            open_local(&file.path)?,
+        let (schema, reader, late_materialization) = build_async_file_batch_reader(
+            Box::new(open_local_async(&file.path).await?),
             batch_size,
             DEFAULT_ROW_INDEX_COLUMN,
-            Some(&read_columns),
-        )?;
+            &task.projection,
+            &read_columns,
+            late_filter,
+        )
+        .await?;
         Ok((
             schema,
             ExportReader {
                 reader,
                 obs_metrics: None,
+                late_materialization,
             },
         ))
     }
+}
+
+fn export_late_materialization_filter(
+    file: &ExportFile,
+    task: &ExportTask,
+) -> Option<LateMaterializationFilter> {
+    if !file.deleted_positions.is_empty() {
+        return None;
+    }
+    if task
+        .projection
+        .iter()
+        .any(|column| column == DEFAULT_ROW_INDEX_COLUMN)
+    {
+        return None;
+    }
+    let mut predicate_columns = Vec::new();
+    collect_predicate_fields(&task.predicate, &mut predicate_columns);
+    if predicate_columns.is_empty() {
+        return None;
+    }
+    if predicate_columns
+        .iter()
+        .any(|column| column == DEFAULT_ROW_INDEX_COLUMN)
+    {
+        return None;
+    }
+    Some(LateMaterializationFilter {
+        predicate: task.predicate.clone(),
+        partition: file.partition.clone(),
+        predicate_columns,
+    })
 }
 
 fn export_read_columns(task: &ExportTask) -> Vec<String> {
@@ -2989,9 +3545,11 @@ pub unsafe extern "C" fn paimon_string_free(value: *mut c_char) {
 mod tests {
     use super::*;
     use parquet::arrow::ArrowWriter;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use parquet::file::properties::WriterProperties;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static CAPTURED_DIAGNOSTIC_EVENTS: OnceLock<Mutex<Vec<Value>>> = OnceLock::new();
 
     fn temp_parquet_path(name: &str) -> String {
         let mut path = std::env::temp_dir();
@@ -3032,6 +3590,32 @@ mod tests {
         path
     }
 
+    fn write_i64_parquet_with_row_group_size(values: Vec<i64>, row_group_size: usize) -> String {
+        let path = temp_parquet_path("row-groups");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(row_group_size)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(properties)).unwrap();
+        let mut offset = 0;
+        while offset < values.len() {
+            let end = (offset + row_group_size).min(values.len());
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(
+                    values[offset..end].iter().copied(),
+                )) as ArrayRef],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+            offset = end;
+        }
+        writer.close().unwrap();
+        path
+    }
+
     fn write_string_parquet_column(name: &str, values: Vec<String>) -> String {
         let path = temp_parquet_path("string");
         let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
@@ -3045,6 +3629,141 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         path
+    }
+
+    unsafe extern "C" fn capture_diagnostic_event(event_json: *const c_char) {
+        if event_json.is_null() {
+            return;
+        }
+        let event = unsafe { CStr::from_ptr(event_json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        let event: Value = serde_json::from_str(&event).unwrap();
+        CAPTURED_DIAGNOSTIC_EVENTS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push(event);
+    }
+
+    fn captured_diagnostic_events() -> Vec<Value> {
+        CAPTURED_DIAGNOSTIC_EVENTS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn concurrent_range_fetch_respects_limit_and_preserves_order() {
+        let runtime = global_runtime_with_threads(4).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let ranges = (0..8).map(|value| value..value + 1).collect::<Vec<_>>();
+
+        let results = runtime
+            .block_on(fetch_byte_ranges_concurrently(ranges, 3, {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                move |range| {
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Bytes::from(vec![range.start as u8]))
+                    }
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            results.iter().map(|bytes| bytes[0]).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn coalesced_range_fetch_merges_ranges_and_preserves_order() {
+        let runtime = global_runtime_with_threads(4).unwrap();
+        let source = Bytes::from((0u8..64u8).collect::<Vec<_>>());
+        let fetched_ranges = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let ranges = vec![10..12, 0..4, 4..8, 30..32, 8..10, 33..35];
+
+        let results = runtime
+            .block_on(fetch_byte_ranges_coalesced(ranges, 2, 1, 16, {
+                let source = source.clone();
+                let fetched_ranges = Arc::clone(&fetched_ranges);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                move |range| {
+                    let source = source.clone();
+                    let fetched_ranges = Arc::clone(&fetched_ranges);
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        fetched_ranges.lock().unwrap().push(range.clone());
+                        Ok(source.slice(range.start as usize..range.end as usize))
+                    }
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|bytes| bytes.iter().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![10, 11],
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+                vec![30, 31],
+                vec![8, 9],
+                vec![33, 34]
+            ]
+        );
+        let mut fetched_ranges = fetched_ranges.lock().unwrap().clone();
+        fetched_ranges.sort_by_key(|range| (range.start, range.end));
+        assert_eq!(fetched_ranges, vec![0..12, 30..35]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn file_batch_reader_reduces_batch_rows_for_wide_projection() {
+        let row_count = 1024;
+        let column_count = 512;
+        let columns = (0..column_count)
+            .map(|column| {
+                (
+                    format!("c{}", column),
+                    (0..row_count).map(|row| row as i64).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parquet_columns = columns
+            .iter()
+            .map(|(name, values)| (name.as_str(), values.clone()))
+            .collect::<Vec<_>>();
+        let input = write_i64_parquet_columns(parquet_columns);
+
+        let (_, mut file_reader) =
+            build_file_batch_reader(open_local(&input).unwrap(), 1024, "__row_index", None)
+                .unwrap();
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 512);
+
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]
@@ -3103,6 +3822,302 @@ mod tests {
             .unwrap();
         assert_eq!(id.value(0), 2);
         assert_eq!(dt.value(0), "2026-05-06");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_reports_row_group_and_batch_read_progress() {
+        let input = write_i64_parquet_with_row_group_size(vec![1, 2, 3, 4], 2);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-diagnostics-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 1,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({"op":"true"}).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 4,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+        let mut diagnostics = NativeExportDiagnostics::new(
+            "test-export-progress".to_string(),
+            Some(capture_diagnostic_event),
+        );
+
+        let result: Value = serde_json::from_str(
+            &export_parquet_with_diagnostics(&request.to_string(), &mut diagnostics).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(4));
+
+        let events = captured_diagnostic_events();
+        let row_group_progress = events
+            .iter()
+            .filter(|event| {
+                event["operation_id"] == "test-export-progress"
+                    && event["event_type"] == "PHASE_PROGRESS"
+                    && event["phase"] == "READ"
+                    && event["object_operation"] == "read_row_group"
+            })
+            .count();
+        let row_group_end = events
+            .iter()
+            .filter(|event| {
+                event["operation_id"] == "test-export-progress"
+                    && event["event_type"] == "PHASE_END"
+                    && event["phase"] == "READ"
+                    && event["object_operation"] == "read_row_group"
+            })
+            .count();
+        let batch_end = events
+            .iter()
+            .filter(|event| {
+                event["operation_id"] == "test-export-progress"
+                    && event["event_type"] == "PHASE_END"
+                    && event["phase"] == "READ"
+                    && event["object_operation"] == "read_next_batch"
+            })
+            .count();
+
+        assert_eq!(row_group_progress, 2);
+        assert_eq!(row_group_end, 2);
+        assert_eq!(batch_end, 4);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_uses_late_materialization_for_predicate_only_column() {
+        let input = write_i64_parquet_columns(vec![
+            ("id", vec![1, 2, 3, 4]),
+            ("score", vec![10, 20, 30, 40]),
+            ("payload", vec![100, 200, 300, 400]),
+        ]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-late-materialization-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 2,
+            "projection": ["id", "payload"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({
+                "op": "ge",
+                "field": "score",
+                "literal": {"type": "BIGINT", "value": 30}
+            }).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 4,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+        let mut diagnostics = NativeExportDiagnostics::new(
+            "test-late-materialization".to_string(),
+            Some(capture_diagnostic_event),
+        );
+
+        let result: Value = serde_json::from_str(
+            &export_parquet_with_diagnostics(&request.to_string(), &mut diagnostics).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(2));
+
+        let events = captured_diagnostic_events();
+        assert!(events.iter().any(|event| {
+            event["operation_id"] == "test-late-materialization"
+                && event["event_type"] == "READER_READY"
+                && event["metrics_json"]
+                    .as_str()
+                    .and_then(|json| serde_json::from_str::<Value>(json).ok())
+                    .and_then(|metrics| metrics["late_materialization"].as_bool())
+                    == Some(true)
+        }));
+
+        let output_file = result["files_written"][0]["path"].as_str().unwrap();
+        let (schema, mut file_reader) =
+            build_file_batch_reader(open_local(output_file).unwrap(), 8, "__row_index", None)
+                .unwrap();
+        assert!(schema.field_with_name("score").is_err());
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        let id = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let payload = batch
+            .column(batch.schema().index_of("payload").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.values(), &[3, 4]);
+        assert_eq!(payload.values(), &[300, 400]);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_disables_late_materialization_when_deletion_vector_exists() {
+        let input = write_i64_parquet_columns(vec![
+            ("id", vec![1, 2, 3, 4]),
+            ("score", vec![10, 20, 30, 40]),
+        ]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-late-materialization-dv-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 2,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({
+                "op": "ge",
+                "field": "score",
+                "literal": {"type": "BIGINT", "value": 20}
+            }).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 4,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": [2]
+            }]
+        });
+        let mut diagnostics = NativeExportDiagnostics::new(
+            "test-late-materialization-dv".to_string(),
+            Some(capture_diagnostic_event),
+        );
+
+        let result: Value = serde_json::from_str(
+            &export_parquet_with_diagnostics(&request.to_string(), &mut diagnostics).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(2));
+
+        let events = captured_diagnostic_events();
+        assert!(events.iter().any(|event| {
+            event["operation_id"] == "test-late-materialization-dv"
+                && event["event_type"] == "READER_READY"
+                && event["metrics_json"]
+                    .as_str()
+                    .and_then(|json| serde_json::from_str::<Value>(json).ok())
+                    .and_then(|metrics| metrics["late_materialization"].as_bool())
+                    == Some(false)
+        }));
+
+        let output_file = result["files_written"][0]["path"].as_str().unwrap();
+        let (_, mut file_reader) =
+            build_file_batch_reader(open_local(output_file).unwrap(), 8, "__row_index", None)
+                .unwrap();
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        let id = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.values(), &[2, 4]);
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn native_export_disables_late_materialization_for_row_index_predicate() {
+        let input = write_i64_parquet_columns(vec![("id", vec![1, 2, 3, 4])]);
+        let mut output_dir = std::env::temp_dir();
+        output_dir.push(format!(
+            "paimon-native-export-late-materialization-row-index-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let request = serde_json::json!({
+            "request_version": 1,
+            "output_path": output_dir.to_string_lossy(),
+            "compression": "zstd",
+            "writer_batch_size": 2,
+            "projection": ["id"],
+            "predicate_format": "paimon-json-v1",
+            "predicate_json": serde_json::json!({
+                "op": "ge",
+                "field": DEFAULT_ROW_INDEX_COLUMN,
+                "literal": {"type": "BIGINT", "value": 2}
+            }).to_string(),
+            "object_store": {},
+            "files": [{
+                "path": input,
+                "row_count": 4,
+                "file_size": 0,
+                "schema_id": 0,
+                "partition": {},
+                "positions": []
+            }]
+        });
+        let mut diagnostics = NativeExportDiagnostics::new(
+            "test-late-materialization-row-index".to_string(),
+            Some(capture_diagnostic_event),
+        );
+
+        let result: Value = serde_json::from_str(
+            &export_parquet_with_diagnostics(&request.to_string(), &mut diagnostics).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["rows_output"].as_u64(), Some(2));
+
+        let events = captured_diagnostic_events();
+        assert!(events.iter().any(|event| {
+            event["operation_id"] == "test-late-materialization-row-index"
+                && event["event_type"] == "READER_READY"
+                && event["metrics_json"]
+                    .as_str()
+                    .and_then(|json| serde_json::from_str::<Value>(json).ok())
+                    .and_then(|metrics| metrics["late_materialization"].as_bool())
+                    == Some(false)
+        }));
+
+        let output_file = result["files_written"][0]["path"].as_str().unwrap();
+        let (_, mut file_reader) =
+            build_file_batch_reader(open_local(output_file).unwrap(), 8, "__row_index", None)
+                .unwrap();
+        let batch = file_reader.reader.next().unwrap().unwrap();
+        let id = batch
+            .column(batch.schema().index_of("id").unwrap())
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id.values(), &[3, 4]);
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_dir_all(output_dir);

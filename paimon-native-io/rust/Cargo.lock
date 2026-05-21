@@ -1314,6 +1314,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "futures",
  "half",
  "hashbrown 0.16.1",
  "lz4_flex",
@@ -1325,6 +1326,7 @@ dependencies = [
  "simdutf8",
  "snap",
  "thrift",
+ "tokio",
  "twox-hash",
  "zstd",
 ]
