@@ -25,7 +25,9 @@ import org.apache.paimon.spark.commands.BucketExpression
 import org.apache.paimon.spark.execution.{OldCompatibleStrategy, PaimonStrategy}
 import org.apache.paimon.spark.execution.adaptive.DisableUnnecessaryPaimonBucketedScan
 
-import org.apache.spark.sql.SparkSessionExtensions
+import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.paimon.shims.SparkShimLoader
 
 /** Spark session extension to extends the syntax and adds the rules. */
@@ -46,6 +48,7 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     extensions.injectPostHocResolutionRule(spark => ReplacePaimonFunctions(spark))
     extensions.injectPostHocResolutionRule(spark => PaimonPostHocResolutionRules(spark))
+    extensions.injectPostHocResolutionRule(spark => NativeIODiagnosticsInstallRule(spark))
 
     extensions.injectPostHocResolutionRule(_ => PaimonUpdateTable)
     extensions.injectPostHocResolutionRule(_ => PaimonDeleteTable)
@@ -74,5 +77,46 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     // query stage preparation
     extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)
+  }
+}
+
+private object NativeIODiagnosticsInstallRule {
+
+  private val NativeIOEnabledKey = "spark.paimon.native-io.enabled"
+  private val NativeIOUIEnabledKey = "spark.paimon.native-io.ui.enabled"
+  private val DiagnosticsClass = "org.apache.paimon.spark.nativeio.diagnostics.NativeIODiagnostics"
+
+  def apply(spark: SparkSession): Rule[LogicalPlan] = {
+    new Rule[LogicalPlan] {
+      override def apply(plan: LogicalPlan): LogicalPlan = {
+        installIfEnabled(spark)
+        plan
+      }
+    }
+  }
+
+  private def installIfEnabled(spark: SparkSession): Unit = {
+    if (!confBoolean(spark, NativeIOEnabledKey, defaultValue = false) ||
+        !confBoolean(spark, NativeIOUIEnabledKey, defaultValue = true)) {
+      return
+    }
+
+    try {
+      val diagnostics =
+        Class.forName(DiagnosticsClass, true, Thread.currentThread().getContextClassLoader)
+      diagnostics
+        .getMethod("install", classOf[SparkSession])
+        .invoke(null, spark)
+    } catch {
+      case _: Throwable =>
+    }
+  }
+
+  private def confBoolean(
+      spark: SparkSession,
+      key: String,
+      defaultValue: Boolean): Boolean = {
+    val default = spark.sparkContext.getConf.get(key, defaultValue.toString)
+    spark.sessionState.conf.getConfString(key, default).equalsIgnoreCase("true")
   }
 }

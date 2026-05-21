@@ -37,7 +37,9 @@ object NativeIODiagnostics {
 
   def install(spark: SparkSession): NativeIOStore = synchronized {
     installedStore match {
-      case Some(store) => store
+      case Some(store) =>
+        sparkUi(spark).foreach(NativeIOTabSupport.attach(_, store))
+        store
       case None =>
         val store = new NativeIOStore(DefaultMaxEvents, DefaultStuckThresholdMs)
         NativeIORpcSupport.setupDriver(spark.sparkContext, store)

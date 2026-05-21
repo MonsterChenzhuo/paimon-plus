@@ -87,6 +87,10 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       completed: Seq[NativeIOOperationState]): Seq[Node] = {
     Seq(<div>
       <h4>Summary</h4>
+      <p>
+        Native IO diagnostics are installed for this Spark application.
+        Native read and export events appear below when eligible work is planned or executed.
+      </p>
       <table class="table table-bordered table-condensed">
         <tbody>
           <tr><th>Active Operations</th><td>{active.size}</td></tr>

@@ -25,6 +25,8 @@ object NativeIOTabSupport {
 
   def attach(ui: Any, store: NativeIOStore): Unit = {
     val sparkUI = ui.asInstanceOf[SparkUI]
-    sparkUI.attachTab(new NativeIOTab(sparkUI, store))
+    if (!sparkUI.getTabs.exists(_.prefix == "native-io")) {
+      sparkUI.attachTab(new NativeIOTab(sparkUI, store))
+    }
   }
 }
