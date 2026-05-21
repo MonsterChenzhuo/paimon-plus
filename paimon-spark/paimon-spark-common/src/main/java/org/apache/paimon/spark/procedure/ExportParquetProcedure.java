@@ -71,6 +71,7 @@ import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileWriter;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.FileMetaData;
 import org.apache.paimon.shade.org.apache.parquet.schema.MessageType;
+
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -140,6 +141,7 @@ public class ExportParquetProcedure extends BaseProcedure {
     private static final String PAIMON_OPTION_PREFIX = "spark.paimon.";
     private static final String SPARK_HADOOP_PREFIX = "spark.hadoop.";
     private static final String OBS_CONF_PREFIX = "fs.obs.";
+    private static final int MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS = 100_000;
 
     private static final ProcedureParameter[] PARAMETERS =
             new ProcedureParameter[] {
@@ -288,7 +290,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                         overwrite,
                         targetFileSize);
         if (compactOutput) {
-            compactOutputDirectory(table, outputDir);
+            compactOutputDirectory(table, outputDir, targetFileSize, outputProjection.length);
         }
         return rows;
     }
@@ -510,7 +512,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                         false,
                         targetFileSize);
         if (compactOutput) {
-            compactOutputDirectory(table, partition.outputDir);
+            compactOutputDirectory(table, partition.outputDir, targetFileSize, outputFieldCount);
         }
         return rows;
     }
@@ -553,10 +555,25 @@ public class ExportParquetProcedure extends BaseProcedure {
                         + split.getClass().getName());
     }
 
-    private void compactOutputDirectory(Table table, Path outputDir) throws IOException {
+    private void compactOutputDirectory(
+            Table table, Path outputDir, @Nullable Long targetFileSize, int outputFieldCount)
+            throws IOException {
         FileIO fileIO = outputFileIO(table, outputDir);
         List<FileStatus> parquetFiles = parquetFiles(fileIO, outputDir);
         if (parquetFiles.size() <= 1) {
+            return;
+        }
+        long compactTargetFileSize = compactTargetFileSize(table, targetFileSize);
+        List<List<FileStatus>> parquetFileGroups =
+                parquetFileGroups(parquetFiles, compactTargetFileSize, outputFieldCount);
+        if (parquetFileGroups.size() >= parquetFiles.size()) {
+            LOG.info(
+                    "Skip Parquet copy compaction because files are already at target size. "
+                            + "outputDir={}, files={}, targetFileSize={}, outputFieldCount={}",
+                    outputDir,
+                    parquetFiles.size(),
+                    compactTargetFileSize,
+                    outputFieldCount);
             return;
         }
 
@@ -581,10 +598,20 @@ public class ExportParquetProcedure extends BaseProcedure {
         boolean backedUp = false;
         try {
             fileIO.mkdirs(tempDir);
-            copyParquetRowGroups(
-                    fileIO,
-                    parquetFiles,
-                    new Path(tempDir, "part-" + UUID.randomUUID() + ".parquet"));
+            LOG.info(
+                    "Copy compacting Parquet output. outputDir={}, inputFiles={}, outputFiles={}, "
+                            + "targetFileSize={}, outputFieldCount={}",
+                    outputDir,
+                    parquetFiles.size(),
+                    parquetFileGroups.size(),
+                    compactTargetFileSize,
+                    outputFieldCount);
+            for (List<FileStatus> parquetFileGroup : parquetFileGroups) {
+                copyParquetRowGroups(
+                        fileIO,
+                        parquetFileGroup,
+                        new Path(tempDir, "part-" + UUID.randomUUID() + ".parquet"));
+            }
             fileIO.newOutputStream(new Path(tempDir, "_SUCCESS"), true).close();
             if (!fileIO.rename(outputDir, backupDir)) {
                 throw new IOException(
@@ -612,6 +639,42 @@ public class ExportParquetProcedure extends BaseProcedure {
                 }
             }
         }
+    }
+
+    private static long compactTargetFileSize(Table table, @Nullable Long targetFileSize) {
+        return targetFileSize == null
+                ? new CoreOptions(table.options()).targetFileSize(false)
+                : targetFileSize;
+    }
+
+    static List<List<FileStatus>> parquetFileGroups(
+            List<FileStatus> parquetFiles, long targetFileSize, int outputFieldCount) {
+        Preconditions.checkArgument(
+                targetFileSize > 0, "Target file size should be larger than 0 bytes.");
+        int maxFilesPerGroup =
+                Math.max(
+                        1,
+                        MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS / Math.max(1, outputFieldCount));
+
+        List<List<FileStatus>> groups = new ArrayList<>();
+        List<FileStatus> currentGroup = new ArrayList<>();
+        long currentSize = 0L;
+        for (FileStatus parquetFile : parquetFiles) {
+            long fileSize = Math.max(0L, parquetFile.getLen());
+            if (!currentGroup.isEmpty()
+                    && (currentGroup.size() >= maxFilesPerGroup
+                            || currentSize + fileSize > targetFileSize)) {
+                groups.add(currentGroup);
+                currentGroup = new ArrayList<>();
+                currentSize = 0L;
+            }
+            currentGroup.add(parquetFile);
+            currentSize += fileSize;
+        }
+        if (!currentGroup.isEmpty()) {
+            groups.add(currentGroup);
+        }
+        return groups;
     }
 
     static void copyParquetRowGroups(FileIO fileIO, List<FileStatus> parquetFiles, Path outputFile)

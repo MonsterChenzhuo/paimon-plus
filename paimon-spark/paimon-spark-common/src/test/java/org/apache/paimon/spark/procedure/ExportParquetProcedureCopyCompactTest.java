@@ -25,6 +25,7 @@ import org.apache.paimon.format.parquet.ParquetInputFile;
 import org.apache.paimon.format.parquet.ParquetWriterFactory;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.options.Options;
@@ -36,10 +37,12 @@ import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.BlockMetaData;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.util.Arrays;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -81,6 +84,39 @@ class ExportParquetProcedureCopyCompactTest {
         }
     }
 
+    @Test
+    void parquetFileGroupsUseTargetFileSize() {
+        List<List<FileStatus>> groups =
+                ExportParquetProcedure.parquetFileGroups(
+                        Arrays.asList(
+                                fileStatus("part-a.parquet", 40L),
+                                fileStatus("part-b.parquet", 40L),
+                                fileStatus("part-c.parquet", 40L)),
+                        100L,
+                        10);
+
+        assertThat(groups).hasSize(2);
+        assertThat(groups.get(0)).hasSize(2);
+        assertThat(groups.get(1)).hasSize(1);
+    }
+
+    @Test
+    void parquetFileGroupsLimitEstimatedColumnChunksForWideTables() {
+        FileStatus[] files = new FileStatus[12];
+        for (int i = 0; i < files.length; i++) {
+            files[i] = fileStatus("part-" + i + ".parquet", 1L);
+        }
+
+        List<List<FileStatus>> groups =
+                ExportParquetProcedure.parquetFileGroups(
+                        Arrays.asList(files), Long.MAX_VALUE, 20_000);
+
+        assertThat(groups).hasSize(3);
+        assertThat(groups.get(0)).hasSize(5);
+        assertThat(groups.get(1)).hasSize(5);
+        assertThat(groups.get(2)).hasSize(2);
+    }
+
     private static void writeParquet(FileIO fileIO, Path path, int id, String name)
             throws Exception {
         FormatWriter writer =
@@ -91,5 +127,29 @@ class ExportParquetProcedureCopyCompactTest {
         } finally {
             writer.close();
         }
+    }
+
+    private static FileStatus fileStatus(String name, long length) {
+        return new FileStatus() {
+            @Override
+            public long getLen() {
+                return length;
+            }
+
+            @Override
+            public boolean isDir() {
+                return false;
+            }
+
+            @Override
+            public Path getPath() {
+                return new Path("file:///" + name);
+            }
+
+            @Override
+            public long getModificationTime() {
+                return 0L;
+            }
+        };
     }
 }
