@@ -596,14 +596,24 @@ public class ExportParquetProcedure extends BaseProcedure {
                                 + tempDir);
             }
             committed = true;
-            fileIO.deleteQuietly(backupDir);
+            deleteDirectoryQuietly(fileIO, backupDir);
         } finally {
             if (!committed) {
-                fileIO.deleteQuietly(tempDir);
+                deleteDirectoryQuietly(fileIO, tempDir);
                 if (backedUp && !fileIO.exists(outputDir)) {
                     fileIO.rename(backupDir, outputDir);
                 }
             }
+        }
+    }
+
+    static void deleteDirectoryQuietly(FileIO fileIO, Path directory) {
+        try {
+            if (!fileIO.delete(directory, true) && fileIO.exists(directory)) {
+                LOG.warn("Failed to delete directory {}", directory);
+            }
+        } catch (IOException e) {
+            LOG.warn("Exception occurs when deleting directory {}", directory, e);
         }
     }
 
