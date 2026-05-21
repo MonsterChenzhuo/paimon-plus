@@ -141,10 +141,7 @@ mvn clean install -DskipTests -Pfast-build,native-io
 构建 Spark 3.4 模块及其依赖，并同时启用 Native IO native library：
 
 ```bash
-mvn clean install -DskipTests \
-  -Pfast-build,native-io,spark3 \
-  -Dspark.version=3.4.4 \
-  -pl paimon-spark/paimon-spark-3.4 -am
+mvn clean install -DskipTests -Pfast-build,native-io,spark3 -pl paimon-spark/paimon-spark-3.4 -am
 ```
 
 快速打包：
