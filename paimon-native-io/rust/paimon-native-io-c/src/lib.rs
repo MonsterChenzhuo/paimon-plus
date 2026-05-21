@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -1176,19 +1176,39 @@ impl MultipartWriteBuffer {
         })
     }
 
+    #[cfg(test)]
     fn write_bytes<F>(&mut self, bytes: &[u8], mut emit_part: F) -> Result<(), String>
     where
         F: FnMut(Vec<u8>) -> Result<(), String>,
     {
-        self.buffer.extend_from_slice(bytes);
-        while self.buffer.len() >= self.part_size {
-            let rest = self.buffer.split_off(self.part_size);
-            let part = std::mem::replace(&mut self.buffer, rest);
-            emit_part(part)?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            if !self.buffer.is_empty() {
+                let take = self
+                    .remaining_capacity()
+                    .min(bytes.len().saturating_sub(offset));
+                self.extend_from_slice(&bytes[offset..offset + take]);
+                offset += take;
+                if self.is_full() {
+                    emit_part(self.take_remaining())?;
+                }
+                continue;
+            }
+
+            let remaining = bytes.len() - offset;
+            if remaining >= self.part_size {
+                let end = offset + self.part_size;
+                emit_part(bytes[offset..end].to_vec())?;
+                offset = end;
+            } else {
+                self.extend_from_slice(&bytes[offset..]);
+                break;
+            }
         }
         Ok(())
     }
 
+    #[cfg(test)]
     fn finish<F>(&mut self, mut emit_part: F) -> Result<(), String>
     where
         F: FnMut(Vec<u8>) -> Result<(), String>,
@@ -1203,8 +1223,24 @@ impl MultipartWriteBuffer {
         std::mem::take(&mut self.buffer)
     }
 
+    fn part_size(&self) -> usize {
+        self.part_size
+    }
+
     fn buffered_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        self.part_size.saturating_sub(self.buffer.len())
+    }
+
+    fn is_full(&self) -> bool {
+        self.buffer.len() >= self.part_size
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
     }
 }
 
@@ -1214,12 +1250,21 @@ struct ObsMultipartWriter {
     key: String,
     client: Client,
     runtime_threads: usize,
+    max_inflight_parts: usize,
     buffer: MultipartWriteBuffer,
     upload_id: Option<String>,
-    completed_parts: Vec<CompletedPart>,
+    completed_parts: Vec<(i32, CompletedPart)>,
+    inflight_parts: VecDeque<PendingPartUpload>,
+    inflight_bytes: u64,
     next_part_number: i32,
     stats: UploadStats,
     completed: bool,
+}
+
+struct PendingPartUpload {
+    part_number: i32,
+    bytes: u64,
+    handle: tokio::task::JoinHandle<Result<(CompletedPart, u64), String>>,
 }
 
 impl std::fmt::Debug for ObsMultipartWriter {
@@ -1229,6 +1274,9 @@ impl std::fmt::Debug for ObsMultipartWriter {
             .field("buffered_bytes", &self.buffer.buffered_len())
             .field("upload_id", &self.upload_id.as_ref().map(|_| "<set>"))
             .field("completed_parts", &self.completed_parts.len())
+            .field("inflight_parts", &self.inflight_parts.len())
+            .field("inflight_bytes", &self.inflight_bytes)
+            .field("max_inflight_parts", &self.max_inflight_parts)
             .field("next_part_number", &self.next_part_number)
             .field("completed", &self.completed)
             .finish()
@@ -1240,6 +1288,7 @@ impl ObsMultipartWriter {
         output_path: &str,
         options: &HashMap<String, String>,
         multipart_part_size_bytes: u64,
+        memory_limit_bytes: u64,
         runtime_threads: usize,
         request_timeout_ms: u64,
         connect_timeout_ms: u64,
@@ -1247,6 +1296,17 @@ impl ObsMultipartWriter {
         let part_size = usize::try_from(multipart_part_size_bytes)
             .map_err(|_| "multipart part size exceeds usize".to_string())?;
         let (bucket, key) = parse_obs_prefix(output_path)?;
+        let runtime_threads = runtime_threads.max(1);
+        let memory_part_cap_u64 = memory_limit_bytes
+            .checked_div(multipart_part_size_bytes.max(1))
+            .unwrap_or(0)
+            .max(1);
+        let memory_part_cap = usize::try_from(memory_part_cap_u64).unwrap_or(usize::MAX);
+        let max_inflight_parts = runtime_threads.min(memory_part_cap).max(1);
+        export_log(format!(
+            "multipart_writer_config output_path={} part_size={} max_inflight_parts={} memory_limit_bytes={}",
+            output_path, multipart_part_size_bytes, max_inflight_parts, memory_limit_bytes
+        ));
         Ok(Self {
             output_path: output_path.to_string(),
             bucket,
@@ -1256,10 +1316,13 @@ impl ObsMultipartWriter {
                 request_timeout_ms,
                 connect_timeout_ms,
             )?,
-            runtime_threads: runtime_threads.max(1),
+            runtime_threads,
+            max_inflight_parts,
             buffer: MultipartWriteBuffer::new(part_size)?,
             upload_id: None,
             completed_parts: Vec::new(),
+            inflight_parts: VecDeque::new(),
+            inflight_bytes: 0,
             next_part_number: 1,
             stats: UploadStats::default(),
             completed: false,
@@ -1267,13 +1330,31 @@ impl ObsMultipartWriter {
     }
 
     fn write_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let mut parts = Vec::new();
-        self.buffer.write_bytes(bytes, |part| {
-            parts.push(part);
-            Ok(())
-        })?;
-        for part in parts {
-            self.upload_part(part)?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            if self.buffer.buffered_len() > 0 {
+                let take = self
+                    .buffer
+                    .remaining_capacity()
+                    .min(bytes.len().saturating_sub(offset));
+                self.buffer.extend_from_slice(&bytes[offset..offset + take]);
+                offset += take;
+                if self.buffer.is_full() {
+                    let part = self.buffer.take_remaining();
+                    self.submit_part(part)?;
+                }
+                continue;
+            }
+
+            let remaining = bytes.len() - offset;
+            if remaining >= self.buffer.part_size() {
+                let end = offset + self.buffer.part_size();
+                self.submit_part(bytes[offset..end].to_vec())?;
+                offset = end;
+            } else {
+                self.buffer.extend_from_slice(&bytes[offset..]);
+                break;
+            }
         }
         Ok(())
     }
@@ -1286,20 +1367,20 @@ impl ObsMultipartWriter {
             return Ok(std::mem::take(&mut self.stats));
         }
 
-        let mut final_parts = Vec::new();
-        self.buffer.finish(|part| {
-            final_parts.push(part);
-            Ok(())
-        })?;
-        for part in final_parts {
-            self.upload_part(part)?;
-        }
+        let final_part = self.buffer.take_remaining();
+        self.submit_part(final_part)?;
+        self.drain_part_uploads()?;
 
         let upload_id = self
             .upload_id
             .clone()
             .ok_or_else(|| "OBS multipart upload missing upload id".to_string())?;
-        let completed_parts = std::mem::take(&mut self.completed_parts);
+        self.completed_parts
+            .sort_by_key(|(part_number, _)| *part_number);
+        let completed_parts = std::mem::take(&mut self.completed_parts)
+            .into_iter()
+            .map(|(_, part)| part)
+            .collect();
         let finish_start = std::time::Instant::now();
         let complete_result = global_runtime_with_threads(self.runtime_threads)?.block_on(async {
             self.client
@@ -1395,9 +1476,12 @@ impl ObsMultipartWriter {
         Ok(())
     }
 
-    fn upload_part(&mut self, body: Vec<u8>) -> Result<(), String> {
+    fn submit_part(&mut self, body: Vec<u8>) -> Result<(), String> {
         if body.is_empty() {
             return Ok(());
+        }
+        while self.inflight_parts.len() >= self.max_inflight_parts() {
+            self.wait_for_next_part()?;
         }
         if self.next_part_number > 10000 {
             return Err(format!(
@@ -1412,45 +1496,86 @@ impl ObsMultipartWriter {
             .ok_or_else(|| "OBS multipart upload missing upload id".to_string())?;
         let part_number = self.next_part_number;
         let bytes = body.len() as u64;
-        let start = std::time::Instant::now();
         export_log(format!(
             "multipart_part_start output_path={} part={} bytes={}",
             self.output_path, part_number, bytes
         ));
-        let part = global_runtime_with_threads(self.runtime_threads)?
-            .block_on(async {
-                self.client
-                    .upload_part()
-                    .bucket(&self.bucket)
-                    .key(&self.key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(body)
-                    .send()
-                    .await
-            })
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let output_path = self.output_path.clone();
+        let handle = global_runtime_with_threads(self.runtime_threads)?.spawn(async move {
+            let start = std::time::Instant::now();
+            let part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "OBS upload_part failed for {} part {}: {}",
+                        output_path, part_number, e
+                    )
+                })?;
+            Ok((
+                CompletedPart::new(part_number, part.etag()),
+                elapsed_ms(start),
+            ))
+        });
+        self.inflight_parts.push_back(PendingPartUpload {
+            part_number,
+            bytes,
+            handle,
+        });
+        self.inflight_bytes = self.inflight_bytes.saturating_add(bytes);
+        self.next_part_number += 1;
+        Ok(())
+    }
+
+    fn max_inflight_parts(&self) -> usize {
+        self.max_inflight_parts
+    }
+
+    fn wait_for_next_part(&mut self) -> Result<(), String> {
+        let Some(pending) = self.inflight_parts.pop_front() else {
+            return Ok(());
+        };
+        let wait_start = std::time::Instant::now();
+        let (part, upload_elapsed_ms) = global_runtime_with_threads(self.runtime_threads)?
+            .block_on(pending.handle)
             .map_err(|e| {
                 format!(
-                    "OBS upload_part failed for {} part {}: {}",
-                    self.output_path, part_number, e
+                    "OBS upload_part task failed for {} part {}: {}",
+                    self.output_path, pending.part_number, e
                 )
-            })?;
-        let elapsed = elapsed_ms(start);
+            })??;
+        self.stats.write_ms += elapsed_ms(wait_start);
         self.stats.requests += 1;
-        self.stats.bytes += bytes;
-        self.stats.write_ms += elapsed;
-        self.completed_parts
-            .push(CompletedPart::new(part_number, part.etag()));
-        self.next_part_number += 1;
+        self.stats.bytes += pending.bytes;
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(pending.bytes);
+        self.completed_parts.push((pending.part_number, part));
         export_log(format!(
-            "multipart_part_done output_path={} part={} bytes={} elapsed_ms={}",
-            self.output_path, part_number, bytes, elapsed
+            "multipart_part_done output_path={} part={} bytes={} upload_elapsed_ms={}",
+            self.output_path, pending.part_number, pending.bytes, upload_elapsed_ms
         ));
         Ok(())
     }
 
+    fn drain_part_uploads(&mut self) -> Result<(), String> {
+        while !self.inflight_parts.is_empty() {
+            self.wait_for_next_part()?;
+        }
+        Ok(())
+    }
+
     fn buffered_len(&self) -> usize {
-        self.buffer.buffered_len()
+        self.buffer
+            .buffered_len()
+            .saturating_add(usize::try_from(self.inflight_bytes).unwrap_or(usize::MAX))
     }
 
     fn write_ms(&self) -> u64 {
@@ -1485,6 +1610,10 @@ impl Drop for ObsMultipartWriter {
             "multipart_abort_start output_path={}",
             self.output_path
         ));
+        for pending in self.inflight_parts.drain(..) {
+            pending.handle.abort();
+        }
+        self.inflight_bytes = 0;
         if let Ok(runtime) = global_runtime_with_threads(self.runtime_threads) {
             let _ = runtime.block_on(async {
                 self.client
@@ -1939,6 +2068,7 @@ fn create_export_writer(
             &output_path,
             &task.object_store_options,
             task.multipart_part_size_bytes,
+            task.memory_limit_bytes,
             task.runtime_threads,
             task.obs_request_timeout_ms,
             task.obs_connect_timeout_ms,
