@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -355,6 +355,7 @@ fn global_runtime_with_threads(
     }
 }
 
+#[cfg(test)]
 fn build_obs_client(options: &HashMap<String, String>) -> Result<Client, String> {
     build_obs_client_with_timeouts(
         options,
@@ -1113,15 +1114,22 @@ fn parse_export_task(request_json: &str) -> Result<ExportTask, String> {
 #[derive(Debug)]
 struct ActiveExportWriter {
     output_path: String,
-    local_output: String,
+    local_output: Option<String>,
     multipart_part_size_bytes: u64,
     runtime_threads: usize,
     obs_request_timeout_ms: u64,
     obs_connect_timeout_ms: u64,
     cleanup: TempFileCleanup,
-    writer: ArrowWriter<File>,
+    writer: ExportWriter,
     rows: u64,
     buffered_bytes: u64,
+    reported_obs_write_ms: u64,
+}
+
+#[derive(Debug)]
+enum ExportWriter {
+    Local(ArrowWriter<File>),
+    Obs(ArrowWriter<ObsMultipartWriter>),
 }
 
 #[derive(Debug)]
@@ -1142,9 +1150,442 @@ impl Drop for TempFileCleanup {
 struct UploadStats {
     requests: u64,
     bytes: u64,
+    write_ms: u64,
     multipart_finish_ms: u64,
 }
 
+struct FinishedExportOutput {
+    bytes: u64,
+    upload_stats: Option<UploadStats>,
+}
+
+#[derive(Debug)]
+struct MultipartWriteBuffer {
+    part_size: usize,
+    buffer: Vec<u8>,
+}
+
+impl MultipartWriteBuffer {
+    fn new(part_size: usize) -> Result<Self, String> {
+        if part_size == 0 {
+            return Err("multipart part size must be positive".to_string());
+        }
+        Ok(Self {
+            part_size,
+            buffer: Vec::with_capacity(part_size.min(8 * 1024 * 1024)),
+        })
+    }
+
+    fn write_bytes<F>(&mut self, bytes: &[u8], mut emit_part: F) -> Result<(), String>
+    where
+        F: FnMut(Vec<u8>) -> Result<(), String>,
+    {
+        self.buffer.extend_from_slice(bytes);
+        while self.buffer.len() >= self.part_size {
+            let rest = self.buffer.split_off(self.part_size);
+            let part = std::mem::replace(&mut self.buffer, rest);
+            emit_part(part)?;
+        }
+        Ok(())
+    }
+
+    fn finish<F>(&mut self, mut emit_part: F) -> Result<(), String>
+    where
+        F: FnMut(Vec<u8>) -> Result<(), String>,
+    {
+        if !self.buffer.is_empty() {
+            emit_part(std::mem::take(&mut self.buffer))?;
+        }
+        Ok(())
+    }
+
+    fn take_remaining(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+struct ObsMultipartWriter {
+    output_path: String,
+    bucket: String,
+    key: String,
+    client: Client,
+    runtime_threads: usize,
+    buffer: MultipartWriteBuffer,
+    upload_id: Option<String>,
+    completed_parts: Vec<CompletedPart>,
+    next_part_number: i32,
+    stats: UploadStats,
+    completed: bool,
+}
+
+impl std::fmt::Debug for ObsMultipartWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObsMultipartWriter")
+            .field("output_path", &self.output_path)
+            .field("buffered_bytes", &self.buffer.buffered_len())
+            .field("upload_id", &self.upload_id.as_ref().map(|_| "<set>"))
+            .field("completed_parts", &self.completed_parts.len())
+            .field("next_part_number", &self.next_part_number)
+            .field("completed", &self.completed)
+            .finish()
+    }
+}
+
+impl ObsMultipartWriter {
+    fn new(
+        output_path: &str,
+        options: &HashMap<String, String>,
+        multipart_part_size_bytes: u64,
+        runtime_threads: usize,
+        request_timeout_ms: u64,
+        connect_timeout_ms: u64,
+    ) -> Result<Self, String> {
+        let part_size = usize::try_from(multipart_part_size_bytes)
+            .map_err(|_| "multipart part size exceeds usize".to_string())?;
+        let (bucket, key) = parse_obs_prefix(output_path)?;
+        Ok(Self {
+            output_path: output_path.to_string(),
+            bucket,
+            key,
+            client: build_obs_client_with_timeouts(
+                options,
+                request_timeout_ms,
+                connect_timeout_ms,
+            )?,
+            runtime_threads: runtime_threads.max(1),
+            buffer: MultipartWriteBuffer::new(part_size)?,
+            upload_id: None,
+            completed_parts: Vec::new(),
+            next_part_number: 1,
+            stats: UploadStats::default(),
+            completed: false,
+        })
+    }
+
+    fn write_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut parts = Vec::new();
+        self.buffer.write_bytes(bytes, |part| {
+            parts.push(part);
+            Ok(())
+        })?;
+        for part in parts {
+            self.upload_part(part)?;
+        }
+        Ok(())
+    }
+
+    fn complete(mut self) -> Result<UploadStats, String> {
+        if self.upload_id.is_none() {
+            let body = self.buffer.take_remaining();
+            self.put_object(body)?;
+            self.completed = true;
+            return Ok(std::mem::take(&mut self.stats));
+        }
+
+        let mut final_parts = Vec::new();
+        self.buffer.finish(|part| {
+            final_parts.push(part);
+            Ok(())
+        })?;
+        for part in final_parts {
+            self.upload_part(part)?;
+        }
+
+        let upload_id = self
+            .upload_id
+            .clone()
+            .ok_or_else(|| "OBS multipart upload missing upload id".to_string())?;
+        let completed_parts = std::mem::take(&mut self.completed_parts);
+        let finish_start = std::time::Instant::now();
+        let complete_result = global_runtime_with_threads(self.runtime_threads)?.block_on(async {
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .upload_id(&upload_id)
+                .parts(completed_parts)
+                .send()
+                .await
+        });
+        let finish_ms = elapsed_ms(finish_start);
+        self.stats.write_ms += finish_ms;
+        self.stats.multipart_finish_ms += finish_ms;
+        complete_result.map_err(|e| {
+            format!(
+                "OBS complete_multipart_upload failed for {}: {}",
+                self.output_path, e
+            )
+        })?;
+        self.stats.requests += 1;
+        self.completed = true;
+        export_log(format!(
+            "multipart_complete_done output_path={} requests={} bytes={} elapsed_ms={}",
+            self.output_path, self.stats.requests, self.stats.bytes, finish_ms
+        ));
+        Ok(std::mem::take(&mut self.stats))
+    }
+
+    fn put_object(&mut self, body: Vec<u8>) -> Result<(), String> {
+        let bytes = body.len() as u64;
+        let start = std::time::Instant::now();
+        export_log(format!(
+            "put_object_start output_path={} bytes={}",
+            self.output_path, bytes
+        ));
+        global_runtime_with_threads(self.runtime_threads)?
+            .block_on(async {
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .body(body)
+                    .content_type("application/octet-stream")
+                    .send()
+                    .await
+            })
+            .map_err(|e| format!("OBS put_object failed for {}: {}", self.output_path, e))?;
+        let elapsed = elapsed_ms(start);
+        self.stats.requests += 1;
+        self.stats.bytes += bytes;
+        self.stats.write_ms += elapsed;
+        export_log(format!(
+            "put_object_done output_path={} bytes={} elapsed_ms={}",
+            self.output_path, bytes, elapsed
+        ));
+        Ok(())
+    }
+
+    fn ensure_multipart_upload(&mut self) -> Result<(), String> {
+        if self.upload_id.is_some() {
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
+        export_log(format!(
+            "multipart_initiate_start output_path={}",
+            self.output_path
+        ));
+        let initiate = global_runtime_with_threads(self.runtime_threads)?
+            .block_on(async {
+                self.client
+                    .initiate_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .content_type("application/octet-stream")
+                    .send()
+                    .await
+            })
+            .map_err(|e| {
+                format!(
+                    "OBS initiate_multipart_upload failed for {}: {}",
+                    self.output_path, e
+                )
+            })?;
+        let elapsed = elapsed_ms(start);
+        self.stats.requests += 1;
+        self.stats.write_ms += elapsed;
+        self.upload_id = Some(initiate.upload_id().to_string());
+        export_log(format!(
+            "multipart_initiate_done output_path={} elapsed_ms={}",
+            self.output_path, elapsed
+        ));
+        Ok(())
+    }
+
+    fn upload_part(&mut self, body: Vec<u8>) -> Result<(), String> {
+        if body.is_empty() {
+            return Ok(());
+        }
+        if self.next_part_number > 10000 {
+            return Err(format!(
+                "OBS multipart upload would exceed 10000 parts for {}",
+                self.output_path
+            ));
+        }
+        self.ensure_multipart_upload()?;
+        let upload_id = self
+            .upload_id
+            .clone()
+            .ok_or_else(|| "OBS multipart upload missing upload id".to_string())?;
+        let part_number = self.next_part_number;
+        let bytes = body.len() as u64;
+        let start = std::time::Instant::now();
+        export_log(format!(
+            "multipart_part_start output_path={} part={} bytes={}",
+            self.output_path, part_number, bytes
+        ));
+        let part = global_runtime_with_threads(self.runtime_threads)?
+            .block_on(async {
+                self.client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(body)
+                    .send()
+                    .await
+            })
+            .map_err(|e| {
+                format!(
+                    "OBS upload_part failed for {} part {}: {}",
+                    self.output_path, part_number, e
+                )
+            })?;
+        let elapsed = elapsed_ms(start);
+        self.stats.requests += 1;
+        self.stats.bytes += bytes;
+        self.stats.write_ms += elapsed;
+        self.completed_parts
+            .push(CompletedPart::new(part_number, part.etag()));
+        self.next_part_number += 1;
+        export_log(format!(
+            "multipart_part_done output_path={} part={} bytes={} elapsed_ms={}",
+            self.output_path, part_number, bytes, elapsed
+        ));
+        Ok(())
+    }
+
+    fn buffered_len(&self) -> usize {
+        self.buffer.buffered_len()
+    }
+
+    fn write_ms(&self) -> u64 {
+        self.stats.write_ms
+    }
+}
+
+impl Write for ObsMultipartWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_inner(buf).map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.write_inner(buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ObsMultipartWriter {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let Some(upload_id) = self.upload_id.take() else {
+            return;
+        };
+        export_log(format!(
+            "multipart_abort_start output_path={}",
+            self.output_path
+        ));
+        if let Ok(runtime) = global_runtime_with_threads(self.runtime_threads) {
+            let _ = runtime.block_on(async {
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+            });
+        }
+    }
+}
+
+impl ExportWriter {
+    fn write(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        match self {
+            ExportWriter::Local(writer) => writer.write(batch),
+            ExportWriter::Obs(writer) => writer.write(batch),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        match self {
+            ExportWriter::Local(writer) => writer.flush(),
+            ExportWriter::Obs(writer) => writer.flush(),
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    fn memory_size(&self) -> usize {
+        match self {
+            ExportWriter::Local(writer) => writer.memory_size(),
+            ExportWriter::Obs(writer) => writer.memory_size(),
+        }
+    }
+
+    fn in_progress_size(&self) -> usize {
+        match self {
+            ExportWriter::Local(writer) => writer.in_progress_size(),
+            ExportWriter::Obs(writer) => writer.in_progress_size(),
+        }
+    }
+
+    fn in_progress_rows(&self) -> usize {
+        match self {
+            ExportWriter::Local(writer) => writer.in_progress_rows(),
+            ExportWriter::Obs(writer) => writer.in_progress_rows(),
+        }
+    }
+
+    fn bytes_written(&self) -> usize {
+        match self {
+            ExportWriter::Local(writer) => writer.bytes_written(),
+            ExportWriter::Obs(writer) => writer.bytes_written(),
+        }
+    }
+
+    fn multipart_buffered_bytes(&self) -> usize {
+        match self {
+            ExportWriter::Local(_) => 0,
+            ExportWriter::Obs(writer) => writer.inner().buffered_len(),
+        }
+    }
+
+    fn obs_write_ms(&self) -> u64 {
+        match self {
+            ExportWriter::Local(_) => 0,
+            ExportWriter::Obs(writer) => writer.inner().write_ms(),
+        }
+    }
+
+    fn finish(self, local_output: Option<&str>) -> Result<FinishedExportOutput, String> {
+        match self {
+            ExportWriter::Local(writer) => {
+                let _file = writer.into_inner().map_err(|e| e.to_string())?;
+                let local_output =
+                    local_output.ok_or_else(|| "local export writer missing path".to_string())?;
+                let bytes = std::fs::metadata(local_output)
+                    .map_err(|e| e.to_string())?
+                    .len();
+                Ok(FinishedExportOutput {
+                    bytes,
+                    upload_stats: None,
+                })
+            }
+            ExportWriter::Obs(writer) => {
+                let obs_writer = writer.into_inner().map_err(|e| e.to_string())?;
+                let stats = obs_writer.complete()?;
+                let bytes = stats.bytes;
+                Ok(FinishedExportOutput {
+                    bytes,
+                    upload_stats: Some(stats),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct MultipartPartRange {
     part_number: i32,
@@ -1311,7 +1752,6 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             finish_export_writer(
                 writer,
                 &mut files_written,
-                &task.object_store_options,
                 &mut obs_write_requests,
                 &mut obs_write_bytes,
                 &mut encode_ms,
@@ -1436,7 +1876,6 @@ fn write_projected_export_batch(
             finish_export_writer(
                 finished,
                 files_written,
-                &task.object_store_options,
                 obs_write_requests,
                 obs_write_bytes,
                 encode_ms,
@@ -1455,13 +1894,13 @@ fn write_projected_export_batch(
             task.memory_limit_bytes,
             peak_buffered_bytes,
             encode_ms,
+            obs_write_ms,
         )?;
         if should_roll_export_writer(writer.as_ref().unwrap(), roll_limit) {
             let finished = writer.take().unwrap();
             finish_export_writer(
                 finished,
                 files_written,
-                &task.object_store_options,
                 obs_write_requests,
                 obs_write_bytes,
                 encode_ms,
@@ -1484,34 +1923,61 @@ fn create_export_writer(
     ordinal: usize,
 ) -> Result<ActiveExportWriter, String> {
     let output_path = output_part_path(&task.output_path, ordinal)?;
-    let local_output = local_output_path(&output_path)?;
-    export_log(format!(
-        "writer_create output_path={} local_output={}",
-        output_path, local_output
-    ));
-    if let Some(parent) = std::path::Path::new(&local_output).parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let writer_file = File::create(&local_output).map_err(|e| e.to_string())?;
-    let writer = ArrowWriter::try_new(
-        writer_file,
-        schema,
-        Some(
-            WriterProperties::builder()
-                .set_max_row_group_size(task.writer_row_group_size.max(1))
-                .set_write_batch_size(task.writer_batch_size.max(1))
-                .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                .build(),
-        ),
-    )
-    .map_err(|e| e.to_string())?;
+    let writer_properties = Some(
+        WriterProperties::builder()
+            .set_max_row_group_size(task.writer_row_group_size.max(1))
+            .set_write_batch_size(task.writer_batch_size.max(1))
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build(),
+    );
+    let (local_output, cleanup, writer) = if output_path.starts_with("obs://") {
+        export_log(format!(
+            "writer_create output_path={} mode=obs-streaming-multipart part_size={}",
+            output_path, task.multipart_part_size_bytes
+        ));
+        let obs_writer = ObsMultipartWriter::new(
+            &output_path,
+            &task.object_store_options,
+            task.multipart_part_size_bytes,
+            task.runtime_threads,
+            task.obs_request_timeout_ms,
+            task.obs_connect_timeout_ms,
+        )?;
+        let writer = ArrowWriter::try_new(obs_writer, schema, writer_properties)
+            .map_err(|e| e.to_string())?;
+        (
+            None,
+            TempFileCleanup {
+                path: String::new(),
+                enabled: false,
+            },
+            ExportWriter::Obs(writer),
+        )
+    } else {
+        let local_output = local_output_path(&output_path)?;
+        export_log(format!(
+            "writer_create output_path={} local_output={}",
+            output_path, local_output
+        ));
+        if let Some(parent) = std::path::Path::new(&local_output).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let writer_file = File::create(&local_output).map_err(|e| e.to_string())?;
+        let writer = ArrowWriter::try_new(writer_file, schema, writer_properties)
+            .map_err(|e| e.to_string())?;
+        (
+            Some(local_output),
+            TempFileCleanup {
+                path: String::new(),
+                enabled: false,
+            },
+            ExportWriter::Local(writer),
+        )
+    };
     Ok(ActiveExportWriter {
         output_path,
-        cleanup: TempFileCleanup {
-            path: local_output.clone(),
-            enabled: task.output_path.starts_with("obs://"),
-        },
         local_output,
+        cleanup,
         multipart_part_size_bytes: task.multipart_part_size_bytes,
         runtime_threads: task.runtime_threads,
         obs_request_timeout_ms: task.obs_request_timeout_ms,
@@ -1519,6 +1985,7 @@ fn create_export_writer(
         writer,
         rows: 0,
         buffered_bytes: 0,
+        reported_obs_write_ms: 0,
     })
 }
 
@@ -1528,27 +1995,35 @@ fn write_export_chunk(
     memory_limit_bytes: u64,
     peak_buffered_bytes: &mut u64,
     encode_ms: &mut u64,
+    obs_write_ms: &mut u64,
 ) -> Result<(), String> {
     let encode_start = std::time::Instant::now();
-    writer.writer.write(batch).map_err(|e| e.to_string())?;
+    writer.writer.write(batch)?;
     if writer.writer.memory_size() as u64 >= memory_limit_bytes {
-        writer.writer.flush().map_err(|e| e.to_string())?;
+        writer.writer.flush()?;
     }
-    *encode_ms += elapsed_ms(encode_start);
+    let elapsed = elapsed_ms(encode_start);
+    let obs_delta = writer
+        .writer
+        .obs_write_ms()
+        .saturating_sub(writer.reported_obs_write_ms);
+    writer.reported_obs_write_ms += obs_delta;
+    *obs_write_ms += obs_delta;
+    *encode_ms += elapsed.saturating_sub(obs_delta);
     writer.rows += batch.num_rows() as u64;
     writer.buffered_bytes = writer_buffered_bytes(writer);
     *peak_buffered_bytes = (*peak_buffered_bytes)
         .max(writer.buffered_bytes)
         .max(record_batch_memory_size(batch))
         .max(writer.writer.memory_size() as u64)
-        .max(writer.writer.in_progress_size() as u64);
+        .max(writer.writer.in_progress_size() as u64)
+        .max(writer.writer.multipart_buffered_bytes() as u64);
     Ok(())
 }
 
 fn finish_export_writer(
     writer: ActiveExportWriter,
     files_written: &mut Vec<Value>,
-    object_store_options: &HashMap<String, String>,
     obs_write_requests: &mut u64,
     obs_write_bytes: &mut u64,
     encode_ms: &mut u64,
@@ -1558,13 +2033,14 @@ fn finish_export_writer(
     let ActiveExportWriter {
         output_path,
         local_output,
-        multipart_part_size_bytes,
-        runtime_threads,
-        obs_request_timeout_ms,
-        obs_connect_timeout_ms,
+        multipart_part_size_bytes: _multipart_part_size_bytes,
+        runtime_threads: _runtime_threads,
+        obs_request_timeout_ms: _obs_request_timeout_ms,
+        obs_connect_timeout_ms: _obs_connect_timeout_ms,
         cleanup: _cleanup,
         writer,
         rows,
+        reported_obs_write_ms,
         ..
     } = writer;
     export_log(format!(
@@ -1572,42 +2048,26 @@ fn finish_export_writer(
         output_path, rows
     ));
     let encode_start = std::time::Instant::now();
-    writer.close().map_err(|e| e.to_string())?;
-    *encode_ms += elapsed_ms(encode_start);
-    let bytes = std::fs::metadata(&local_output)
-        .map_err(|e| e.to_string())?
-        .len();
-    if output_path.starts_with("obs://") {
-        let obs_start = std::time::Instant::now();
-        export_log(format!(
-            "upload_start output_path={} local_output={} bytes={}",
-            output_path, local_output, bytes
-        ));
-        let stats = upload_local_file_to_obs(
-            &local_output,
-            &output_path,
-            object_store_options,
-            multipart_part_size_bytes,
-            runtime_threads,
-            obs_request_timeout_ms,
-            obs_connect_timeout_ms,
-        )?;
-        *obs_write_ms += elapsed_ms(obs_start);
+    let finished = writer.finish(local_output.as_deref())?;
+    let elapsed = elapsed_ms(encode_start);
+    if let Some(stats) = finished.upload_stats {
+        let obs_delta = stats.write_ms.saturating_sub(reported_obs_write_ms);
+        *obs_write_ms += obs_delta;
         *obs_write_requests += stats.requests;
         *obs_write_bytes += stats.bytes;
         *multipart_finish_ms += stats.multipart_finish_ms;
+        *encode_ms += elapsed.saturating_sub(obs_delta);
         export_log(format!(
             "upload_done output_path={} requests={} bytes={} elapsed_ms={}",
-            output_path,
-            stats.requests,
-            stats.bytes,
-            elapsed_ms(obs_start)
+            output_path, stats.requests, stats.bytes, stats.write_ms
         ));
+    } else {
+        *encode_ms += elapsed;
     }
     files_written.push(serde_json::json!({
         "path": output_path,
         "rows": rows,
-        "bytes": bytes
+        "bytes": finished.bytes
     }));
     Ok(())
 }
@@ -1636,7 +2096,9 @@ fn writer_estimated_output_bytes(writer: &ActiveExportWriter) -> u64 {
 }
 
 fn writer_buffered_bytes(writer: &ActiveExportWriter) -> u64 {
-    (writer.writer.memory_size() as u64).max(writer.writer.in_progress_size() as u64)
+    (writer.writer.memory_size() as u64)
+        .max(writer.writer.in_progress_size() as u64)
+        .max(writer.writer.multipart_buffered_bytes() as u64)
 }
 
 fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
@@ -1981,50 +2443,7 @@ fn local_output_path(path: &str) -> Result<String, String> {
         .to_string())
 }
 
-fn upload_local_file_to_obs(
-    local_path: &str,
-    output_path: &str,
-    options: &HashMap<String, String>,
-    multipart_part_size_bytes: u64,
-    runtime_threads: usize,
-    request_timeout_ms: u64,
-    connect_timeout_ms: u64,
-) -> Result<UploadStats, String> {
-    let (bucket, key) = parse_obs_prefix(output_path)?;
-    let bytes = std::fs::metadata(local_path)
-        .map_err(|e| e.to_string())?
-        .len();
-    let client = build_obs_client_with_timeouts(options, request_timeout_ms, connect_timeout_ms)?;
-    if bytes <= multipart_part_size_bytes {
-        let body = std::fs::read(local_path).map_err(|e| e.to_string())?;
-        global_runtime_with_threads(runtime_threads)?.block_on(async {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(body)
-                .content_type("application/octet-stream")
-                .send()
-                .await
-                .map_err(|e| format!("OBS put_object failed for {}: {}", output_path, e))
-                .map(|_| UploadStats {
-                    requests: 1,
-                    bytes,
-                    multipart_finish_ms: 0,
-                })
-        })
-    } else {
-        upload_local_file_to_obs_multipart(
-            local_path,
-            &bucket,
-            &key,
-            client,
-            multipart_part_size_bytes,
-            runtime_threads,
-        )
-    }
-}
-
+#[cfg(test)]
 fn multipart_part_ranges(
     file_size: u64,
     multipart_part_size_bytes: u64,
@@ -2051,108 +2470,6 @@ fn multipart_part_ranges(
         part_number += 1;
     }
     Ok(ranges)
-}
-
-fn read_local_file_range(file: &mut File, offset: u64, length: usize) -> Result<Vec<u8>, String> {
-    let mut body = vec![0u8; length];
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| e.to_string())?;
-    file.read_exact(&mut body).map_err(|e| e.to_string())?;
-    Ok(body)
-}
-
-fn upload_local_file_to_obs_multipart(
-    local_path: &str,
-    bucket: &str,
-    key: &str,
-    client: Client,
-    multipart_part_size_bytes: u64,
-    runtime_threads: usize,
-) -> Result<UploadStats, String> {
-    let ranges = multipart_part_ranges(
-        std::fs::metadata(local_path)
-            .map_err(|e| e.to_string())?
-            .len(),
-        multipart_part_size_bytes,
-    )?;
-    global_runtime_with_threads(runtime_threads)?.block_on(async {
-        let initiate = client
-            .initiate_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .content_type("application/octet-stream")
-            .send()
-            .await
-            .map_err(|e| {
-                format!(
-                    "OBS initiate_multipart_upload failed for obs://{}/{}: {}",
-                    bucket, key, e
-                )
-            })?;
-        let upload_id = initiate.upload_id().to_string();
-        let mut stats = UploadStats {
-            requests: 1,
-            bytes: 0,
-            multipart_finish_ms: 0,
-        };
-
-        let upload_result = async {
-            let mut file = File::open(local_path).map_err(|e| e.to_string())?;
-            let mut completed_parts = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                let body = read_local_file_range(&mut file, range.offset, range.length)?;
-                let part = client
-                    .upload_part()
-                    .bucket(bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .part_number(range.part_number)
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "OBS upload_part failed for obs://{}/{} part {}: {}",
-                            bucket, key, range.part_number, e
-                        )
-                    })?;
-                stats.requests += 1;
-                stats.bytes += range.length as u64;
-                completed_parts.push(CompletedPart::new(range.part_number, part.etag()));
-            }
-
-            let finish_start = std::time::Instant::now();
-            client
-                .complete_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .parts(completed_parts)
-                .send()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "OBS complete_multipart_upload failed for obs://{}/{}: {}",
-                        bucket, key, e
-                    )
-                })?;
-            stats.requests += 1;
-            stats.multipart_finish_ms += elapsed_ms(finish_start);
-            Ok(stats)
-        }
-        .await;
-
-        if upload_result.is_err() {
-            let _ = client
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .send()
-                .await;
-        }
-        upload_result
-    })
 }
 
 #[unsafe(no_mangle)]
@@ -2470,6 +2787,41 @@ mod tests {
     }
 
     #[test]
+    fn streaming_multipart_buffer_emits_full_parts_before_finish() {
+        let mut buffer = MultipartWriteBuffer::new(5).unwrap();
+        let mut parts = Vec::new();
+
+        buffer
+            .write_bytes(b"abc", |part| {
+                parts.push(part);
+                Ok(())
+            })
+            .unwrap();
+        assert!(parts.is_empty());
+        assert_eq!(buffer.buffered_len(), 3);
+
+        buffer
+            .write_bytes(b"defghijk", |part| {
+                parts.push(part);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(parts, vec![b"abcde".to_vec(), b"fghij".to_vec()]);
+        assert_eq!(buffer.buffered_len(), 1);
+
+        buffer
+            .finish(|part| {
+                parts.push(part);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            parts,
+            vec![b"abcde".to_vec(), b"fghij".to_vec(), b"k".to_vec()]
+        );
+    }
+
+    #[test]
     fn native_export_rejects_invalid_multipart_part_size() {
         let request = serde_json::json!({
             "request_version": 1,
@@ -2653,7 +3005,9 @@ mod tests {
         assert_eq!(writer.runtime_threads, 7);
         assert_eq!(writer.obs_request_timeout_ms, 45_000);
         assert_eq!(writer.obs_connect_timeout_ms, 12_000);
-        let _ = std::fs::remove_file(writer.local_output);
+        if let Some(local_output) = writer.local_output {
+            let _ = std::fs::remove_file(local_output);
+        }
         let _ = std::fs::remove_dir_all(output_dir);
     }
 
