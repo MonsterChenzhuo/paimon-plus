@@ -439,6 +439,14 @@ public class CoreOptions implements Serializable {
                     .defaultValue(true)
                     .withDescription("Whether native export should return and log task metrics.");
 
+    public static final ConfigOption<Integer> NATIVE_IO_EXPORT_MAX_PROJECTED_FIELDS =
+            key("native-io.export.max-projected-fields")
+                    .intType()
+                    .defaultValue(5000)
+                    .withDescription(
+                            "Maximum projected field count allowed for native export. "
+                                    + "Wider projections fall back to the Java streaming export path when fallback is enabled.");
+
     public static final ConfigOption<MemorySize> NATIVE_IO_EXPORT_OBS_READ_BUFFER_SIZE =
             key("native-io.export.obs.read-buffer-size")
                     .memoryType()

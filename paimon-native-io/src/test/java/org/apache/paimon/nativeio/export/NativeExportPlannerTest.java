@@ -81,6 +81,37 @@ class NativeExportPlannerTest {
     }
 
     @Test
+    void rejectsVeryWideProjectionSoSparkProcedureFallsBackToJavaStreaming() {
+        Options options = validOptions();
+        options.setString("native-io.export.max-projected-fields", "3");
+
+        NativeExportPreflightResult result =
+                new NativeExportPlanner()
+                        .preflight(
+                                new NativeExportContext(
+                                        options,
+                                        "obs://bucket/out",
+                                        "zstd",
+                                        536870912L,
+                                        Arrays.asList("c0", "c1", "c2", "c3"),
+                                        1,
+                                        Collections.singletonList(
+                                                new NativeExportSourceFile(
+                                                        "obs://bucket/table/file.parquet",
+                                                        "parquet",
+                                                        1,
+                                                        128,
+                                                        0,
+                                                        Collections.emptyMap(),
+                                                        Collections.emptyList())),
+                                        null));
+
+        assertThat(result.applicable()).isFalse();
+        assertThat(result.reason().name()).isEqualTo("EXPORT_WIDE_SCHEMA");
+        assertThat(result.detail()).contains("projected_fields=4").contains("max=3");
+    }
+
+    @Test
     void rejectsObsOutputPathWithQueryOrFragment() {
         NativeExportPreflightResult queryResult =
                 new NativeExportPlanner()

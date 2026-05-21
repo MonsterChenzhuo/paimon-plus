@@ -55,6 +55,16 @@ public final class NativeExportPlanner {
         if (!config.applicable()) {
             return NativeExportPreflightResult.rejected(config.reason(), config.detail());
         }
+        int projectedFields = context.projectedFieldNames().size();
+        int maxProjectedFields = exportOptions.maxProjectedFields();
+        if (projectedFields > maxProjectedFields) {
+            return NativeExportPreflightResult.rejected(
+                    NativeRejectReason.EXPORT_WIDE_SCHEMA,
+                    "native export falls back to Java streaming for wide projections: projected_fields="
+                            + projectedFields
+                            + ", max="
+                            + maxProjectedFields);
+        }
         if (!"zstd".equalsIgnoreCase(context.compression())) {
             return NativeExportPreflightResult.rejected(
                     NativeRejectReason.EXPORT_UNSUPPORTED_COMPRESSION,

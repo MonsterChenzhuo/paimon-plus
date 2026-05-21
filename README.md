@@ -59,11 +59,14 @@ SET spark.paimon.native-io.max-batch-bytes='64 MB';
 SET spark.paimon.native-io.enabled=true;
 SET spark.paimon.native-io.export.enabled=true;
 SET spark.paimon.native-io.export.metrics.enabled=true;
+SET spark.paimon.native-io.export.max-projected-fields=5000;
 SET spark.paimon.native-io.export.memory-limit='512 MB';
 SET spark.paimon.native-io.export.fail-on-fallback=true;
 ```
 
 默认 `spark.paimon.native-io.export.fallback.enabled=true`，driver preflight 不适用时会回退 Java export。压测或验收 native fast path 时建议设置 `spark.paimon.native-io.export.fail-on-fallback=true`，这样未命中 native 会直接抛出 reject reason，便于确认是否真正走到 native。
+
+对于 5000 列以上的超宽投影，native export 默认会在 driver preflight 阶段以 `EXPORT_WIDE_SCHEMA` 拒绝，并回退到 Java `RecordReader` 流式 export 路径，避免 Rust Arrow/Parquet reader 在单个超宽 row group 上长时间 materialize 列向量。该阈值可通过 `spark.paimon.native-io.export.max-projected-fields` 调整。
 
 Native IO 设计入口：
 

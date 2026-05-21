@@ -34,6 +34,7 @@ class NativeExportOptionsTest {
         assertThat(options.fallbackEnabled()).isTrue();
         assertThat(options.failOnFallback()).isFalse();
         assertThat(options.metricsEnabled()).isTrue();
+        assertThat(options.maxProjectedFields()).isEqualTo(5000);
         assertThat(options.readBufferSizeBytes()).isEqualTo(8L * 1024 * 1024);
         assertThat(options.readConcurrency()).isEqualTo(4);
         assertThat(options.obsRequestTimeoutMillis()).isEqualTo(30000L);
@@ -50,6 +51,12 @@ class NativeExportOptionsTest {
     void validatesExportTunables() {
         Options raw = new Options();
         raw.setString("native-io.export.enabled", "true");
+
+        raw.setString("native-io.export.max-projected-fields", "0");
+        assertThat(NativeExportOptions.from(raw).valid().detail())
+                .contains("native-io.export.max-projected-fields");
+
+        raw.setString("native-io.export.max-projected-fields", "5000");
         raw.setString("native-io.export.obs.read-buffer-size", "0 b");
 
         assertThat(NativeExportOptions.from(raw).valid().applicable()).isFalse();

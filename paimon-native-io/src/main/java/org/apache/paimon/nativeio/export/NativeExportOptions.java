@@ -42,6 +42,8 @@ public final class NativeExportOptions {
     private static final long MAX_MEMORY_LIMIT_BYTES = 16L * 1024 * 1024 * 1024;
     private static final int MIN_RUNTIME_THREADS = 1;
     private static final int MAX_RUNTIME_THREADS = 64;
+    private static final int MIN_MAX_PROJECTED_FIELDS = 1;
+    private static final int MAX_MAX_PROJECTED_FIELDS = 65536;
 
     private final Options options;
 
@@ -67,6 +69,10 @@ public final class NativeExportOptions {
 
     public boolean metricsEnabled() {
         return options.get(CoreOptions.NATIVE_IO_EXPORT_METRICS_ENABLED);
+    }
+
+    public int maxProjectedFields() {
+        return options.get(CoreOptions.NATIVE_IO_EXPORT_MAX_PROJECTED_FIELDS);
     }
 
     public long readBufferSizeBytes() {
@@ -113,6 +119,11 @@ public final class NativeExportOptions {
         if (!enabled()) {
             return NativeApplicability.rejected(
                     NativeRejectReason.EXPORT_DISABLED, "native export is disabled");
+        }
+        int maxProjectedFields = maxProjectedFields();
+        if (maxProjectedFields < MIN_MAX_PROJECTED_FIELDS
+                || maxProjectedFields > MAX_MAX_PROJECTED_FIELDS) {
+            return invalid("native-io.export.max-projected-fields must be between 1 and 65536");
         }
         long readBufferSizeBytes = readBufferSizeBytes();
         if (readBufferSizeBytes < MIN_READ_BUFFER_BYTES
