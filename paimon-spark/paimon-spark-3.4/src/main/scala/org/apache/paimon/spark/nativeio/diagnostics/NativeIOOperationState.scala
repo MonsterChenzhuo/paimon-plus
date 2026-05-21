@@ -1,0 +1,62 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.paimon.spark.nativeio.diagnostics
+
+import org.apache.paimon.operation.nativeio.diagnostics.NativeIOPhase
+
+case class NativeIOOperationState(
+    operationId: String,
+    operationName: String,
+    startTime: Long,
+    lastEventTime: Long,
+    currentPhase: Option[NativeIOPhase] = None,
+    phaseStartTime: Option[Long] = None,
+    sqlExecutionId: Option[Long] = None,
+    stageId: Option[Int] = None,
+    stageAttemptId: Option[Int] = None,
+    taskAttemptId: Option[Long] = None,
+    taskIndex: Option[Int] = None,
+    attemptNumber: Option[Int] = None,
+    executorId: Option[String] = None,
+    host: Option[String] = None,
+    threadId: Option[Long] = None,
+    filePath: Option[String] = None,
+    outputPath: Option[String] = None,
+    objectRequestId: Option[String] = None,
+    objectOperation: Option[String] = None,
+    rows: Option[Long] = None,
+    bytes: Option[Long] = None,
+    queueDepth: Option[Int] = None,
+    runtimeThreads: Option[Int] = None,
+    nativeMemoryBytes: Option[Long] = None,
+    peakBufferedBytes: Option[Long] = None,
+    metricsJson: Option[String] = None,
+    errorClass: Option[String] = None,
+    errorMessage: Option[String] = None,
+    stackTrace: Option[String] = None,
+    completed: Boolean = false,
+    eventCount: Int = 0) {
+
+  def phaseElapsedMs(now: Long): Long = {
+    phaseStartTime.map(start => math.max(0L, now - start)).getOrElse(0L)
+  }
+
+  def elapsedMs(now: Long): Long = math.max(0L, now - startTime)
+}

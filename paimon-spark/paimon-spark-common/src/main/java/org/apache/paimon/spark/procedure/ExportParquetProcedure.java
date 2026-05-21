@@ -345,6 +345,7 @@ public class ExportParquetProcedure extends BaseProcedure {
     private long nativeExport(
             NativeExportProvider provider, NativeExportContext context, int parallelism)
             throws Exception {
+        installNativeIODiagnostics();
         NativeExportPlanDescriptor plan = provider.plan(context);
         List<byte[]> taskPayloads = plan.taskPayloads();
         LOG.info(
@@ -373,6 +374,21 @@ public class ExportParquetProcedure extends BaseProcedure {
                 rows,
                 results.size());
         return rows;
+    }
+
+    private void installNativeIODiagnostics() {
+        try {
+            Class<?> diagnostics =
+                    Class.forName(
+                            "org.apache.paimon.spark.nativeio.diagnostics.NativeIODiagnostics",
+                            true,
+                            Thread.currentThread().getContextClassLoader());
+            diagnostics
+                    .getMethod("install", org.apache.spark.sql.SparkSession.class)
+                    .invoke(null, spark());
+        } catch (Throwable e) {
+            LOG.debug("Native IO Spark UI diagnostics are not available.", e);
+        }
     }
 
     static int nativeTaskCount(int parallelism, int taskCount) {
