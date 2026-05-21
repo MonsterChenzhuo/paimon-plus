@@ -22,7 +22,9 @@ import org.apache.paimon.format.FormatReaderFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceConfigurationError;
@@ -32,7 +34,7 @@ import java.util.WeakHashMap;
 /** ClassLoader-safe loader for optional native format reader providers. */
 public final class NativeFormatReaderFactoryProviderLoader {
 
-    private static final Map<ClassLoader, Optional<NativeFormatReaderFactoryProvider>> CACHE =
+    private static final Map<ClassLoader, List<NativeFormatReaderFactoryProvider>> CACHE =
             Collections.synchronizedMap(new WeakHashMap<>());
 
     private NativeFormatReaderFactoryProviderLoader() {}
@@ -42,53 +44,54 @@ public final class NativeFormatReaderFactoryProviderLoader {
         if (context == null) {
             return Optional.empty();
         }
-        Optional<NativeFormatReaderFactoryProvider> provider = loadProvider();
-        if (!provider.isPresent()) {
-            return Optional.empty();
+        for (NativeFormatReaderFactoryProvider provider : loadProviders()) {
+            try {
+                Optional<FormatReaderFactory> readerFactory = provider.create(context);
+                if (readerFactory != null && readerFactory.isPresent()) {
+                    return readerFactory;
+                }
+            } catch (LinkageError | RuntimeException e) {
+                // Try the next provider. Native IO is optional and must not break Java reads.
+            }
         }
-        try {
-            Optional<FormatReaderFactory> readerFactory = provider.get().create(context);
-            return readerFactory == null ? Optional.empty() : readerFactory;
-        } catch (LinkageError | RuntimeException e) {
-            return Optional.empty();
-        }
+        return Optional.empty();
     }
 
-    private static Optional<NativeFormatReaderFactoryProvider> loadProvider() {
+    private static List<NativeFormatReaderFactoryProvider> loadProviders() {
         ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
         ClassLoader ownClassLoader = NativeFormatReaderFactoryProviderLoader.class.getClassLoader();
 
         if (contextClassLoader != null) {
-            Optional<NativeFormatReaderFactoryProvider> provider = loadProvider(contextClassLoader);
-            if (provider.isPresent() || contextClassLoader == ownClassLoader) {
-                return provider;
+            List<NativeFormatReaderFactoryProvider> providers = loadProviders(contextClassLoader);
+            if (!providers.isEmpty() || contextClassLoader == ownClassLoader) {
+                return providers;
             }
         }
-        return loadProvider(ownClassLoader);
+        return loadProviders(ownClassLoader);
     }
 
-    private static Optional<NativeFormatReaderFactoryProvider> loadProvider(
-            ClassLoader classLoader) {
-        Optional<NativeFormatReaderFactoryProvider> cached = CACHE.get(classLoader);
+    private static List<NativeFormatReaderFactoryProvider> loadProviders(ClassLoader classLoader) {
+        List<NativeFormatReaderFactoryProvider> cached = CACHE.get(classLoader);
         if (cached != null) {
             return cached;
         }
-        Optional<NativeFormatReaderFactoryProvider> loaded = discoverProvider(classLoader);
+        List<NativeFormatReaderFactoryProvider> loaded = discoverProviders(classLoader);
         CACHE.put(classLoader, loaded);
         return loaded;
     }
 
-    private static Optional<NativeFormatReaderFactoryProvider> discoverProvider(
+    private static List<NativeFormatReaderFactoryProvider> discoverProviders(
             ClassLoader classLoader) {
         try {
             ServiceLoader<NativeFormatReaderFactoryProvider> loader =
                     ServiceLoader.load(NativeFormatReaderFactoryProvider.class, classLoader);
+            List<NativeFormatReaderFactoryProvider> providers = new ArrayList<>();
             for (NativeFormatReaderFactoryProvider provider : loader) {
-                return Optional.of(provider);
+                providers.add(provider);
             }
-            return Optional.empty();
+            return providers;
         } catch (ServiceConfigurationError | LinkageError | RuntimeException e) {
-            return Optional.empty();
+            return Collections.emptyList();
         }
     }
 }

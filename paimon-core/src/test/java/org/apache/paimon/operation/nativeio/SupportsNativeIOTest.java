@@ -31,6 +31,7 @@ import org.apache.paimon.types.VarCharType;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 class SupportsNativeIOTest {
 
@@ -67,7 +68,7 @@ class SupportsNativeIOTest {
     }
 
     @Test
-    void rejectsNativeFileWithoutObsPathOrConfig() {
+    void rejectsNativeFileWithoutObsPath() {
         DataFileMeta file = DataFileTestUtils.newFile("data.parquet", 0, 1, 1, 1, 0L);
         Options raw = enabledSparkOptions();
 
@@ -81,6 +82,15 @@ class SupportsNativeIOTest {
                         new Path("file:/tmp/data.parquet"));
         assertThat(localPath.applicable()).isFalse();
         assertThat(localPath.reason()).isEqualTo(NativeRejectReason.NON_OBS_PATH);
+    }
+
+    @Test
+    void rejectsNativeFileWithoutObsConfigWhenEnvironmentDoesNotProvideIt() {
+        DataFileMeta file = DataFileTestUtils.newFile("data.parquet", 0, 1, 1, 1, 0L);
+        Options raw = enabledSparkOptions();
+        NativeIOOptions options = NativeIOOptions.from(raw);
+
+        assumeFalse(options.hasRequiredObsConfig());
 
         NativeApplicability missingConfig =
                 SupportsNativeIO.checkNativeFile(
@@ -88,7 +98,7 @@ class SupportsNativeIOTest {
                         null,
                         RowType.of(new IntType()),
                         false,
-                        NativeIOOptions.from(raw),
+                        options,
                         new Path("obs://bucket/data.parquet"));
         assertThat(missingConfig.applicable()).isFalse();
         assertThat(missingConfig.reason()).isEqualTo(NativeRejectReason.MISSING_OBS_CONFIG);

@@ -22,14 +22,11 @@ import org.apache.paimon.format.FormatReaderFactory;
 
 import java.util.Optional;
 
-/** Test ServiceLoader provider for {@link NativeFormatReaderFactoryProviderLoaderTest}. */
-public class TestNativeFormatReaderFactoryProvider implements NativeFormatReaderFactoryProvider {
+/** Empty test ServiceLoader provider for {@link NativeFormatReaderFactoryProviderLoaderTest}. */
+public class EmptyNativeFormatReaderFactoryProvider implements NativeFormatReaderFactoryProvider {
 
     @Override
     public Optional<FormatReaderFactory> create(NativeFormatReaderContext context) {
-        if (!context.actualDataPath().toString().contains("__native_format_provider_test__")) {
-            return Optional.empty();
-        }
-        return Optional.of(context1 -> null);
+        return Optional.empty();
     }
 }

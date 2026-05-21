@@ -1,1 +1,2 @@
+org.apache.paimon.operation.nativeio.EmptyNativeFormatReaderFactoryProvider
 org.apache.paimon.operation.nativeio.TestNativeFormatReaderFactoryProvider

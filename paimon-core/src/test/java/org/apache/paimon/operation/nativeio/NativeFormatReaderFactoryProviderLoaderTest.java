@@ -51,7 +51,28 @@ class NativeFormatReaderFactoryProviderLoaderTest {
         }
     }
 
+    @Test
+    void triesNextProviderWhenFirstProviderReturnsEmpty() {
+        assertThat(NativeFormatReaderFactoryProviderLoader.tryCreate(testContext())).isPresent();
+    }
+
+    @Test
+    void testProviderDoesNotMatchRegularReadContexts() {
+        assertThat(NativeFormatReaderFactoryProviderLoader.tryCreate(regularContext())).isEmpty();
+    }
+
     private static NativeFormatReaderContext testContext() {
+        return new NativeFormatReaderContext(
+                DataFileTestUtils.newFile("data.parquet", 0, 1, 1, 1, 0L),
+                RowType.of(DataTypes.INT()),
+                false,
+                false,
+                NativeIOOptions.from(new Options()),
+                new Path("obs://bucket/__native_format_provider_test__/data.parquet"),
+                NativeApplicabilityReporter.NO_OP);
+    }
+
+    private static NativeFormatReaderContext regularContext() {
         return new NativeFormatReaderContext(
                 DataFileTestUtils.newFile("data.parquet", 0, 1, 1, 1, 0L),
                 RowType.of(DataTypes.INT()),
