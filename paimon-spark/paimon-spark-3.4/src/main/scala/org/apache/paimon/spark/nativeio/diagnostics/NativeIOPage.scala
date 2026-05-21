@@ -112,6 +112,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
             <th>{title}</th>
             <th>Active</th>
             <th>Max Elapsed</th>
+            <th>Max Last Event Age</th>
             <th>Executors</th>
             <th>Current Phase / Status</th>
           </tr>
@@ -123,6 +124,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
                 <td>{key}</td>
                 <td>{states.size}</td>
                 <td>{formatDuration(states.map(_.stuckElapsedMs(now)).foldLeft(0L)(math.max))}</td>
+                <td>{formatDuration(states.map(state => math.max(0L, now - state.lastEventTime)).foldLeft(0L)(math.max))}</td>
                 <td>{states.flatMap(_.executorId).distinct.sorted.mkString(", ")}</td>
                 <td>{states.map(_.phaseOrStatus).distinct.sorted.mkString(", ")}</td>
               </tr>
@@ -150,16 +152,19 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
             <th>Elapsed</th>
             <th>Last Event Age</th>
             <th>Diagnosis</th>
+            <th>Runtime</th>
+            <th>Native Memory</th>
             <th>File</th>
             <th>Object Request</th>
             <th>Rows</th>
             <th>Bytes</th>
+            <th>Details</th>
             <th>Error</th>
           </tr>
         </thead>
         <tbody>
           {if (operations.isEmpty) {
-            <tr><td colspan="14">No data</td></tr>
+            <tr><td colspan="17">No data</td></tr>
           } else {
             operations.map(operationRow(_, now))
           }}
@@ -179,10 +184,13 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       <td>{formatDuration(state.stuckElapsedMs(now))}</td>
       <td>{formatDuration(math.max(0L, now - state.lastEventTime))}</td>
       <td>{state.diagnosis}</td>
+      <td>{runtimeDetails(state)}</td>
+      <td>{memoryDetails(state)}</td>
       <td>{state.filePath.getOrElse(state.outputPath.getOrElse("-"))}</td>
       <td>{state.objectOperation.getOrElse("-")}<br/><small>{state.objectRequestId.getOrElse("-")}</small></td>
       <td>{state.rows.map(_.toString).getOrElse("-")}</td>
       <td>{state.bytes.map(formatBytes).getOrElse("-")}</td>
+      <td>{state.metricsJson.map(truncate).getOrElse("-")}</td>
       <td>{state.errorMessage.getOrElse("-")}</td>
     </tr>
   }
@@ -226,9 +234,13 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       "object" -> option(event.objectOperation()),
       "request" -> option(event.objectRequestId()),
       "duration" -> option(event.durationMs()).map(value => formatDuration(value.longValue())),
+      "rows" -> option(event.rows()).map(_.toString),
+      "bytes" -> option(event.bytes()).map(value => formatBytes(value.longValue())),
       "queueDepth" -> option(event.queueDepth()).map(_.toString),
       "runtimeThreads" -> option(event.runtimeThreads()).map(_.toString),
       "nativeMemory" -> option(event.nativeMemoryBytes()).map(value => formatBytes(value.longValue())),
+      "peakBuffered" -> option(event.peakBufferedBytes()).map(value => formatBytes(value.longValue())),
+      "metrics" -> option(event.metricsJson()).map(truncate),
       "error" -> option(event.errorMessage()))
       .flatMap {
         case (name, Some(value)) => Some(name + "=" + value)
@@ -278,6 +290,44 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       None
     } else {
       Some(value)
+    }
+  }
+
+  private def runtimeDetails(state: NativeIOOperationState): NodeSeq = {
+    val values = Seq(
+      "threads" -> state.runtimeThreads.map(_.toString),
+      "queueDepth" -> state.queueDepth.map(_.toString))
+      .flatMap {
+        case (name, Some(value)) => Some(name + "=" + value)
+        case _ => None
+      }
+    if (values.isEmpty) {
+      Text("-")
+    } else {
+      Text(values.mkString(", "))
+    }
+  }
+
+  private def memoryDetails(state: NativeIOOperationState): NodeSeq = {
+    val values = Seq(
+      "native" -> state.nativeMemoryBytes.map(formatBytes),
+      "peakBuffered" -> state.peakBufferedBytes.map(formatBytes))
+      .flatMap {
+        case (name, Some(value)) => Some(name + "=" + value)
+        case _ => None
+      }
+    if (values.isEmpty) {
+      Text("-")
+    } else {
+      Text(values.mkString(", "))
+    }
+  }
+
+  private def truncate(value: String): String = {
+    if (value.length <= 240) {
+      value
+    } else {
+      value.substring(0, 240) + "...(truncated)"
     }
   }
 }

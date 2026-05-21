@@ -6,7 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{
@@ -65,6 +65,95 @@ const DEFAULT_OBS_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_OBS_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 static GLOBAL_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+type NativeDiagnosticsCallback = Option<unsafe extern "C" fn(event_json: *const c_char)>;
+
+struct NativeExportDiagnostics {
+    operation_id: String,
+    callback: NativeDiagnosticsCallback,
+    output_path: Option<String>,
+    runtime_threads: Option<usize>,
+    sequence: u64,
+}
+
+#[derive(Default)]
+struct NativeDiagnosticEvent<'a> {
+    event_type: &'a str,
+    phase: Option<&'a str>,
+    file_path: Option<&'a str>,
+    object_operation: Option<&'a str>,
+    duration_ms: Option<u64>,
+    rows: Option<u64>,
+    bytes: Option<u64>,
+    queue_depth: Option<usize>,
+    native_memory_bytes: Option<u64>,
+    peak_buffered_bytes: Option<u64>,
+    metrics_json: Option<String>,
+}
+
+impl NativeExportDiagnostics {
+    fn disabled() -> Self {
+        Self {
+            operation_id: "native-export-parquet-disabled".to_string(),
+            callback: None,
+            output_path: None,
+            runtime_threads: None,
+            sequence: 0,
+        }
+    }
+
+    fn new(operation_id: String, callback: NativeDiagnosticsCallback) -> Self {
+        Self {
+            operation_id,
+            callback,
+            output_path: None,
+            runtime_threads: None,
+            sequence: 0,
+        }
+    }
+
+    fn set_task_context(&mut self, task: &ExportTask) {
+        self.output_path = Some(task.output_path.clone());
+        self.runtime_threads = Some(task.runtime_threads);
+    }
+
+    fn emit(&mut self, event: NativeDiagnosticEvent<'_>) {
+        let Some(callback) = self.callback else {
+            return;
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        let event_id = format!("{}-native-{}", self.operation_id, self.sequence);
+        let object_request_id = event
+            .object_operation
+            .map(|operation| format!("{}-{}-{}", self.operation_id, operation, self.sequence));
+        let payload = serde_json::json!({
+            "version": 1,
+            "event_id": event_id,
+            "event_time": current_time_millis(),
+            "event_type": event.event_type,
+            "operation_id": self.operation_id,
+            "operation_name": "native-export-parquet",
+            "phase": event.phase,
+            "file_path": event.file_path,
+            "output_path": self.output_path,
+            "object_request_id": object_request_id,
+            "object_operation": event.object_operation,
+            "duration_ms": event.duration_ms,
+            "rows": event.rows,
+            "bytes": event.bytes,
+            "queue_depth": event.queue_depth,
+            "runtime_threads": self.runtime_threads,
+            "native_memory_bytes": event.native_memory_bytes,
+            "peak_buffered_bytes": event.peak_buffered_bytes,
+            "metrics_json": event.metrics_json,
+        });
+        if let Ok(json) = CString::new(payload.to_string()) {
+            unsafe {
+                callback(json.as_ptr());
+            }
+        }
+    }
+}
 
 #[repr(C)]
 pub struct ReaderConfig {
@@ -1586,6 +1675,10 @@ impl ObsMultipartWriter {
     fn write_ms(&self) -> u64 {
         self.stats.write_ms
     }
+
+    fn inflight_part_count(&self) -> usize {
+        self.inflight_parts.len()
+    }
 }
 
 fn multipart_max_inflight_parts(
@@ -1699,6 +1792,13 @@ impl ExportWriter {
         }
     }
 
+    fn multipart_inflight_parts(&self) -> usize {
+        match self {
+            ExportWriter::Local(_) => 0,
+            ExportWriter::Obs(writer) => writer.inner().inflight_part_count(),
+        }
+    }
+
     fn obs_write_ms(&self) -> u64 {
         match self {
             ExportWriter::Local(_) => 0,
@@ -1777,7 +1877,26 @@ fn string_field(value: &Value, name: &str) -> Result<String, String> {
 }
 
 fn export_parquet(request_json: &str) -> Result<String, String> {
+    let mut diagnostics = NativeExportDiagnostics::disabled();
+    export_parquet_with_diagnostics(request_json, &mut diagnostics)
+}
+
+fn export_parquet_with_diagnostics(
+    request_json: &str,
+    diagnostics: &mut NativeExportDiagnostics,
+) -> Result<String, String> {
     let task = parse_export_task(request_json)?;
+    diagnostics.set_task_context(&task);
+    diagnostics.emit(NativeDiagnosticEvent {
+        event_type: "REQUEST_PARSED",
+        phase: Some("PLAN"),
+        metrics_json: Some(format!(
+            "{{\"files\":{},\"projection\":{}}}",
+            task.files.len(),
+            task.projection.len()
+        )),
+        ..Default::default()
+    });
     validate_export_task_options(&task)?;
     if !task.compression.eq_ignore_ascii_case("zstd") {
         return Err(format!("UNSUPPORTED_COMPRESSION: {}", task.compression));
@@ -1823,17 +1942,38 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             "file_start ordinal={} path={}",
             file_ordinal, file.path
         ));
+        diagnostics.emit(NativeDiagnosticEvent {
+            event_type: "FILE_START",
+            phase: Some("OPEN_READER"),
+            file_path: Some(&file.path),
+            ..Default::default()
+        });
         let reader_start = std::time::Instant::now();
+        diagnostics.emit(NativeDiagnosticEvent {
+            event_type: "PHASE_START",
+            phase: Some("OPEN_READER"),
+            file_path: Some(&file.path),
+            object_operation: Some("open_reader"),
+            ..Default::default()
+        });
         let (schema, mut export_reader) = build_export_reader(
             file,
             &task,
             task.writer_batch_size,
             &task.object_store_options,
         )?;
+        let reader_elapsed_ms = elapsed_ms(reader_start);
+        diagnostics.emit(NativeDiagnosticEvent {
+            event_type: "READER_READY",
+            phase: Some("READ"),
+            file_path: Some(&file.path),
+            object_operation: Some("open_reader"),
+            duration_ms: Some(reader_elapsed_ms),
+            ..Default::default()
+        });
         export_log(format!(
             "reader_ready ordinal={} elapsed_ms={}",
-            file_ordinal,
-            elapsed_ms(reader_start)
+            file_ordinal, reader_elapsed_ms
         ));
         let _ = schema;
         let reader = &mut export_reader.reader;
@@ -1844,24 +1984,62 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
 
         loop {
             let decode_start = std::time::Instant::now();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_START",
+                phase: Some("READ"),
+                file_path: Some(&file.path),
+                object_operation: Some("read_next_batch"),
+                ..Default::default()
+            });
             let batch = match reader.reader.next() {
                 Some(batch) => batch.map_err(|e| e.to_string())?,
                 None => break,
             };
-            decode_ms += elapsed_ms(decode_start);
+            let read_elapsed_ms = elapsed_ms(decode_start);
+            decode_ms += read_elapsed_ms;
             parquet_row_groups_read += 1;
             file_row_groups += 1;
             let batch = append_row_index(batch, DEFAULT_ROW_INDEX_COLUMN, reader.row_offset)?;
             reader.row_offset += batch.num_rows() as i64;
             let input_rows = batch.num_rows();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_END",
+                phase: Some("READ"),
+                file_path: Some(&file.path),
+                object_operation: Some("read_next_batch"),
+                duration_ms: Some(read_elapsed_ms),
+                rows: Some(input_rows as u64),
+                ..Default::default()
+            });
             rows_read += input_rows as u64;
             file_rows_read += input_rows as u64;
             let filter_start = std::time::Instant::now();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_START",
+                phase: Some("FILTER"),
+                file_path: Some(&file.path),
+                rows: Some(input_rows as u64),
+                ..Default::default()
+            });
             let (batch, filtered_by_dv) = apply_export_filters(batch, file, &task.predicate)?;
-            filter_ms += elapsed_ms(filter_start);
+            let filter_elapsed_ms = elapsed_ms(filter_start);
+            filter_ms += filter_elapsed_ms;
             dv_filtered_rows += filtered_by_dv as u64;
             predicate_filtered_rows +=
                 input_rows.saturating_sub(filtered_by_dv + batch.num_rows()) as u64;
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_END",
+                phase: Some("FILTER"),
+                file_path: Some(&file.path),
+                duration_ms: Some(filter_elapsed_ms),
+                rows: Some(batch.num_rows() as u64),
+                metrics_json: Some(format!(
+                    "{{\"dv_filtered_rows\":{},\"predicate_filtered_rows\":{}}}",
+                    filtered_by_dv,
+                    input_rows.saturating_sub(filtered_by_dv + batch.num_rows())
+                )),
+                ..Default::default()
+            });
             if batch.num_rows() == 0 {
                 if file_row_groups == 1 || file_row_groups % 100 == 0 {
                     export_log(format!(
@@ -1874,6 +2052,14 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             let projected = project_export_batch(batch, &task.projection, &file.partition)?;
             rows_output += projected.num_rows() as u64;
             file_rows_output += projected.num_rows() as u64;
+            let write_start = std::time::Instant::now();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_START",
+                phase: Some("WRITE"),
+                file_path: Some(&file.path),
+                rows: Some(projected.num_rows() as u64),
+                ..Default::default()
+            });
             write_projected_export_batch(
                 projected,
                 &task,
@@ -1888,6 +2074,18 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
                 &mut obs_write_ms,
                 &mut multipart_finish_ms,
             )?;
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_END",
+                phase: Some("WRITE"),
+                file_path: Some(&file.path),
+                duration_ms: Some(elapsed_ms(write_start)),
+                rows: Some(file_rows_output),
+                queue_depth: writer
+                    .as_ref()
+                    .map(|value| value.writer.multipart_inflight_parts()),
+                peak_buffered_bytes: Some(peak_buffered_bytes),
+                ..Default::default()
+            });
             if file_row_groups == 1 || file_row_groups % 100 == 0 {
                 export_log(format!(
                     "file_progress ordinal={} row_groups={} rows_read={} rows_output={}",
@@ -1897,6 +2095,14 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
         }
 
         if let Some(writer) = writer.take() {
+            let finish_start = std::time::Instant::now();
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_START",
+                phase: Some("MULTIPART_FINISH"),
+                file_path: Some(&file.path),
+                queue_depth: Some(writer.writer.multipart_inflight_parts()),
+                ..Default::default()
+            });
             finish_export_writer(
                 writer,
                 &mut files_written,
@@ -1906,6 +2112,15 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
                 &mut obs_write_ms,
                 &mut multipart_finish_ms,
             )?;
+            diagnostics.emit(NativeDiagnosticEvent {
+                event_type: "PHASE_END",
+                phase: Some("MULTIPART_FINISH"),
+                file_path: Some(&file.path),
+                duration_ms: Some(elapsed_ms(finish_start)),
+                rows: Some(file_rows_output),
+                peak_buffered_bytes: Some(peak_buffered_bytes),
+                ..Default::default()
+            });
         }
         if let Some(metrics) = export_reader.obs_metrics {
             obs_read_requests += metrics.requests.load(Ordering::Relaxed);
@@ -1916,6 +2131,23 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             "file_done ordinal={} row_groups={} rows_read={} rows_output={}",
             file_ordinal, file_row_groups, file_rows_read, file_rows_output
         ));
+        diagnostics.emit(NativeDiagnosticEvent {
+            event_type: "FILE_END",
+            phase: Some("CLOSE"),
+            file_path: Some(&file.path),
+            rows: Some(file_rows_output),
+            bytes: Some(obs_read_bytes.saturating_add(obs_write_bytes)),
+            peak_buffered_bytes: Some(peak_buffered_bytes),
+            metrics_json: Some(format!(
+                "{{\"row_groups\":{},\"rows_read\":{},\"rows_output\":{},\"obs_read_requests\":{},\"obs_write_requests\":{}}}",
+                file_row_groups,
+                file_rows_read,
+                file_rows_output,
+                obs_read_requests,
+                obs_write_requests
+            )),
+            ..Default::default()
+        });
     }
 
     export_log(format!(
@@ -1926,7 +2158,7 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
         files_written.len()
     ));
 
-    Ok(serde_json::json!({
+    let result_json = serde_json::json!({
         "rows_output": rows_output,
         "files_written": files_written,
         "metrics": {
@@ -1951,7 +2183,17 @@ fn export_parquet(request_json: &str) -> Result<String, String> {
             "multipart_finish_ms": multipart_finish_ms
         }
     })
-    .to_string())
+    .to_string();
+    diagnostics.emit(NativeDiagnosticEvent {
+        event_type: "RUNTIME_SNAPSHOT",
+        phase: Some("CLOSE"),
+        rows: Some(rows_output),
+        bytes: Some(obs_read_bytes.saturating_add(obs_write_bytes)),
+        peak_buffered_bytes: Some(peak_buffered_bytes),
+        metrics_json: Some(result_json.clone()),
+        ..Default::default()
+    });
+    Ok(result_json)
 }
 
 fn validate_export_task_options(task: &ExportTask) -> Result<(), String> {
@@ -2266,6 +2508,13 @@ fn record_batch_memory_size(batch: &RecordBatch) -> u64 {
 
 fn elapsed_ms(start: std::time::Instant) -> u64 {
     start.elapsed().as_millis() as u64
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn export_log(message: impl AsRef<str>) {
@@ -2655,11 +2904,60 @@ pub unsafe extern "C" fn paimon_exporter_export_parquet(
     result_json: *mut *mut c_char,
     error_message: *mut *mut c_char,
 ) -> i32 {
+    paimon_exporter_export_parquet_inner(
+        exporter,
+        ptr::null(),
+        request_json,
+        None,
+        result_json,
+        error_message,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_exporter_export_parquet_with_diagnostics(
+    exporter: *mut Exporter,
+    operation_id: *const c_char,
+    request_json: *const c_char,
+    diagnostics_callback: NativeDiagnosticsCallback,
+    result_json: *mut *mut c_char,
+    error_message: *mut *mut c_char,
+) -> i32 {
+    paimon_exporter_export_parquet_inner(
+        exporter,
+        operation_id,
+        request_json,
+        diagnostics_callback,
+        result_json,
+        error_message,
+    )
+}
+
+unsafe fn paimon_exporter_export_parquet_inner(
+    exporter: *mut Exporter,
+    operation_id: *const c_char,
+    request_json: *const c_char,
+    diagnostics_callback: NativeDiagnosticsCallback,
+    result_json: *mut *mut c_char,
+    error_message: *mut *mut c_char,
+) -> i32 {
     if exporter.is_null() || result_json.is_null() || error_message.is_null() {
         return -1;
     }
     match catch_unwind(AssertUnwindSafe(|| {
-        cstr_to_string(request_json).and_then(|r| export_parquet(&r))
+        let operation_id = if operation_id.is_null() {
+            "native-export-parquet-unknown".to_string()
+        } else {
+            cstr_to_string(operation_id)?
+        };
+        let mut diagnostics = NativeExportDiagnostics::new(operation_id, diagnostics_callback);
+        diagnostics.emit(NativeDiagnosticEvent {
+            event_type: "FFI_ENTERED",
+            phase: Some("PARSE_REQUEST"),
+            ..Default::default()
+        });
+        cstr_to_string(request_json)
+            .and_then(|request| export_parquet_with_diagnostics(&request, &mut diagnostics))
     })) {
         Ok(Ok(result)) => {
             *result_json = CString::new(result).unwrap().into_raw();

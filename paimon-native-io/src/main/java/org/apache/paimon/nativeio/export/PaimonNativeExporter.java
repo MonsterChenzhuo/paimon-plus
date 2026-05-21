@@ -22,6 +22,7 @@ import org.apache.paimon.nativeio.jnr.LibPaimonNativeIO;
 import org.apache.paimon.nativeio.jnr.PaimonJnrLoader;
 import org.apache.paimon.operation.nativeio.diagnostics.NativeIODiagnosticsEmitter;
 import org.apache.paimon.operation.nativeio.diagnostics.NativeIOEvent;
+import org.apache.paimon.operation.nativeio.diagnostics.NativeIOEventJson;
 import org.apache.paimon.operation.nativeio.diagnostics.NativeIOEventType;
 import org.apache.paimon.operation.nativeio.diagnostics.NativeIOPhase;
 
@@ -30,22 +31,30 @@ import jnr.ffi.byref.PointerByReference;
 
 import java.io.IOException;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /** JNR wrapper for native export_parquet FFI. */
 public final class PaimonNativeExporter {
 
     private final LibPaimonNativeIO library;
+    private final Consumer<NativeIOEvent> diagnosticsSink;
 
     public PaimonNativeExporter() throws IOException {
         this(
                 PaimonJnrLoader.current()
                         .load()
                         .orElseThrow(
-                                () -> new IOException("Paimon native IO library is unavailable.")));
+                                () -> new IOException("Paimon native IO library is unavailable.")),
+                NativeIODiagnosticsEmitter::emit);
     }
 
     PaimonNativeExporter(LibPaimonNativeIO library) {
+        this(library, NativeIODiagnosticsEmitter::emit);
+    }
+
+    PaimonNativeExporter(LibPaimonNativeIO library, Consumer<NativeIOEvent> diagnosticsSink) {
         this.library = library;
+        this.diagnosticsSink = diagnosticsSink;
     }
 
     public NativeExportResult exportParquet(NativeExportTask task) throws IOException {
@@ -59,11 +68,24 @@ public final class PaimonNativeExporter {
 
         PointerByReference resultJson = new PointerByReference();
         PointerByReference errorMessage = new PointerByReference();
+        LibPaimonNativeIO.NativeIODiagnosticsCallback nativeDiagnosticsCallback =
+                eventJson -> {
+                    try {
+                        diagnosticsSink.accept(NativeIOEventJson.fromJson(eventJson));
+                    } catch (Throwable ignored) {
+                        // Native export must never fail because diagnostics payload parsing failed.
+                    }
+                };
         try {
             emit(task, operationId, NativeIOEventType.JNI_CALL_START, NativeIOPhase.JNI, null);
             int status =
-                    library.paimon_exporter_export_parquet(
-                            exporter, NativeExportJson.toJson(task), resultJson, errorMessage);
+                    library.paimon_exporter_export_parquet_with_diagnostics(
+                            exporter,
+                            operationId,
+                            NativeExportJson.toJson(task),
+                            nativeDiagnosticsCallback,
+                            resultJson,
+                            errorMessage);
             emit(task, operationId, NativeIOEventType.JNI_CALL_END, NativeIOPhase.JNI, null);
             if (status == 0) {
                 Pointer result = resultJson.getValue();
@@ -99,7 +121,7 @@ public final class PaimonNativeExporter {
         }
     }
 
-    private static void emit(
+    private void emit(
             NativeExportTask task,
             String operationId,
             NativeIOEventType eventType,
@@ -116,10 +138,10 @@ public final class PaimonNativeExporter {
         if (rows != null) {
             builder.withRows(rows);
         }
-        NativeIODiagnosticsEmitter.emit(builder.build());
+        diagnosticsSink.accept(builder.build());
     }
 
-    private static void emitError(
+    private void emitError(
             NativeExportTask task, String operationId, String message, Throwable throwable) {
         NativeIOEvent.Builder builder =
                 NativeIOEvent.builder(NativeIOEventType.ERROR, operationId, "native-export-parquet")
@@ -131,6 +153,6 @@ public final class PaimonNativeExporter {
         if (throwable != null) {
             builder.withErrorClass(throwable.getClass().getName());
         }
-        NativeIODiagnosticsEmitter.emit(builder.build());
+        diagnosticsSink.accept(builder.build());
     }
 }

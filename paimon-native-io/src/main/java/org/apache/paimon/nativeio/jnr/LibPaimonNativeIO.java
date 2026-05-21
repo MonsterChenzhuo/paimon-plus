@@ -19,6 +19,7 @@
 package org.apache.paimon.nativeio.jnr;
 
 import jnr.ffi.Pointer;
+import jnr.ffi.annotations.Delegate;
 import jnr.ffi.byref.PointerByReference;
 
 /** JNR ABI binding for the optional paimon native IO library. */
@@ -60,5 +61,19 @@ public interface LibPaimonNativeIO {
             PointerByReference resultJson,
             PointerByReference errorMessage);
 
+    int paimon_exporter_export_parquet_with_diagnostics(
+            Pointer exporter,
+            String operationId,
+            String requestJson,
+            NativeIODiagnosticsCallback callback,
+            PointerByReference resultJson,
+            PointerByReference errorMessage);
+
     void paimon_string_free(Pointer value);
+
+    /** Callback invoked synchronously by native export code with a NativeIOEvent JSON payload. */
+    interface NativeIODiagnosticsCallback {
+        @Delegate
+        void emit(String eventJson);
+    }
 }
