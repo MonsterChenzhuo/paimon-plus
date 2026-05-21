@@ -23,11 +23,14 @@ import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FormatWriter;
+import org.apache.paimon.format.parquet.ParquetInputFile;
 import org.apache.paimon.format.parquet.ParquetWriterFactory;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
+import org.apache.paimon.format.parquet.writer.StreamOutputFile;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.operation.nativeio.NativeRejectReason;
 import org.apache.paimon.operation.nativeio.export.NativeExportContext;
@@ -62,8 +65,13 @@ import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.Projection;
 import org.apache.paimon.utils.StringUtils;
 
+import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.ParquetFileWriter;
+import org.apache.parquet.hadoop.ParquetWriter;
+import org.apache.parquet.hadoop.metadata.FileMetaData;
+import org.apache.parquet.schema.MessageType;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -91,6 +99,7 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -279,7 +288,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                         overwrite,
                         targetFileSize);
         if (compactOutput) {
-            compactOutputDirectory(table, outputDir, compression);
+            compactOutputDirectory(table, outputDir);
         }
         return rows;
     }
@@ -501,7 +510,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                         false,
                         targetFileSize);
         if (compactOutput) {
-            compactOutputDirectory(table, partition.outputDir, compression);
+            compactOutputDirectory(table, partition.outputDir);
         }
         return rows;
     }
@@ -544,11 +553,10 @@ public class ExportParquetProcedure extends BaseProcedure {
                         + split.getClass().getName());
     }
 
-    private void compactOutputDirectory(Table table, Path outputDir, String compression)
-            throws IOException {
+    private void compactOutputDirectory(Table table, Path outputDir) throws IOException {
         FileIO fileIO = outputFileIO(table, outputDir);
-        int parquetFiles = parquetFileCount(fileIO, outputDir);
-        if (parquetFiles <= 1) {
+        List<FileStatus> parquetFiles = parquetFiles(fileIO, outputDir);
+        if (parquetFiles.size() <= 1) {
             return;
         }
 
@@ -572,13 +580,12 @@ public class ExportParquetProcedure extends BaseProcedure {
         boolean committed = false;
         boolean backedUp = false;
         try {
-            spark().read()
-                    .parquet(outputDir.toString())
-                    .coalesce(1)
-                    .write()
-                    .mode(SaveMode.Overwrite)
-                    .option("compression", compression)
-                    .parquet(tempDir.toString());
+            fileIO.mkdirs(tempDir);
+            copyParquetRowGroups(
+                    fileIO,
+                    parquetFiles,
+                    new Path(tempDir, "part-" + UUID.randomUUID() + ".parquet"));
+            fileIO.newOutputStream(new Path(tempDir, "_SUCCESS"), true).close();
             if (!fileIO.rename(outputDir, backupDir)) {
                 throw new IOException(
                         "Failed to backup output directory "
@@ -607,6 +614,64 @@ public class ExportParquetProcedure extends BaseProcedure {
         }
     }
 
+    static void copyParquetRowGroups(FileIO fileIO, List<FileStatus> parquetFiles, Path outputFile)
+            throws IOException {
+        ParquetFileWriter writer = null;
+        PositionOutputStream outputStream = null;
+        boolean ended = false;
+        MessageType schema = null;
+        Map<String, String> keyValueMetaData = Collections.emptyMap();
+
+        try {
+            for (FileStatus parquetFile : parquetFiles) {
+                try (ParquetFileReader reader =
+                        new ParquetFileReader(
+                                ParquetInputFile.fromPath(
+                                        fileIO, parquetFile.getPath(), parquetFile.getLen()),
+                                ParquetReadOptions.builder().build())) {
+                    FileMetaData fileMetaData = reader.getFileMetaData();
+                    if (writer == null) {
+                        schema = fileMetaData.getSchema();
+                        keyValueMetaData = keyValueMetaData(fileMetaData);
+                        outputStream = fileIO.newOutputStream(outputFile, false);
+                        writer =
+                                new ParquetFileWriter(
+                                        new StreamOutputFile(outputStream),
+                                        schema,
+                                        ParquetFileWriter.Mode.CREATE,
+                                        ParquetWriter.DEFAULT_BLOCK_SIZE,
+                                        ParquetWriter.MAX_PADDING_SIZE_DEFAULT);
+                        writer.start();
+                    } else if (!schema.equals(fileMetaData.getSchema())) {
+                        throw new IOException(
+                                "Cannot compact Parquet files with different schemas. first="
+                                        + schema
+                                        + ", current="
+                                        + fileMetaData.getSchema()
+                                        + ", file="
+                                        + parquetFile.getPath());
+                    }
+                    reader.appendTo(writer);
+                }
+            }
+
+            if (writer == null) {
+                throw new IOException("No Parquet files to compact into " + outputFile);
+            }
+            writer.end(keyValueMetaData);
+            ended = true;
+        } finally {
+            if (!ended && outputStream != null) {
+                outputStream.close();
+            }
+        }
+    }
+
+    private static Map<String, String> keyValueMetaData(FileMetaData fileMetaData) {
+        Map<String, String> metadata = fileMetaData.getKeyValueMetaData();
+        return metadata == null ? Collections.emptyMap() : new LinkedHashMap<>(metadata);
+    }
+
     static void deleteDirectoryQuietly(FileIO fileIO, Path directory) {
         try {
             if (!fileIO.delete(directory, true) && fileIO.exists(directory)) {
@@ -617,14 +682,15 @@ public class ExportParquetProcedure extends BaseProcedure {
         }
     }
 
-    private static int parquetFileCount(FileIO fileIO, Path outputDir) throws IOException {
-        int count = 0;
+    private static List<FileStatus> parquetFiles(FileIO fileIO, Path outputDir) throws IOException {
+        List<FileStatus> files = new ArrayList<>();
         for (FileStatus status : fileIO.listFiles(outputDir, false)) {
             if (!status.isDir() && status.getPath().getName().endsWith(".parquet")) {
-                count++;
+                files.add(status);
             }
         }
-        return count;
+        files.sort(Comparator.comparing(status -> status.getPath().getName()));
+        return files;
     }
 
     private long javaExport(

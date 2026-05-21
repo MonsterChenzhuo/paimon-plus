@@ -51,7 +51,7 @@ CALL sys.export_parquet(
 | `target_file_size` | `STRING` | 否 | 空，表示按 Paimon split 写文件 | 目标 Parquet 文件大小，例如 `'128 MB'`。配置后会启用滚动写文件。 |
 | `partitioned_output` | `BOOLEAN` | 否 | `false` | 是否按 Paimon 分区分别输出到 `output_path/分区路径`。 |
 | `partition_job_parallelism` | `INT` | 否 | `1` | `partitioned_output=true` 时，并发提交分区导出 job 的上限。 |
-| `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否在当前 Spark 会话提交合并 job，将该导出目录合并为一个 Parquet 文件。 |
+| `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否将该导出目录的 Parquet 文件通过 row-group 级 copy 合并为一个 Parquet 文件。 |
 
 ## Native fast path
 
@@ -292,10 +292,10 @@ CALL sys.export_parquet(
 
 执行方式：
 
-- 普通导出：导出 job 完成后，对 `output_path` 提交一个 Spark 合并 job。
-- 分区导出：每个分区目录的导出 job 完成后，对该分区目录提交一个 Spark 合并 job。
+- 普通导出：导出 job 完成后，对 `output_path` 执行一次 Parquet row-group copy 合并。
+- 分区导出：每个分区目录的导出 job 完成后，对该分区目录执行一次 Parquet row-group copy 合并。
 
-合并 job 会读取对应输出目录的 Parquet 文件，`coalesce(1)` 后写入临时兄弟目录，再替换原输出目录。合并后该导出目录下只保留一个 `part-*.parquet` 和 `_SUCCESS`。
+合并过程只读取 Parquet footer，并复制源文件中的 row groups / column chunks 到临时兄弟目录下的新 Parquet 文件，再替换原输出目录。它不会把 2w 列数据解码成 Spark rows，也不会重新编码或重新压缩数据页。合并后该导出目录下只保留一个 `part-*.parquet` 和 `_SUCCESS`。
 
 示例：
 
@@ -486,7 +486,7 @@ CALL sys.export_parquet(
 7. 准备输出目录，必要时按 `overwrite` 删除旧目录。
 8. Spark 根据 split 和参数启动导出任务。
 9. 每个任务读取 Paimon split，应用过滤条件，写出 Parquet 文件。
-10. 如果启用 `compact_output`，导出 job 完成后提交合并 job，将对应导出目录合并成单个 Parquet 文件。
+10. 如果启用 `compact_output`，导出 job 完成后通过 Parquet row-group copy 将对应导出目录合并成单个 Parquet 文件。
 11. driver 汇总写出行数，并创建 `_SUCCESS` 文件。
 
 ## 输出文件与文件数
