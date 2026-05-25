@@ -51,7 +51,7 @@ CALL sys.export_parquet(
 | `target_file_size` | `STRING` | 否 | 空，表示按 Paimon split 写文件 | 目标 Parquet 文件大小，例如 `'128 MB'`。配置后会启用滚动写文件。 |
 | `partitioned_output` | `BOOLEAN` | 否 | `false` | 是否按 Paimon 分区分别输出到 `output_path/分区路径`。 |
 | `partition_job_parallelism` | `INT` | 否 | `1` | `partitioned_output=true` 时，并发提交分区导出 job 的上限。 |
-| `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否将该导出目录的 Parquet 文件通过 row-group 级 copy 合并为一个 Parquet 文件。 |
+| `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否将该导出目录的 Parquet 文件通过 row-group 级 copy 合并为接近 `target_file_size` 的文件。 |
 
 ## Native fast path
 
@@ -290,12 +290,14 @@ CALL sys.export_parquet(
 
 `compact_output => true` 表示导出完成后，对外部 Parquet 输出目录执行一次文件合并。它不是 Paimon 表 compaction，也不会修改源 Paimon 表。
 
+合并后的目标文件大小由 `target_file_size` 控制。例如 `target_file_size => '256 MB'` 时，procedure 会按当前导出目录下 Parquet 文件的大小分组，尽量将每个新 `part-*.parquet` 控制在 256 MB 左右。最后一个文件可能小于目标大小；如果单个源 Parquet 文件本身已经大于目标大小，row-group copy compaction 不会把这个源文件拆成多个更小文件。
+
 执行方式：
 
 - 普通导出：导出 job 完成后，对 `output_path` 执行一次 Parquet row-group copy 合并。
 - 分区导出：每个分区目录的导出 job 完成后，对该分区目录执行一次 Parquet row-group copy 合并。
 
-合并过程只读取 Parquet footer，并复制源文件中的 row groups / column chunks 到临时兄弟目录下的新 Parquet 文件，再替换原输出目录。它不会把 2w 列数据解码成 Spark rows，也不会重新编码或重新压缩数据页。合并后该导出目录下只保留一个 `part-*.parquet` 和 `_SUCCESS`。
+合并过程只读取 Parquet footer，并复制源文件中的 row groups / column chunks 到临时兄弟目录下的新 Parquet 文件，再替换原输出目录。它不会把 2w 列数据解码成 Spark rows，也不会重新编码或重新压缩数据页。合并后该导出目录下会保留一个或多个接近目标大小的 `part-*.parquet` 和 `_SUCCESS`。
 
 示例：
 
@@ -303,8 +305,9 @@ CALL sys.export_parquet(
 CALL sys.export_parquet(
   table => 'default.orders',
   columns => '*',
-  output_path => 's3://bucket/export/orders_single_file',
+  output_path => 's3://bucket/export/orders_compacted',
   where => "dt = '2026-05-14'",
+  target_file_size => '256 MB',
   compact_output => true,
   overwrite => true
 );
@@ -432,7 +435,7 @@ CALL sys.export_parquet(
 );
 ```
 
-### 按分区目录导出日期范围并合并每个分区
+### 按分区目录导出日期范围并按目标大小合并每个分区
 
 ```sql
 CALL sys.export_parquet(
@@ -442,6 +445,7 @@ CALL sys.export_parquet(
   where => "dt >= '2026-05-01' and dt <= '2026-05-06'",
   partitioned_output => true,
   partition_job_parallelism => 4,
+  target_file_size => '256 MB',
   compact_output => true,
   overwrite => true
 );
@@ -452,6 +456,7 @@ CALL sys.export_parquet(
 ```text
 s3://bucket/export/orders_range/
   dt=2026-05-01/
+    part-....parquet
     part-....parquet
     _SUCCESS
   dt=2026-05-02/
@@ -486,7 +491,7 @@ CALL sys.export_parquet(
 7. 准备输出目录，必要时按 `overwrite` 删除旧目录。
 8. Spark 根据 split 和参数启动导出任务。
 9. 每个任务读取 Paimon split，应用过滤条件，写出 Parquet 文件。
-10. 如果启用 `compact_output`，导出 job 完成后通过 Parquet row-group copy 将对应导出目录合并成单个 Parquet 文件。
+10. 如果启用 `compact_output`，导出 job 完成后通过 Parquet row-group copy 将对应导出目录合并为接近 `target_file_size` 的 Parquet 文件。
 11. driver 汇总写出行数，并创建 `_SUCCESS` 文件。
 
 ## 输出文件与文件数
@@ -501,6 +506,7 @@ CALL sys.export_parquet(
 - 每个 Spark partition 使用一个 rolling writer。
 - writer 达到目标大小后滚动生成新文件。
 - 文件数量主要由数据量、压缩率、目标大小和实际 Spark partition 数决定。
+- 如果同时设置 `compact_output => true`，导出完成后的 copy compaction 也会使用同一个 `target_file_size` 重新合并目录内的小文件。
 
 ## 常见错误
 
