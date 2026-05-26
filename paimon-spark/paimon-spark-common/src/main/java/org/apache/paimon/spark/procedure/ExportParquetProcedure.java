@@ -66,13 +66,12 @@ import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.Projection;
 import org.apache.paimon.utils.StringUtils;
 
-import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileWriter;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetWriter;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.FileMetaData;
-import org.apache.paimon.shade.org.apache.parquet.schema.MessageType;
-
+import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.ParquetFileWriter;
+import org.apache.parquet.hadoop.ParquetWriter;
+import org.apache.parquet.hadoop.metadata.FileMetaData;
+import org.apache.parquet.schema.MessageType;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -112,7 +111,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -145,6 +146,7 @@ public class ExportParquetProcedure extends BaseProcedure {
     private static final int MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS = 100_000;
     private static final String SUCCESS_FILE_NAME = "_SUCCESS";
     private static final String MANIFEST_FILE_NAME = "_manifest.json";
+    private static final long COMPACT_SUCCESS_POLL_INTERVAL_MS = 200L;
     private static final String SPARK_SCHEDULER_MODE = "spark.scheduler.mode";
     private static final String SPARK_SCHEDULER_MODE_FAIR = "FAIR";
     private static final String SPARK_SCHEDULER_POOL = "spark.scheduler.pool";
@@ -299,7 +301,8 @@ public class ExportParquetProcedure extends BaseProcedure {
                         overwrite,
                         targetFileSize);
         if (compactOutput) {
-            compactOutputDirectory(table, outputDir, targetFileSize, outputProjection.length);
+            writeSuccessFile(outputFileIO(table, outputDir), outputDir);
+            compactOutputDirectory(table, outputDir, targetFileSize, outputProjection.length, true);
         }
         writeManifestAndSuccess(table, outputDir, normalizedOutputPath);
         return rows;
@@ -413,8 +416,11 @@ public class ExportParquetProcedure extends BaseProcedure {
                                 outputFieldCount,
                                 parallelism,
                                 compression,
-                                targetFileSize,
-                                compactOutput);
+                                targetFileSize);
+                if (compactOutput) {
+                    compactOutputDirectory(
+                            table, partition.outputDir, targetFileSize, outputFieldCount, true);
+                }
             }
         } else {
             configurePartitionExportFairScheduling(jobParallelism);
@@ -450,18 +456,22 @@ public class ExportParquetProcedure extends BaseProcedure {
             @Nullable Long targetFileSize,
             boolean compactOutput)
             throws Exception {
-        ExecutorService executor = Executors.newFixedThreadPool(jobParallelism);
+        ExecutorService exportExecutor = Executors.newFixedThreadPool(jobParallelism);
+        ExecutorService compactExecutor =
+                compactOutput ? Executors.newFixedThreadPool(jobParallelism) : null;
         try {
-            List<Future<Long>> futures = new ArrayList<>(partitions.size());
+            CompletionService<PartitionExportResult> exportCompletion =
+                    new ExecutorCompletionService<>(exportExecutor);
             for (int i = 0; i < partitions.size(); i++) {
+                final int partitionIndex = i;
                 PartitionExportPlan partition = partitions.get(i);
                 String schedulerPool = PARTITION_EXPORT_POOL_PREFIX + i;
-                futures.add(
-                        executor.submit(
-                                new Callable<Long>() {
-                                    @Override
-                                    public Long call() throws Exception {
-                                        return withSparkSchedulerPool(
+                exportCompletion.submit(
+                        new Callable<PartitionExportResult>() {
+                            @Override
+                            public PartitionExportResult call() throws Exception {
+                                Long rows =
+                                        withSparkSchedulerPool(
                                                 schedulerPool,
                                                 new Callable<Long>() {
                                                     @Override
@@ -475,17 +485,48 @@ public class ExportParquetProcedure extends BaseProcedure {
                                                                 outputFieldCount,
                                                                 parallelism,
                                                                 compression,
-                                                                targetFileSize,
-                                                                compactOutput);
+                                                                targetFileSize);
                                                     }
                                                 });
-                                    }
-                                }));
+                                return new PartitionExportResult(partitionIndex, partition, rows);
+                            }
+                        });
             }
 
+            List<Future<Long>> compactFutures = new ArrayList<>(partitions.size());
             long rows = 0L;
-            for (Future<Long> future : futures) {
-                rows += future.get();
+            for (int i = 0; i < partitions.size(); i++) {
+                PartitionExportResult result = exportCompletion.take().get();
+                rows += result.rows;
+                if (compactOutput) {
+                    String schedulerPool =
+                            PARTITION_EXPORT_POOL_PREFIX + result.partitionIndex + "-compact";
+                    compactFutures.add(
+                            compactExecutor.submit(
+                                    new Callable<Long>() {
+                                        @Override
+                                        public Long call() throws Exception {
+                                            return withSparkSchedulerPool(
+                                                    schedulerPool,
+                                                    new Callable<Long>() {
+                                                        @Override
+                                                        public Long call() throws Exception {
+                                                            compactOutputDirectory(
+                                                                    table,
+                                                                    result.partition.outputDir,
+                                                                    targetFileSize,
+                                                                    outputFieldCount,
+                                                                    true);
+                                                            return 0L;
+                                                        }
+                                                    });
+                                        }
+                                    }));
+                }
+            }
+
+            for (Future<Long> future : compactFutures) {
+                future.get();
             }
             return rows;
         } catch (ExecutionException e) {
@@ -495,7 +536,10 @@ public class ExportParquetProcedure extends BaseProcedure {
             }
             throw new RuntimeException(cause);
         } finally {
-            executor.shutdownNow();
+            exportExecutor.shutdownNow();
+            if (compactExecutor != null) {
+                compactExecutor.shutdownNow();
+            }
         }
     }
 
@@ -537,8 +581,7 @@ public class ExportParquetProcedure extends BaseProcedure {
             int outputFieldCount,
             int parallelism,
             String compression,
-            @Nullable Long targetFileSize,
-            boolean compactOutput)
+            @Nullable Long targetFileSize)
             throws Exception {
         LOG.info(
                 "Exporting partition for sys.export_parquet. partition={}, outputPath={}, splits={}",
@@ -558,9 +601,6 @@ public class ExportParquetProcedure extends BaseProcedure {
                         compression,
                         false,
                         targetFileSize);
-        if (compactOutput) {
-            compactOutputDirectory(table, partition.outputDir, targetFileSize, outputFieldCount);
-        }
         writeSuccessFile(outputFileIO(table, partition.outputDir), partition.outputDir);
         return rows;
     }
@@ -604,9 +644,16 @@ public class ExportParquetProcedure extends BaseProcedure {
     }
 
     private void compactOutputDirectory(
-            Table table, Path outputDir, @Nullable Long targetFileSize, int outputFieldCount)
-            throws IOException {
+            Table table,
+            Path outputDir,
+            @Nullable Long targetFileSize,
+            int outputFieldCount,
+            boolean waitForSuccess)
+            throws Exception {
         FileIO fileIO = outputFileIO(table, outputDir);
+        if (waitForSuccess) {
+            waitForSuccessFile(fileIO, outputDir);
+        }
         List<FileStatus> parquetFiles = parquetFiles(fileIO, outputDir);
         if (parquetFiles.size() <= 1) {
             return;
@@ -654,12 +701,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                     parquetFileGroups.size(),
                     compactTargetFileSize,
                     outputFieldCount);
-            for (List<FileStatus> parquetFileGroup : parquetFileGroups) {
-                copyParquetRowGroups(
-                        fileIO,
-                        parquetFileGroup,
-                        new Path(tempDir, "part-" + UUID.randomUUID() + ".parquet"));
-            }
+            sparkCompactParquetFileGroups(table, tempDir, parquetFileGroups);
             fileIO.newOutputStream(new Path(tempDir, "_SUCCESS"), true).close();
             if (!fileIO.rename(outputDir, backupDir)) {
                 throw new IOException(
@@ -689,6 +731,60 @@ public class ExportParquetProcedure extends BaseProcedure {
         }
     }
 
+    private void sparkCompactParquetFileGroups(
+            Table table, Path tempDir, List<List<FileStatus>> parquetFileGroups) throws Exception {
+        List<ParquetCompactTask> tasks = new ArrayList<>(parquetFileGroups.size());
+        for (List<FileStatus> parquetFileGroup : parquetFileGroups) {
+            List<ParquetCompactFile> inputFiles = new ArrayList<>(parquetFileGroup.size());
+            for (FileStatus parquetFile : parquetFileGroup) {
+                inputFiles.add(
+                        new ParquetCompactFile(
+                                parquetFile.getPath().toString(), parquetFile.getLen()));
+            }
+            tasks.add(
+                    new ParquetCompactTask(
+                            inputFiles,
+                            new Path(tempDir, "part-" + UUID.randomUUID() + ".parquet")
+                                    .toString()));
+        }
+
+        if (tasks.isEmpty()) {
+            return;
+        }
+
+        final Table compactTable = table;
+        JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
+        jsc.parallelize(
+                        tasks,
+                        Math.max(
+                                1,
+                                Math.min(
+                                        spark().sparkContext().defaultParallelism(), tasks.size())))
+                .foreach(task -> compactParquetTask(compactTable, task));
+    }
+
+    private static void compactParquetTask(Table table, ParquetCompactTask task)
+            throws IOException {
+        FileIO fileIO = outputFileIO(table, new Path(task.outputFile));
+        List<FileStatus> inputFiles = new ArrayList<>(task.inputFiles.size());
+        for (ParquetCompactFile inputFile : task.inputFiles) {
+            inputFiles.add(new CompactFileStatus(inputFile.path, inputFile.length));
+        }
+        copyParquetRowGroups(fileIO, inputFiles, new Path(task.outputFile));
+    }
+
+    private static void waitForSuccessFile(FileIO fileIO, Path outputDir) throws IOException {
+        Path successFile = new Path(outputDir, SUCCESS_FILE_NAME);
+        while (!fileIO.exists(successFile)) {
+            try {
+                Thread.sleep(COMPACT_SUCCESS_POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for " + successFile, e);
+            }
+        }
+    }
+
     private static long compactTargetFileSize(Table table, @Nullable Long targetFileSize) {
         return targetFileSize == null
                 ? new CoreOptions(table.options()).targetFileSize(false)
@@ -704,25 +800,36 @@ public class ExportParquetProcedure extends BaseProcedure {
                         1,
                         MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS / Math.max(1, outputFieldCount));
 
-        List<List<FileStatus>> groups = new ArrayList<>();
-        List<FileStatus> currentGroup = new ArrayList<>();
-        long currentSize = 0L;
-        for (FileStatus parquetFile : parquetFiles) {
+        List<FileStatus> sortedFiles = new ArrayList<>(parquetFiles);
+        sortedFiles.sort(
+                Comparator.comparingLong((FileStatus status) -> Math.max(0L, status.getLen()))
+                        .reversed()
+                        .thenComparing(status -> status.getPath().getName()));
+
+        List<ParquetFileGroup> groups = new ArrayList<>();
+        for (FileStatus parquetFile : sortedFiles) {
             long fileSize = Math.max(0L, parquetFile.getLen());
-            if (!currentGroup.isEmpty()
-                    && (currentGroup.size() >= maxFilesPerGroup
-                            || currentSize + fileSize > targetFileSize)) {
-                groups.add(currentGroup);
-                currentGroup = new ArrayList<>();
-                currentSize = 0L;
+            ParquetFileGroup targetGroup = null;
+            for (ParquetFileGroup group : groups) {
+                if (group.files.size() < maxFilesPerGroup
+                        && group.size + fileSize <= targetFileSize) {
+                    targetGroup = group;
+                    break;
+                }
             }
-            currentGroup.add(parquetFile);
-            currentSize += fileSize;
+            if (targetGroup == null) {
+                targetGroup = new ParquetFileGroup();
+                groups.add(targetGroup);
+            }
+            targetGroup.files.add(parquetFile);
+            targetGroup.size += fileSize;
         }
-        if (!currentGroup.isEmpty()) {
-            groups.add(currentGroup);
+
+        List<List<FileStatus>> result = new ArrayList<>(groups.size());
+        for (ParquetFileGroup group : groups) {
+            result.add(group.files);
         }
-        return groups;
+        return result;
     }
 
     static void copyParquetRowGroups(FileIO fileIO, List<FileStatus> parquetFiles, Path outputFile)
@@ -739,8 +846,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                         new ParquetFileReader(
                                 ParquetInputFile.fromPath(
                                         fileIO, parquetFile.getPath(), parquetFile.getLen()),
-                                ParquetReadOptions.builder().build(),
-                                null)) {
+                                ParquetReadOptions.builder().build())) {
                     FileMetaData fileMetaData = reader.getFileMetaData();
                     if (writer == null) {
                         schema = fileMetaData.getSchema();
@@ -1723,6 +1829,85 @@ public class ExportParquetProcedure extends BaseProcedure {
         private PartitionExportPlan(String partitionPath, Path outputDir) {
             this.partitionPath = partitionPath;
             this.outputDir = outputDir;
+        }
+    }
+
+    private static class PartitionExportResult {
+
+        private final int partitionIndex;
+        private final PartitionExportPlan partition;
+        private final long rows;
+
+        private PartitionExportResult(
+                int partitionIndex, PartitionExportPlan partition, long rows) {
+            this.partitionIndex = partitionIndex;
+            this.partition = partition;
+            this.rows = rows;
+        }
+    }
+
+    private static class ParquetFileGroup {
+
+        private final List<FileStatus> files = new ArrayList<>();
+        private long size;
+    }
+
+    private static class ParquetCompactTask implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final List<ParquetCompactFile> inputFiles;
+        private final String outputFile;
+
+        private ParquetCompactTask(List<ParquetCompactFile> inputFiles, String outputFile) {
+            this.inputFiles = inputFiles;
+            this.outputFile = outputFile;
+        }
+    }
+
+    private static class ParquetCompactFile implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String path;
+        private final long length;
+
+        private ParquetCompactFile(String path, long length) {
+            this.path = path;
+            this.length = length;
+        }
+    }
+
+    private static class CompactFileStatus implements FileStatus, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String path;
+        private final long length;
+
+        private CompactFileStatus(String path, long length) {
+            this.path = path;
+            this.length = length;
+        }
+
+        @Override
+        public long getLen() {
+            return length;
+        }
+
+        @Override
+        public boolean isDir() {
+            return false;
+        }
+
+        @Override
+        public Path getPath() {
+            return new Path(path);
+        }
+
+        @Override
+        public long getModificationTime() {
+            return 0L;
         }
     }
 

@@ -36,10 +36,10 @@ import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
-import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.BlockMetaData;
 
+import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -76,8 +76,7 @@ class ExportParquetProcedureCopyCompactTest {
                 new ParquetFileReader(
                         ParquetInputFile.fromPath(
                                 fileIO, compacted, fileIO.getFileStatus(compacted).getLen()),
-                        ParquetReadOptions.builder().build(),
-                        null)) {
+                        ParquetReadOptions.builder().build())) {
             assertThat(reader.getFooter().getBlocks()).hasSize(2);
             assertThat(
                             reader.getFooter().getBlocks().stream()
@@ -101,6 +100,23 @@ class ExportParquetProcedureCopyCompactTest {
         assertThat(groups).hasSize(2);
         assertThat(groups.get(0)).hasSize(2);
         assertThat(groups.get(1)).hasSize(1);
+    }
+
+    @Test
+    void parquetFileGroupsUseBinPacking() {
+        List<List<FileStatus>> groups =
+                ExportParquetProcedure.parquetFileGroups(
+                        Arrays.asList(
+                                fileStatus("part-a.parquet", 100L),
+                                fileStatus("part-b.parquet", 170L),
+                                fileStatus("part-c.parquet", 150L),
+                                fileStatus("part-d.parquet", 80L)),
+                        256L,
+                        2);
+
+        assertThat(groups).hasSize(2);
+        assertThat(groups.get(0).stream().mapToLong(FileStatus::getLen).sum()).isEqualTo(250L);
+        assertThat(groups.get(1).stream().mapToLong(FileStatus::getLen).sum()).isEqualTo(250L);
     }
 
     @Test

@@ -96,8 +96,10 @@ private object NativeIODiagnosticsInstallRule {
   }
 
   private def installIfEnabled(spark: SparkSession): Unit = {
-    if (!confBoolean(spark, NativeIOEnabledKey, defaultValue = false) ||
-        !confBoolean(spark, NativeIOUIEnabledKey, defaultValue = true)) {
+    if (
+      !confBoolean(spark, NativeIOEnabledKey, defaultValue = false) ||
+      !confBoolean(spark, NativeIOUIEnabledKey, defaultValue = true)
+    ) {
       return
     }
 
@@ -112,10 +114,7 @@ private object NativeIODiagnosticsInstallRule {
     }
   }
 
-  private def confBoolean(
-      spark: SparkSession,
-      key: String,
-      defaultValue: Boolean): Boolean = {
+  private def confBoolean(spark: SparkSession, key: String, defaultValue: Boolean): Boolean = {
     val default = spark.sparkContext.getConf.get(key, defaultValue.toString)
     spark.sessionState.conf.getConfString(key, default).equalsIgnoreCase("true")
   }
