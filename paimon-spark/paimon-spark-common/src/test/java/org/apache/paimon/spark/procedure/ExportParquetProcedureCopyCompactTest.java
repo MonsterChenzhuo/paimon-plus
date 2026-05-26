@@ -33,7 +33,9 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.VarCharType;
+import org.apache.paimon.utils.JsonSerdeUtil;
 
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.BlockMetaData;
@@ -42,6 +44,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -115,6 +118,29 @@ class ExportParquetProcedureCopyCompactTest {
         assertThat(groups.get(0)).hasSize(5);
         assertThat(groups.get(1)).hasSize(5);
         assertThat(groups.get(2)).hasSize(2);
+    }
+
+    @Test
+    void writeManifestListsParquetFilesAsRelativePaths() throws Exception {
+        FileIO fileIO = LocalFileIO.create();
+        Path outputDir = new Path(tempDir.resolve("export").toUri());
+        Path partitionDir = new Path(outputDir, "dt=2026-05-13");
+        fileIO.mkdirs(partitionDir);
+        fileIO.writeFile(new Path(outputDir, "_SUCCESS"), "", true);
+        fileIO.writeFile(new Path(outputDir, "part-root.parquet"), "root", true);
+        fileIO.writeFile(new Path(outputDir, "notes.txt"), "ignored", true);
+        fileIO.writeFile(new Path(partitionDir, "part-a.parquet"), "partition", true);
+
+        ExportParquetProcedure.writeManifest(fileIO, outputDir, "obs://bucket/export/table");
+
+        JsonNode manifest =
+                JsonSerdeUtil.OBJECT_MAPPER_INSTANCE.readTree(
+                        fileIO.readFileUtf8(new Path(outputDir, "_manifest.json")));
+        assertThat(manifest.get("base_path").asText()).isEqualTo("obs://bucket/export/table");
+        Iterator<JsonNode> files = manifest.get("files").elements();
+        assertThat(files.next().get("path").asText()).isEqualTo("dt=2026-05-13/part-a.parquet");
+        assertThat(files.next().get("path").asText()).isEqualTo("part-root.parquet");
+        assertThat(files.hasNext()).isFalse();
     }
 
     private static void writeParquet(FileIO fileIO, Path path, int id, String name)

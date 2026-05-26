@@ -59,6 +59,7 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CloseableIterator;
 import org.apache.paimon.utils.InternalRowPartitionComputer;
+import org.apache.paimon.utils.JsonSerdeUtil;
 import org.apache.paimon.utils.PartitionPathUtils;
 import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.ProjectedRow;
@@ -142,6 +143,8 @@ public class ExportParquetProcedure extends BaseProcedure {
     private static final String SPARK_HADOOP_PREFIX = "spark.hadoop.";
     private static final String OBS_CONF_PREFIX = "fs.obs.";
     private static final int MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS = 100_000;
+    private static final String SUCCESS_FILE_NAME = "_SUCCESS";
+    private static final String MANIFEST_FILE_NAME = "_manifest.json";
 
     private static final ProcedureParameter[] PARAMETERS =
             new ProcedureParameter[] {
@@ -254,6 +257,7 @@ public class ExportParquetProcedure extends BaseProcedure {
 
         final ReadBuilder finalReadBuilder = readBuilder;
         List<Split> plannedSplits = finalReadBuilder.newScan().plan().splits();
+        String normalizedOutputPath = trimTrailingSlash(outputPath);
         Path outputDir = new Path(trimTrailingSlash(outputPath));
 
         if (partitionedOutput) {
@@ -273,7 +277,8 @@ public class ExportParquetProcedure extends BaseProcedure {
                     compression,
                     overwrite,
                     targetFileSize,
-                    compactOutput);
+                    compactOutput,
+                    normalizedOutputPath);
         }
 
         long rows =
@@ -292,6 +297,7 @@ public class ExportParquetProcedure extends BaseProcedure {
         if (compactOutput) {
             compactOutputDirectory(table, outputDir, targetFileSize, outputProjection.length);
         }
+        writeManifestAndSuccess(table, outputDir, normalizedOutputPath);
         return rows;
     }
 
@@ -328,9 +334,7 @@ public class ExportParquetProcedure extends BaseProcedure {
             NativeExportAttempt attempt = nativeExportAttempt.get();
             if (attempt.preflight.applicable()) {
                 prepareOutputDirectory(outputFileIO, outputDir, overwrite);
-                long rows = nativeExport(attempt.provider, attempt.context, parallelism);
-                outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
-                return rows;
+                return nativeExport(attempt.provider, attempt.context, parallelism);
             }
             LOG.warn(
                     "Native export requested but rejected. reason={}, detail={}",
@@ -377,7 +381,8 @@ public class ExportParquetProcedure extends BaseProcedure {
             String compression,
             boolean overwrite,
             @Nullable Long targetFileSize,
-            boolean compactOutput)
+            boolean compactOutput,
+            String basePath)
             throws Exception {
         FileIO outputFileIO = outputFileIO(table, outputDir);
         prepareOutputDirectory(outputFileIO, outputDir, overwrite);
@@ -385,7 +390,7 @@ public class ExportParquetProcedure extends BaseProcedure {
         List<PartitionExportPlan> partitions =
                 partitionExportPlans(table, plannedSplits, outputDir);
         if (partitions.isEmpty()) {
-            outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
+            writeManifestAndSuccess(table, outputDir, basePath);
             return 0L;
         }
 
@@ -424,7 +429,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                             compactOutput);
         }
 
-        outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
+        writeManifestAndSuccess(table, outputDir, basePath);
         return rows;
     }
 
@@ -514,6 +519,7 @@ public class ExportParquetProcedure extends BaseProcedure {
         if (compactOutput) {
             compactOutputDirectory(table, partition.outputDir, targetFileSize, outputFieldCount);
         }
+        writeSuccessFile(outputFileIO(table, partition.outputDir), partition.outputDir);
         return rows;
     }
 
@@ -757,6 +763,61 @@ public class ExportParquetProcedure extends BaseProcedure {
         return files;
     }
 
+    private static void writeManifestAndSuccess(Table table, Path outputDir, String basePath)
+            throws IOException {
+        FileIO fileIO = outputFileIO(table, outputDir);
+        writeManifest(fileIO, outputDir, basePath);
+        writeSuccessFile(fileIO, outputDir);
+    }
+
+    static void writeManifest(FileIO fileIO, Path outputDir, String basePath) throws IOException {
+        List<FileStatus> parquetFiles = new ArrayList<>();
+        for (FileStatus status : fileIO.listFiles(outputDir, true)) {
+            if (!status.isDir() && status.getPath().getName().endsWith(".parquet")) {
+                parquetFiles.add(status);
+            }
+        }
+        parquetFiles.sort(Comparator.comparing(status -> status.getPath().toString()));
+
+        List<Map<String, String>> files = new ArrayList<>();
+        for (FileStatus parquetFile : parquetFiles) {
+            Map<String, String> file = new LinkedHashMap<>();
+            file.put("path", relativePath(outputDir, parquetFile.getPath()));
+            files.add(file);
+        }
+
+        Map<String, Object> manifest = new LinkedHashMap<>();
+        manifest.put("base_path", basePath);
+        manifest.put("files", files);
+        fileIO.writeFile(
+                new Path(outputDir, MANIFEST_FILE_NAME), JsonSerdeUtil.toJson(manifest), true);
+    }
+
+    private static String relativePath(Path base, Path file) {
+        String basePath = trimTrailingSlash(base.toString());
+        String filePath = file.toString();
+        String prefix = basePath + Path.SEPARATOR;
+        if (filePath.startsWith(prefix)) {
+            return filePath.substring(prefix.length());
+        }
+
+        String baseUriPath = trimTrailingSlash(base.toUri().getPath());
+        String fileUriPath = file.toUri().getPath();
+        String uriPrefix = baseUriPath + Path.SEPARATOR;
+        if (fileUriPath.startsWith(uriPrefix)) {
+            return fileUriPath.substring(uriPrefix.length());
+        }
+
+        return file.getName();
+    }
+
+    private static void writeSuccessFile(FileIO fileIO, Path outputDir) throws IOException {
+        try (PositionOutputStream ignored =
+                fileIO.newOutputStream(new Path(outputDir, SUCCESS_FILE_NAME), true)) {
+            // close creates the marker file.
+        }
+    }
+
     private long javaExport(
             Table table,
             ReadBuilder readBuilder,
@@ -818,8 +879,6 @@ public class ExportParquetProcedure extends BaseProcedure {
         for (Long count : counts) {
             rows += count;
         }
-        FileIO outputFileIO = outputFileIO(table, outputDir);
-        outputFileIO.newOutputStream(new Path(outputDir, "_SUCCESS"), true).close();
         return rows;
     }
 

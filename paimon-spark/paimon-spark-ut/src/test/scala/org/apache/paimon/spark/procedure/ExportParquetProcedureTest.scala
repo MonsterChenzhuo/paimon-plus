@@ -19,12 +19,17 @@
 package org.apache.paimon.spark.procedure
 
 import org.apache.paimon.spark.PaimonSparkTestBase
+import org.apache.paimon.utils.JsonSerdeUtil
 
 import org.apache.spark.sql.Row
 import org.assertj.core.api.Assertions.assertThat
 
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.util.concurrent.ThreadLocalRandom
+
+import scala.collection.JavaConverters._
 
 class ExportParquetProcedureTest extends PaimonSparkTestBase {
 
@@ -65,8 +70,13 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
           )
 
           assertThat(new File(output, "_SUCCESS")).exists()
-          assertThat(new File(output).listFiles().filter(_.getName.endsWith(".parquet")).length)
+          val parquetFiles = new File(output).listFiles().filter(_.getName.endsWith(".parquet"))
+          assertThat(parquetFiles.length)
             .isGreaterThan(0)
+          val manifest = readManifest(output)
+          assertThat(manifest.get("base_path").asText()).isEqualTo(output)
+          val manifestPaths = manifestPathsFrom(manifest)
+          assertThat(manifestPaths.toSet == parquetFiles.map(_.getName).toSet).isTrue()
 
           val exported = spark.read.parquet(output)
           assertThat(exported.schema.fieldNames).containsExactly("id", "name")
@@ -211,6 +221,19 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
                 .isEqualTo(1)
               assertThat(new File(partitionDir, "_SUCCESS")).exists()
           }
+          val manifest = readManifest(output)
+          assertThat(manifest.get("base_path").asText()).isEqualTo(output)
+          val manifestPaths = manifestPathsFrom(manifest)
+          assertThat(manifestPaths.size).isEqualTo(3)
+          Seq("2026-05-01", "2026-05-03", "2026-05-06").foreach {
+            dt =>
+              assertThat(manifestPaths.exists(_.startsWith(s"dt=$dt/part-"))).isTrue()
+          }
+          manifestPaths.foreach {
+            path =>
+              assertThat(path).endsWith(".parquet")
+              assertThat(path).doesNotStartWith(output)
+          }
 
           val exported = spark.read.option("basePath", output).parquet(output)
           assertThat(exported.schema.fieldNames).containsExactly("id", "name", "dt")
@@ -222,5 +245,18 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
               Row(4, "d", "2026-05-06") :: Nil)
       }
     }
+  }
+
+  private def readManifest(output: String) = {
+    JsonSerdeUtil.OBJECT_MAPPER_INSTANCE.readTree(
+      new String(
+        Files.readAllBytes(new File(output, "_manifest.json").toPath),
+        StandardCharsets.UTF_8))
+  }
+
+  private def manifestPathsFrom(
+      manifest: org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode)
+      : Seq[String] = {
+    manifest.get("files").elements().asScala.map(_.get("path").asText()).toSeq
   }
 }

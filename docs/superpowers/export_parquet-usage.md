@@ -43,7 +43,7 @@ CALL sys.export_parquet(
 | --- | --- | --- | --- | --- |
 | `table` | `STRING` | 是 | 无 | 目标 Paimon 表标识符，例如 `'T'`、`'default.T'`。 |
 | `columns` | `STRING` | 是 | 无 | 导出的列列表，使用逗号分隔；也可以传 `'*'` 导出全部列。 |
-| `output_path` | `STRING` | 是 | 无 | Parquet 输出目录。目录成功写出后会包含 `part-*.parquet` 和 `_SUCCESS`。 |
+| `output_path` | `STRING` | 是 | 无 | Parquet 输出目录。目录成功写出后会包含 `part-*.parquet`、`_manifest.json` 和 `_SUCCESS`。 |
 | `where` | `STRING` | 否 | 空，表示全量导出 | 行过滤条件。当前只支持简单条件通过 `AND` 连接。 |
 | `parallelism` | `INT` | 否 | `spark.sparkContext.defaultParallelism` | Spark 导出任务并行度上限。小于 1 时会按 1 处理。 |
 | `compression` | `STRING` | 否 | `'zstd'` | Parquet 压缩 codec，直接传给 Parquet writer。 |
@@ -171,10 +171,37 @@ CALL sys.export_parquet(
 
 ```text
 s3://bucket/export/t/
+  _manifest.json
   part-0b2b7e7d-....parquet
   part-8d78cc21-....parquet
   _SUCCESS
 ```
+
+`_manifest.json` 是写在输出根目录的文件清单，用于让 Python、Arrow 等下游直接拿到本次导出的 Parquet 文件列表，避免递归 list 对象存储目录。manifest 只包含根路径和相对文件路径：
+
+```json
+{
+  "base_path": "s3://bucket/export/t",
+  "files": [
+    {"path": "part-0b2b7e7d-....parquet"},
+    {"path": "part-8d78cc21-....parquet"}
+  ]
+}
+```
+
+`partitioned_output => true` 时，root `_manifest.json` 会列出所有分区目录下的最终 Parquet 文件，例如：
+
+```json
+{
+  "base_path": "s3://bucket/export/orders_range",
+  "files": [
+    {"path": "dt=2026-05-01/part-0b2b7e7d-....parquet"},
+    {"path": "dt=2026-05-02/part-8d78cc21-....parquet"}
+  ]
+}
+```
+
+`_SUCCESS` 会在 `_manifest.json` 写完后生成；看到 `_SUCCESS` 时，manifest 已经可以读取。
 
 输出路径行为：
 
@@ -183,6 +210,7 @@ s3://bucket/export/t/
 - 如果目录已存在且 `overwrite` 不是 `true`，调用会失败。
 - 如果目录已存在且 `overwrite => true`，会先递归删除该目录，然后重新写出。
 - 文件名由 `part-` 加 UUID 组成，不能通过参数指定文件名前缀。
+- `_manifest.json` 中的 `files[].path` 是相对 `base_path` 的路径，下游读取时需要拼接成完整路径。
 
 ### where
 
