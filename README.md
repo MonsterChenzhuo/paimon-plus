@@ -30,6 +30,7 @@ CALL sys.export_parquet(
 - 支持简单 `AND` 条件过滤。
 - 支持 `parallelism`、`compression`、`overwrite`。
 - 支持 `target_file_size` 控制导出文件滚动，避免生成过多小文件或单文件过大。
+- 支持 `partitioned_output` 按分区目录导出；未显式配置 `partition_job_parallelism` 时默认按实际导出分区数并发提交分区 job。
 
 详细说明见 [docs/superpowers/export_parquet-usage.md](docs/superpowers/export_parquet-usage.md)。
 

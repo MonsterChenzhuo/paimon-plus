@@ -145,6 +145,10 @@ public class ExportParquetProcedure extends BaseProcedure {
     private static final int MAX_COPY_COMPACT_ESTIMATED_COLUMN_CHUNKS = 100_000;
     private static final String SUCCESS_FILE_NAME = "_SUCCESS";
     private static final String MANIFEST_FILE_NAME = "_manifest.json";
+    private static final String SPARK_SCHEDULER_MODE = "spark.scheduler.mode";
+    private static final String SPARK_SCHEDULER_MODE_FAIR = "FAIR";
+    private static final String SPARK_SCHEDULER_POOL = "spark.scheduler.pool";
+    private static final String PARTITION_EXPORT_POOL_PREFIX = "paimon-export-parquet-partition-";
 
     private static final ProcedureParameter[] PARAMETERS =
             new ProcedureParameter[] {
@@ -196,7 +200,7 @@ public class ExportParquetProcedure extends BaseProcedure {
         boolean overwrite = !args.isNullAt(6) && args.getBoolean(6);
         Long targetFileSize = args.isNullAt(7) ? null : parseTargetFileSize(args.getString(7));
         boolean partitionedOutput = !args.isNullAt(8) && args.getBoolean(8);
-        int partitionJobParallelism = args.isNullAt(9) ? 1 : Math.max(1, args.getInt(9));
+        Integer partitionJobParallelism = args.isNullAt(9) ? null : args.getInt(9);
         boolean compactOutput = !args.isNullAt(10) && args.getBoolean(10);
 
         Table table = loadSparkTable(tableIdent).getTable();
@@ -230,7 +234,7 @@ public class ExportParquetProcedure extends BaseProcedure {
             boolean overwrite,
             @Nullable Long targetFileSize,
             boolean partitionedOutput,
-            int partitionJobParallelism,
+            @Nullable Integer partitionJobParallelism,
             boolean compactOutput)
             throws Exception {
         RowType tableRowType = table.rowType();
@@ -377,7 +381,7 @@ public class ExportParquetProcedure extends BaseProcedure {
             @Nullable Predicate projectedPredicate,
             int outputFieldCount,
             int parallelism,
-            int partitionJobParallelism,
+            @Nullable Integer partitionJobParallelism,
             String compression,
             boolean overwrite,
             @Nullable Long targetFileSize,
@@ -394,8 +398,7 @@ public class ExportParquetProcedure extends BaseProcedure {
             return 0L;
         }
 
-        int jobParallelism =
-                Math.max(1, Math.min(Math.max(1, partitionJobParallelism), partitions.size()));
+        int jobParallelism = partitionJobParallelism(partitionJobParallelism, partitions.size());
         long rows;
         if (jobParallelism == 1) {
             rows = 0L;
@@ -414,6 +417,7 @@ public class ExportParquetProcedure extends BaseProcedure {
                                 compactOutput);
             }
         } else {
+            configurePartitionExportFairScheduling(jobParallelism);
             rows =
                     exportPartitionsConcurrently(
                             table,
@@ -449,23 +453,32 @@ public class ExportParquetProcedure extends BaseProcedure {
         ExecutorService executor = Executors.newFixedThreadPool(jobParallelism);
         try {
             List<Future<Long>> futures = new ArrayList<>(partitions.size());
-            for (PartitionExportPlan partition : partitions) {
+            for (int i = 0; i < partitions.size(); i++) {
+                PartitionExportPlan partition = partitions.get(i);
+                String schedulerPool = PARTITION_EXPORT_POOL_PREFIX + i;
                 futures.add(
                         executor.submit(
                                 new Callable<Long>() {
                                     @Override
                                     public Long call() throws Exception {
-                                        return exportPartition(
-                                                table,
-                                                readBuilder,
-                                                partition,
-                                                outputType,
-                                                projectedPredicate,
-                                                outputFieldCount,
-                                                parallelism,
-                                                compression,
-                                                targetFileSize,
-                                                compactOutput);
+                                        return withSparkSchedulerPool(
+                                                schedulerPool,
+                                                new Callable<Long>() {
+                                                    @Override
+                                                    public Long call() throws Exception {
+                                                        return exportPartition(
+                                                                table,
+                                                                readBuilder,
+                                                                partition,
+                                                                outputType,
+                                                                projectedPredicate,
+                                                                outputFieldCount,
+                                                                parallelism,
+                                                                compression,
+                                                                targetFileSize,
+                                                                compactOutput);
+                                                    }
+                                                });
                                     }
                                 }));
             }
@@ -483,6 +496,35 @@ public class ExportParquetProcedure extends BaseProcedure {
             throw new RuntimeException(cause);
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    private Long withSparkSchedulerPool(String schedulerPool, Callable<Long> callable)
+            throws Exception {
+        String previousPool = spark().sparkContext().getLocalProperty(SPARK_SCHEDULER_POOL);
+        spark().sparkContext().setLocalProperty(SPARK_SCHEDULER_POOL, schedulerPool);
+        try {
+            return callable.call();
+        } finally {
+            spark().sparkContext().setLocalProperty(SPARK_SCHEDULER_POOL, previousPool);
+        }
+    }
+
+    private void configurePartitionExportFairScheduling(int jobParallelism) {
+        String schedulerMode = spark().sparkContext().conf().get(SPARK_SCHEDULER_MODE, "FIFO");
+        if (SPARK_SCHEDULER_MODE_FAIR.equalsIgnoreCase(schedulerMode)) {
+            LOG.info(
+                    "Submitting partitioned sys.export_parquet jobs with FAIR scheduler pools. "
+                            + "jobParallelism={}",
+                    jobParallelism);
+        } else {
+            LOG.warn(
+                    "Submitting partitioned sys.export_parquet jobs concurrently, but Spark scheduler "
+                            + "mode is {}. Set {}={} before creating SparkContext to schedule "
+                            + "independent partition jobs fairly.",
+                    schedulerMode,
+                    SPARK_SCHEDULER_MODE,
+                    SPARK_SCHEDULER_MODE_FAIR);
         }
     }
 
@@ -933,6 +975,15 @@ public class ExportParquetProcedure extends BaseProcedure {
 
     static int nativeTaskCount(int parallelism, int taskCount) {
         return Math.max(1, Math.min(Math.max(1, parallelism), Math.max(1, taskCount)));
+    }
+
+    static int partitionJobParallelism(
+            @Nullable Integer configuredParallelism, int partitionCount) {
+        if (configuredParallelism == null) {
+            return Math.max(1, partitionCount);
+        }
+        return Math.max(
+                1, Math.min(Math.max(1, configuredParallelism), Math.max(1, partitionCount)));
     }
 
     private Optional<NativeExportAttempt> nativeExportAttempt(

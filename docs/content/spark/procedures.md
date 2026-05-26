@@ -488,6 +488,8 @@ This section introduce all available spark procedures about paimon.
             <li>compression: Parquet compression codec. Left empty for zstd.</li>
             <li>overwrite: whether to overwrite the output directory. Left empty for false.</li>
             <li>target_file_size: target Parquet file size, such as "128 MB". Left empty to keep one output file per Paimon split.</li>
+            <li>partitioned_output: whether to write Paimon partitions under separate partition directories. Left empty for false.</li>
+            <li>partition_job_parallelism: max concurrent partition export jobs when partitioned_output is true. Left empty to use the actual exported partition count.</li>
             <li>Native IO: the default path is the Java export path. Setting spark.paimon.native-io.export.enabled=true attempts the native fast path and requires spark.paimon.native-io.enabled=true plus paimon-native-io on driver and executor classpaths. Driver preflight failures fall back to Java by default; set spark.paimon.native-io.export.fail-on-fallback=true to fail when native export is not applicable.</li>
       </td>
       <td>

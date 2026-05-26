@@ -30,4 +30,13 @@ class ExportParquetProcedureNativeTest {
         assertThat(ExportParquetProcedure.nativeTaskCount(32, 100)).isEqualTo(32);
         assertThat(ExportParquetProcedure.nativeTaskCount(1, 100)).isEqualTo(1);
     }
+
+    @Test
+    void defaultPartitionJobParallelismUsesAllPartitions() {
+        assertThat(ExportParquetProcedure.partitionJobParallelism(null, 2)).isEqualTo(2);
+        assertThat(ExportParquetProcedure.partitionJobParallelism(null, 8)).isEqualTo(8);
+        assertThat(ExportParquetProcedure.partitionJobParallelism(4, 8)).isEqualTo(4);
+        assertThat(ExportParquetProcedure.partitionJobParallelism(16, 8)).isEqualTo(8);
+        assertThat(ExportParquetProcedure.partitionJobParallelism(0, 8)).isEqualTo(1);
+    }
 }

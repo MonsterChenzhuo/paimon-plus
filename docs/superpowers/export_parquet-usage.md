@@ -50,7 +50,7 @@ CALL sys.export_parquet(
 | `overwrite` | `BOOLEAN` | 否 | `false` | 输出目录已存在时是否删除后重写。 |
 | `target_file_size` | `STRING` | 否 | 空，表示按 Paimon split 写文件 | 目标 Parquet 文件大小，例如 `'128 MB'`。配置后会启用滚动写文件。 |
 | `partitioned_output` | `BOOLEAN` | 否 | `false` | 是否按 Paimon 分区分别输出到 `output_path/分区路径`。 |
-| `partition_job_parallelism` | `INT` | 否 | `1` | `partitioned_output=true` 时，并发提交分区导出 job 的上限。 |
+| `partition_job_parallelism` | `INT` | 否 | 实际导出分区数 | `partitioned_output=true` 时，并发提交分区导出 job 的上限。 |
 | `compact_output` | `BOOLEAN` | 否 | `false` | 导出目录写完后，是否将该导出目录的 Parquet 文件通过 row-group 级 copy 合并为接近 `target_file_size` 的文件。 |
 
 ## Native fast path
@@ -291,7 +291,9 @@ s3://bucket/export/orders/
   dt=2026-05-03/
 ```
 
-`partition_job_parallelism` 控制 driver 侧最多同时提交多少个分区导出 job。每个分区导出 job 内部仍受 `parallelism` 控制。
+`partition_job_parallelism` 控制 driver 侧最多同时提交多少个分区导出 job。未显式配置时，默认按实际导出分区数并发提交，也就是有多少个分区就提交多少个分区导出 job。每个分区导出 job 内部仍受 `parallelism` 控制。
+
+如果 Spark 应用在创建 `SparkContext` 前配置了 `spark.scheduler.mode=FAIR`，这些分区导出 job 会被放入独立 scheduler pool，便于 Spark 在相互无依赖的分区任务之间公平调度。若仍使用默认 FIFO scheduler，procedure 仍会并发提交 job，但 Spark 底层调度可能按 FIFO 排队。
 
 注意：
 
