@@ -66,12 +66,12 @@ import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.Projection;
 import org.apache.paimon.utils.StringUtils;
 
-import org.apache.parquet.ParquetReadOptions;
-import org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.parquet.hadoop.ParquetFileWriter;
-import org.apache.parquet.hadoop.ParquetWriter;
-import org.apache.parquet.hadoop.metadata.FileMetaData;
-import org.apache.parquet.schema.MessageType;
+import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileWriter;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetWriter;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.FileMetaData;
+import org.apache.paimon.shade.org.apache.parquet.schema.MessageType;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -846,7 +846,8 @@ public class ExportParquetProcedure extends BaseProcedure {
                         new ParquetFileReader(
                                 ParquetInputFile.fromPath(
                                         fileIO, parquetFile.getPath(), parquetFile.getLen()),
-                                ParquetReadOptions.builder().build())) {
+                                ParquetReadOptions.builder().build(),
+                                null)) {
                     FileMetaData fileMetaData = reader.getFileMetaData();
                     if (writer == null) {
                         schema = fileMetaData.getSchema();

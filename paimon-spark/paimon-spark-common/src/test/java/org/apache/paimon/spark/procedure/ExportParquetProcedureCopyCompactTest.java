@@ -37,9 +37,9 @@ import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
-import org.apache.parquet.ParquetReadOptions;
-import org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.paimon.shade.org.apache.parquet.ParquetReadOptions;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.paimon.shade.org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -76,7 +76,8 @@ class ExportParquetProcedureCopyCompactTest {
                 new ParquetFileReader(
                         ParquetInputFile.fromPath(
                                 fileIO, compacted, fileIO.getFileStatus(compacted).getLen()),
-                        ParquetReadOptions.builder().build())) {
+                        ParquetReadOptions.builder().build(),
+                        null)) {
             assertThat(reader.getFooter().getBlocks()).hasSize(2);
             assertThat(
                             reader.getFooter().getBlocks().stream()
