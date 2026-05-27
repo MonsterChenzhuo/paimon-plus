@@ -19,13 +19,17 @@
 
 package org.apache.paimon.spark.diagnostics.profiler
 
-import org.apache.spark.SparkConf
+import org.apache.paimon.spark.diagnostics.PaimonDiagnostics
+
+import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.api.plugin.{DriverPlugin, ExecutorPlugin, PluginContext, SparkPlugin}
 import org.apache.spark.internal.Logging
+import org.apache.spark.ui.PaimonDiagnosticsTabSupport
 
 import java.util.{Collections, Map => JMap}
 
 import scala.util.Random
+import scala.util.control.NonFatal
 
 class PaimonProfilerPlugin extends SparkPlugin {
 
@@ -38,8 +42,11 @@ private class PaimonProfilerDriverPlugin extends DriverPlugin with Logging {
 
   private var profiler: PaimonSparkAsyncProfiler = _
 
-  override def init(sc: org.apache.spark.SparkContext, ctx: PluginContext): JMap[String, String] = {
+  override def init(sc: SparkContext, ctx: PluginContext): JMap[String, String] = {
     val conf = ctx.conf()
+    if (conf.getBoolean(PaimonDiagnostics.UiEnabledKey, defaultValue = true)) {
+      installDiagnosticsTab(sc)
+    }
     if (PaimonProfilerConf.driverEnabled(conf)) {
       profiler = new PaimonSparkAsyncProfiler(conf, "driver")
       profiler.start()
@@ -50,6 +57,17 @@ private class PaimonProfilerDriverPlugin extends DriverPlugin with Logging {
   override def shutdown(): Unit = {
     if (profiler != null) {
       profiler.stop()
+    }
+  }
+
+  private def installDiagnosticsTab(sc: SparkContext): Unit = {
+    try {
+      val uiMethod = sc.getClass.getMethod("ui")
+      val ui = uiMethod.invoke(sc).asInstanceOf[Option[Any]]
+      ui.foreach(PaimonDiagnosticsTabSupport.attach)
+    } catch {
+      case NonFatal(e) =>
+        logWarning("Failed to attach Paimon diagnostics tab from profiler plugin.", e)
     }
   }
 }
