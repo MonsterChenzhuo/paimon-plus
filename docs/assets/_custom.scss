@@ -783,6 +783,89 @@ pre.chroma code {
     font-weight: 750;
 }
 
+.pp-notes {
+    background: #07100f;
+}
+
+.markdown .paimon-plus-home .pp-notes h2,
+.markdown .paimon-plus-home .pp-notes p {
+    color: #f7fff9;
+}
+
+.pp-notes-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 0.9fr 0.9fr;
+    gap: 1rem;
+}
+
+.markdown .paimon-plus-home .pp-note-card {
+    display: block;
+    min-height: 260px;
+    padding: 1.5rem;
+    border-radius: 8px;
+    color: #effcf4;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    text-decoration: none;
+}
+
+.markdown .paimon-plus-home .pp-note-card-primary {
+    background:
+        linear-gradient(140deg, rgba(102, 226, 188, 0.18), rgba(245, 191, 85, 0.1)),
+        rgba(255, 255, 255, 0.08);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.25);
+}
+
+.pp-note-card span {
+    display: inline-flex;
+    min-height: 1.65rem;
+    align-items: center;
+    margin-bottom: 1.3rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: 999px;
+    color: #66e2bc;
+    background: rgba(102, 226, 188, 0.12);
+    font-size: 0.74rem;
+    font-weight: 850;
+    text-transform: uppercase;
+}
+
+.markdown .paimon-plus-home .pp-note-card h3 {
+    color: #ffffff;
+    font-size: 1.45rem;
+}
+
+.markdown .paimon-plus-home .pp-note-card p {
+    color: #c9d8d1;
+}
+
+.pp-note-card strong {
+    display: inline-block;
+    margin-top: 1.4rem;
+    color: #66e2bc;
+    font-size: 0.95rem;
+}
+
+.engineering-figure {
+    margin: 1.8rem 0 2.2rem;
+}
+
+.engineering-figure img {
+    display: block;
+    width: 100%;
+    border: 1px solid #d9e2dc;
+    border-radius: 8px;
+    background: #ffffff;
+    box-shadow: 0 18px 42px rgba(26, 49, 40, 0.08);
+}
+
+.engineering-figure figcaption {
+    margin-top: 0.7rem;
+    color: #5d6a64;
+    font-size: 0.92rem;
+    line-height: 1.5;
+}
+
 @media screen and (min-width: 1244px) {
     .pp-hero,
     .pp-proof-grid,
@@ -807,6 +890,10 @@ pre.chroma code {
 
     .pp-feature-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .pp-notes-grid {
+        grid-template-columns: 1fr;
     }
 }
 
@@ -850,7 +937,8 @@ pre.chroma code {
     .pp-proof-grid,
     .pp-feature-grid,
     .pp-pipeline-grid,
-    .pp-capability-layout {
+    .pp-capability-layout,
+    .pp-notes-grid {
         grid-template-columns: 1fr;
     }
 

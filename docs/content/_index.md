@@ -251,4 +251,34 @@ wide schemas and operational exports less fragile in real Spark deployments.
 </div>
 </div>
 </section>
+
+<section class="pp-section pp-notes">
+<div class="pp-section-head">
+<span class="pp-eyebrow">Engineering Notes</span>
+<h2>Scenario, design, implementation, and commits</h2>
+<p>
+The product surface is only the entry point. Engineering Notes go deeper into the production
+scenario, the technical route, the concrete implementation, the related commits, and the problems
+each feature actually removes.
+</p>
+</div>
+<div class="pp-notes-grid">
+<a class="pp-note-card pp-note-card-primary" href="engineering-notes/paimon-diagnostics-ui/">
+<span>Case study</span>
+<h3>Paimon Diagnostics UI</h3>
+<p>How Paimon Plus adds Spark UI pages for executors, thread dump flame graphs, and async-profiler outputs.</p>
+<strong>Read the note</strong>
+</a>
+<article class="pp-note-card">
+<span>Coming next</span>
+<h3>Native IO Export</h3>
+<p>Why wide feature-table export needs driver preflight, raw Parquet split planning, DV pushdown, and native fallback evidence.</p>
+</article>
+<article class="pp-note-card">
+<span>Coming next</span>
+<h3>spark-cli Analysis</h3>
+<p>How diagnostics APIs and Spark History Server evidence can become an AI-readable root-cause workflow.</p>
+</article>
+</div>
+</section>
 </div>

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc">
+  <title id="title">Paimon async-profiler output files</title>
+  <desc id="desc">A Spark UI profiler page listing executor HTML profiles and an embedded flame graph.</desc>
+  <rect width="1600" height="720" fill="#ffffff"/>
+  <text x="20" y="48" font-family="Arial, sans-serif" font-size="30" font-weight="700" fill="#252a32">Paimon Profiler</text>
+  <g transform="translate(20 80)">
+    <rect width="1560" height="72" fill="#ffffff" stroke="#d7dde5"/>
+    <text x="12" y="24" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#252a32">Output Suffix</text>
+    <text x="460" y="24" font-family="Arial, sans-serif" font-size="17" fill="#252a32">html</text>
+    <text x="12" y="52" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#252a32">Async Profiler Args</text>
+    <text x="460" y="52" font-family="Arial, sans-serif" font-size="17" fill="#252a32">event=wall,interval=10ms</text>
+  </g>
+  <text x="20" y="192" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#252a32">Profiler Output Files</text>
+  <g transform="translate(20 212)">
+    <rect width="1560" height="156" fill="#ffffff" stroke="#d7dde5"/>
+    <rect width="1560" height="32" fill="#fbfcfd"/>
+    <g font-family="Arial, sans-serif" font-size="16" font-weight="700" fill="#252a32">
+      <text x="8" y="22">File</text><text x="470" y="22">Format</text><text x="650" y="22">Size</text><text x="860" y="22">Updated</text><text x="1288" y="22">Flame Graph</text>
+    </g>
+    <g font-family="Arial, sans-serif" font-size="15" fill="#252a32">
+      <g transform="translate(0 32)"><rect width="1560" height="25" fill="#eef0f2"/><text x="8" y="18" fill="#d01673">profile-exec-1.html</text><text x="470" y="18">html</text><text x="650" y="18">743.8 KiB</text><text x="860" y="18">2026/05/27 10:35:08</text><text x="1288" y="18" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 57)"><rect width="1560" height="25" fill="#ffffff"/><text x="8" y="18" fill="#d01673">profile-exec-2.html</text><text x="470" y="18">html</text><text x="650" y="18">759.9 KiB</text><text x="860" y="18">2026/05/27 10:35:08</text><text x="1288" y="18" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 82)"><rect width="1560" height="25" fill="#eef0f2"/><text x="8" y="18" fill="#d01673">profile-exec-3.html</text><text x="470" y="18">html</text><text x="650" y="18">745.2 KiB</text><text x="860" y="18">2026/05/27 10:35:08</text><text x="1288" y="18" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 107)"><rect width="1560" height="25" fill="#ffffff"/><text x="8" y="18" fill="#d01673">profile-exec-4.html</text><text x="470" y="18">html</text><text x="650" y="18">743.9 KiB</text><text x="860" y="18">2026/05/27 10:35:08</text><text x="1288" y="18" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 132)"><rect width="1560" height="24" fill="#eef0f2"/><text x="8" y="17" fill="#d01673">profile-exec-5.html</text><text x="470" y="17">html</text><text x="650" y="17">731.5 KiB</text><text x="860" y="17">2026/05/27 10:35:08</text><text x="1288" y="17" fill="#0076c0">Open</text></g>
+    </g>
+  </g>
+  <text x="20" y="412" font-family="Arial, sans-serif" font-size="23" font-weight="700" fill="#252a32">Async Profiler Flame Graph - profile-exec-5.html</text>
+  <g transform="translate(20 432)">
+    <rect width="1560" height="248" fill="#ffffff" stroke="#d7dde5"/>
+    <g transform="translate(8 176)" font-family="Arial, sans-serif" font-size="12">
+      <rect x="0" y="48" width="1030" height="16" fill="#f06f79"/><text x="4" y="60">all</text>
+      <rect x="30" y="32" width="420" height="16" fill="#75df6d"/><text x="36" y="44">java/lang/Thread.run</text>
+      <rect x="450" y="32" width="600" height="16" fill="#f07a7a"/><text x="456" y="44">start_thread</text>
+      <rect x="70" y="16" width="160" height="16" fill="#71df76"/><text x="76" y="28">io/netty/channel</text>
+      <rect x="230" y="16" width="110" height="16" fill="#b9e96c"/><text x="236" y="28">java/util</text>
+      <rect x="340" y="16" width="110" height="16" fill="#f199a8"/><text x="346" y="28">org/apache</text>
+      <rect x="450" y="16" width="300" height="16" fill="#e3e13d"/><text x="456" y="28">pthread_cond_wait</text>
+      <rect x="750" y="16" width="300" height="16" fill="#e3e13d"/><text x="756" y="28">Monitor::wait</text>
+      <rect x="230" y="0" width="18" height="16" fill="#56e760"/><text x="232" y="12">j</text>
+      <rect x="560" y="0" width="360" height="16" fill="#e3e13d"/><text x="566" y="12">CompileBroker::compiler_thread_loop</text>
+      <rect x="920" y="0" width="210" height="16" fill="#f07a7a"/><text x="926" y="12">JavaThread::run</text>
+    </g>
+    <rect x="236" y="0" width="10" height="224" fill="#56e760" opacity="0.9"/>
+    <rect x="360" y="140" width="24" height="84" fill="#f07a7a"/>
+    <rect x="720" y="126" width="2" height="98" fill="#eceb48"/>
+    <rect x="1040" y="150" width="2" height="74" fill="#ffc4c4"/>
+  </g>
+</svg>

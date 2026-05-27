@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc">
+  <title id="title">Paimon Diagnostics executor overview</title>
+  <desc id="desc">A Spark UI diagnostics tab showing executor rows and thread dump flame graph links.</desc>
+  <rect width="1600" height="720" fill="#f7f8fa"/>
+  <rect width="1600" height="54" fill="#ffffff"/>
+  <rect y="54" width="1600" height="1" fill="#d9dde3"/>
+  <text x="18" y="36" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#2b2f36">Spark 3.4.4</text>
+  <text x="184" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">Jobs</text>
+  <text x="286" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">Stages</text>
+  <text x="408" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">Storage</text>
+  <text x="544" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">Environment</text>
+  <text x="744" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">Executors</text>
+  <rect x="880" y="0" width="210" height="54" fill="#e8e8e8"/>
+  <text x="902" y="36" font-family="Arial, sans-serif" font-size="22" fill="#343941">Paimon-diagnostics</text>
+  <text x="1170" y="36" font-family="Arial, sans-serif" font-size="22" fill="#6c7078">SQL / DataFrame</text>
+  <text x="20" y="116" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#252a32">Paimon Diagnostics</text>
+  <text x="58" y="156" font-family="Arial, sans-serif" font-size="18" fill="#006db6">Executors | Profiler</text>
+  <text x="20" y="204" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#252a32">Executors</text>
+  <g transform="translate(20 228)">
+    <rect width="1560" height="418" fill="#ffffff" stroke="#d7dde5"/>
+    <rect width="1560" height="38" fill="#fbfcfd"/>
+    <g font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#252a32">
+      <text x="12" y="26">Executor</text>
+      <text x="154" y="26">Host</text>
+      <text x="448" y="26">Active Tasks</text>
+      <text x="618" y="26">Total Tasks</text>
+      <text x="778" y="26">Failed Tasks</text>
+      <text x="948" y="26">Total Duration</text>
+      <text x="1168" y="26">GC Time</text>
+      <text x="1300" y="26">Thread Dump Flame Graph</text>
+    </g>
+    <g font-family="Arial, sans-serif" font-size="17" fill="#252a32">
+      <g transform="translate(0 38)"><rect width="1560" height="38" fill="#eef0f2"/><text x="12" y="25">driver</text><text x="154" y="25">10.166.18.194:41738</text><text x="448" y="25">0</text><text x="618" y="25">0</text><text x="778" y="25">0</text><text x="948" y="25">350.1 s</text><text x="1168" y="25">1.5 s</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 76)"><rect width="1560" height="38" fill="#ffffff"/><text x="12" y="25">1</text><text x="154" y="25">10.166.23.146:42812</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 114)"><rect width="1560" height="38" fill="#eef0f2"/><text x="12" y="25">10</text><text x="154" y="25">10.166.23.156:43003</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 152)"><rect width="1560" height="38" fill="#ffffff"/><text x="12" y="25">11</text><text x="154" y="25">10.166.23.209:43612</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 190)"><rect width="1560" height="38" fill="#eef0f2"/><text x="12" y="25">12</text><text x="154" y="25">10.166.23.113:42955</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 228)"><rect width="1560" height="38" fill="#ffffff"/><text x="12" y="25">13</text><text x="154" y="25">10.166.23.232:43862</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 266)"><rect width="1560" height="38" fill="#eef0f2"/><text x="12" y="25">14</text><text x="154" y="25">10.166.23.209:36654</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+      <g transform="translate(0 304)"><rect width="1560" height="38" fill="#ffffff"/><text x="12" y="25">15</text><text x="154" y="25">10.166.23.146:37682</text><text x="448" y="25">1</text><text x="618" y="25">1</text><text x="778" y="25">0</text><text x="948" y="25">0 ms</text><text x="1168" y="25">0 ms</text><text x="1300" y="25" fill="#0076c0">Open</text></g>
+    </g>
+    <g stroke="#d7dde5">
+      <line x1="142" y1="0" x2="142" y2="418"/><line x1="430" y1="0" x2="430" y2="418"/><line x1="600" y1="0" x2="600" y2="418"/><line x1="760" y1="0" x2="760" y2="418"/><line x1="930" y1="0" x2="930" y2="418"/><line x1="1150" y1="0" x2="1150" y2="418"/><line x1="1282" y1="0" x2="1282" y2="418"/>
+    </g>
+  </g>
+</svg>
