@@ -47,6 +47,7 @@ class PaimonProfilerPluginSuite extends FunSuite {
         .init(spark.sparkContext, new TestPluginContext(spark.sparkContext.getConf))
 
       assert(tabPrefixes(spark).contains("paimon-diagnostics"))
+      assert(!handlerPaths(spark).contains("/paimon-diagnostics/static"))
     } finally {
       spark.stop()
       SparkSession.clearActiveSession()
@@ -61,6 +62,17 @@ class PaimonProfilerPluginSuite extends FunSuite {
       val getTabs = sparkUI.getClass.getMethod("getTabs")
       getTabs.invoke(sparkUI).asInstanceOf[Seq[Any]].map { tab =>
         tab.getClass.getMethod("prefix").invoke(tab).asInstanceOf[String]
+      }
+    }.getOrElse(Seq.empty)
+  }
+
+  private def handlerPaths(spark: SparkSession): Seq[String] = {
+    val uiMethod = spark.sparkContext.getClass.getMethod("ui")
+    val ui = uiMethod.invoke(spark.sparkContext).asInstanceOf[Option[Any]]
+    ui.map { sparkUI =>
+      val getHandlers = sparkUI.getClass.getMethod("getHandlers")
+      getHandlers.invoke(sparkUI).asInstanceOf[Seq[Any]].map { handler =>
+        handler.getClass.getMethod("getContextPath").invoke(handler).asInstanceOf[String]
       }
     }.getOrElse(Seq.empty)
   }

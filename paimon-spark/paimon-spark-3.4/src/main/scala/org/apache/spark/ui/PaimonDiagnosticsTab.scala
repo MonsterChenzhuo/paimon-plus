@@ -44,19 +44,11 @@ object PaimonDiagnosticsTabSupport {
 
   val TabPrefix = "paimon-diagnostics"
 
-  private val StaticPath = "/" + TabPrefix + "/static"
-  private val StaticResourceDir = "org/apache/paimon/spark/diagnostics/static"
-
   def attach(ui: Any): Unit = {
     val sparkUI = ui.asInstanceOf[SparkUI]
     if (!sparkUI.getTabs.exists(_.prefix == TabPrefix)) {
-      sparkUI.addStaticHandler(StaticResourceDir, StaticPath)
       sparkUI.attachTab(new PaimonDiagnosticsTab(sparkUI))
     }
-  }
-
-  def staticResource(request: HttpServletRequest, resource: String): String = {
-    UIUtils.prependBaseUri(request, StaticPath + "/" + resource)
   }
 }
 
@@ -176,9 +168,8 @@ private class PaimonThreadDumpFlamegraphPage(tab: PaimonDiagnosticsTab, sparkUI:
           {PaimonFlamegraphNode.fromThreadDump(threadDump).toJsonString}
         </div>
         <div id="paimon-flamegraph-chart" class="paimon-flamegraph"></div>
-        <link rel="stylesheet" type="text/css"
-              href={PaimonDiagnosticsTabSupport.staticResource(request, "paimon-flamegraph.css")}></link>
-        <script src={PaimonDiagnosticsTabSupport.staticResource(request, "paimon-flamegraph.js")}></script>
+        <style type="text/css">{Unparsed(PaimonFlamegraphAssets.Css)}</style>
+        <script>{Unparsed(PaimonFlamegraphAssets.Js)}</script>
         <script>{Unparsed(js)}</script>
       </div>)
   }
@@ -256,6 +247,104 @@ private class PaimonProfilerPage(tab: PaimonDiagnosticsTab, sparkUI: SparkUI)
       .contains(PaimonProfilerConf.PluginClass)
       .toString
   }
+}
+
+private object PaimonFlamegraphAssets {
+
+  val Css: String =
+    """
+      |.paimon-flamegraph {
+      |  border: 1px solid #d6d6d6;
+      |  margin: 12px 0 24px 0;
+      |  overflow-x: auto;
+      |  overflow-y: hidden;
+      |  position: relative;
+      |  width: 100%;
+      |}
+      |
+      |.paimon-flamegraph-frame {
+      |  border: 1px solid rgba(255, 255, 255, 0.85);
+      |  box-sizing: border-box;
+      |  color: #1f1f1f;
+      |  cursor: pointer;
+      |  font-family: Verdana, Arial, sans-serif;
+      |  font-size: 12px;
+      |  height: 22px;
+      |  line-height: 20px;
+      |  overflow: hidden;
+      |  padding: 0 4px;
+      |  position: absolute;
+      |  text-overflow: ellipsis;
+      |  white-space: nowrap;
+      |}
+      |
+      |.paimon-flamegraph-frame:hover {
+      |  border-color: #222;
+      |}
+      |""".stripMargin
+
+  val Js: String =
+    """
+      |(function () {
+      |  function depth(node) {
+      |    if (!node.children || node.children.length === 0) {
+      |      return 1;
+      |    }
+      |    return 1 + Math.max.apply(null, node.children.map(depth));
+      |  }
+      |
+      |  function color(name) {
+      |    var hash = 0;
+      |    for (var i = 0; i < name.length; i++) {
+      |      hash = ((hash << 5) - hash) + name.charCodeAt(i);
+      |      hash = hash & hash;
+      |    }
+      |    var hue = Math.abs(hash) % 360;
+      |    return "hsl(" + hue + ", 70%, 72%)";
+      |  }
+      |
+      |  function title(node, rootValue) {
+      |    var pct = rootValue === 0 ? 0 : (node.value * 100.0 / rootValue);
+      |    return node.name + " (" + node.value + " samples, " + pct.toFixed(2) + "%)";
+      |  }
+      |
+      |  function addFrame(chart, node, rootValue, level, left, width) {
+      |    var frame = document.createElement("div");
+      |    frame.className = "paimon-flamegraph-frame";
+      |    frame.style.backgroundColor = color(node.name);
+      |    frame.style.left = left + "%";
+      |    frame.style.top = (level * 22) + "px";
+      |    frame.style.width = width + "%";
+      |    frame.title = title(node, rootValue);
+      |    frame.textContent = node.name;
+      |    chart.appendChild(frame);
+      |
+      |    if (!node.children || node.children.length === 0 || node.value === 0) {
+      |      return;
+      |    }
+      |
+      |    var childLeft = left;
+      |    node.children.forEach(function (child) {
+      |      var childWidth = width * child.value / node.value;
+      |      addFrame(chart, child, rootValue, level + 1, childLeft, childWidth);
+      |      childLeft += childWidth;
+      |    });
+      |  }
+      |
+      |  window.paimonDrawFlamegraph = function (dataId, chartId) {
+      |    var dataElement = document.getElementById(dataId);
+      |    var chart = document.getElementById(chartId);
+      |    if (!dataElement || !chart) {
+      |      return;
+      |    }
+      |
+      |    var data = JSON.parse(dataElement.textContent.trim());
+      |    chart.innerHTML = "";
+      |    chart.style.height = (depth(data) * 22) + "px";
+      |    addFrame(chart, data, data.value || 0, 0, 0, 100);
+      |  };
+      |})();
+      |""".stripMargin
 }
 
 private object PaimonDiagnosticsNav {
