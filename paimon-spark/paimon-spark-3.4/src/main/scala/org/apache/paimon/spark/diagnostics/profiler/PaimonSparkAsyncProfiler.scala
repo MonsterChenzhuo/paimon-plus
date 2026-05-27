@@ -29,6 +29,7 @@ import org.apache.spark.internal.Logging
 import java.io.{BufferedInputStream, FileInputStream, IOException, InputStream}
 import java.net.URI
 import java.nio.file.{Files, Paths}
+import java.util.Locale
 import java.util.concurrent.{Executors, ScheduledExecutorService, ThreadFactory, TimeUnit}
 
 class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logging {
@@ -36,10 +37,12 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
   private val profilerArgs = PaimonProfilerConf.asyncProfilerArgs(conf)
   private val profilerDfsDir = PaimonProfilerConf.dfsDir(conf)
   private val profilerLocalDir = PaimonProfilerConf.localDir(conf)
+  private val outputSuffix = PaimonProfilerConf.outputSuffix(conf)
   private val profileFile =
-    PaimonProfilerConf.profileFile(executorId, PaimonProfilerConf.outputSuffix(conf))
+    PaimonProfilerConf.profileFile(executorId, outputSuffix)
   private val profilePath = profilerLocalDir + "/" + profileFile
   private val writeInterval = PaimonProfilerConf.dfsWriteIntervalSeconds(conf)
+  private val appendDfsOutput = outputSuffix.toLowerCase(Locale.ROOT) == "jfr"
 
   private val startCommand = "start," + profilerArgs + ",file=" + profilePath
   private val stopCommand = "stop," + profilerArgs + ",file=" + profilePath
@@ -103,7 +106,6 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
   private def startWriting(): Unit = {
     profilerDfsDir.foreach { _ =>
       try {
-        inputStream = new BufferedInputStream(new FileInputStream(profilePath))
         threadPool = Executors.newSingleThreadScheduledExecutor(daemonThreadFactory)
         threadPool.scheduleWithFixedDelay(
           new Runnable {
@@ -126,21 +128,22 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
       return
     }
 
-    ensureOutputStream()
-
     try {
       profiler.foreach(_.execute(stopCommand))
       profiler.foreach(_.execute(dumpCommand))
-      var remaining = inputStream.available()
-      if (!lastChunk) {
-        profiler.foreach(_.execute(resumeCommand))
+      if (appendDfsOutput) {
+        ensureInputStream()
+        val remaining = inputStream.available()
+        if (!lastChunk) {
+          profiler.foreach(_.execute(resumeCommand))
+        }
+        writeAppendedBytes(remaining)
+      } else {
+        writeSnapshot()
+        if (!lastChunk) {
+          profiler.foreach(_.execute(resumeCommand))
+        }
       }
-      while (remaining > 0) {
-        val read = inputStream.read(dataBuffer, 0, math.min(remaining, UploadSize))
-        outputStream.write(dataBuffer, 0, read)
-        remaining -= read
-      }
-      outputStream.hflush()
     } catch {
       case e: IOException =>
         logError("Exception while writing Paimon profiler output.", e)
@@ -151,21 +154,55 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
     }
   }
 
+  private def ensureInputStream(): Unit = {
+    if (inputStream == null) {
+      inputStream = new BufferedInputStream(new FileInputStream(profilePath))
+    }
+  }
+
+  private def writeAppendedBytes(bytes: Int): Unit = {
+    ensureOutputStream()
+    var remaining = bytes
+    while (remaining > 0) {
+      val read = inputStream.read(dataBuffer, 0, math.min(remaining, UploadSize))
+      if (read < 0) {
+        return
+      }
+      outputStream.write(dataBuffer, 0, read)
+      remaining -= read
+    }
+    outputStream.hflush()
+  }
+
+  private def writeSnapshot(): Unit = {
+    val copied =
+      PaimonProfilerDfsOutput.copySnapshot(
+        profilePath,
+        dfsOutputFile,
+        newHadoopConfiguration())
+    if (!copied) {
+      logWarning("Paimon profiler output file is not available yet: " + profilePath)
+    }
+  }
+
   private def ensureOutputStream(): Unit = {
     if (outputStream == null) {
-      while (conf.getOption("spark.app.id").isEmpty) {
-        Thread.sleep(1000L)
-      }
-      val appId = conf.getAppId
-      val attemptId = conf.getOption("spark.app.attempt.id")
-      val outputDir = PaimonProfilerConf.appAttemptDir(profilerDfsDir.get, appId, attemptId)
-      val outputFile = outputDir + "/" + profileFile
       val hadoopConf = newHadoopConfiguration()
+      val outputFile = dfsOutputFile
       val fs = FileSystem.get(new URI(outputFile), hadoopConf)
-      fs.mkdirs(new Path(outputDir))
+      fs.mkdirs(new Path(outputFile).getParent)
       outputStream = fs.create(new Path(outputFile), true)
       logInfo("Copying Paimon profiler output to " + outputFile)
     }
+  }
+
+  private def dfsOutputFile: String = {
+    while (conf.getOption("spark.app.id").isEmpty) {
+      Thread.sleep(1000L)
+    }
+    val appId = conf.getAppId
+    val attemptId = conf.getOption("spark.app.attempt.id")
+    PaimonProfilerConf.appAttemptDir(profilerDfsDir.get, appId, attemptId) + "/" + profileFile
   }
 
   private def finishWriting(): Unit = {
@@ -225,6 +262,38 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
         thread.setDaemon(true)
         thread
       }
+    }
+  }
+}
+
+private[profiler] object PaimonProfilerDfsOutput {
+
+  private val CopyBufferSize = 8 * 1024 * 1024
+
+  def copySnapshot(localFile: String, outputFile: String, hadoopConf: Configuration): Boolean = {
+    val localPath = Paths.get(localFile)
+    if (!Files.exists(localPath)) {
+      return false
+    }
+
+    val fs = FileSystem.get(new URI(outputFile), hadoopConf)
+    val outputPath = new Path(outputFile)
+    fs.mkdirs(outputPath.getParent)
+
+    val input = new BufferedInputStream(new FileInputStream(localFile))
+    val output = fs.create(outputPath, true)
+    try {
+      val buffer = new Array[Byte](CopyBufferSize)
+      var read = input.read(buffer)
+      while (read >= 0) {
+        output.write(buffer, 0, read)
+        read = input.read(buffer)
+      }
+      output.hflush()
+      true
+    } finally {
+      input.close()
+      output.close()
     }
   }
 }
