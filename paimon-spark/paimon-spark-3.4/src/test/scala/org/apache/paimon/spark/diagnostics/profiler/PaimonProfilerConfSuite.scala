@@ -32,7 +32,7 @@ class PaimonProfilerConfSuite extends FunSuite {
     assert(PaimonProfilerConf.executorFraction(conf) == 0.1D)
     assert(PaimonProfilerConf.localDir(conf) == ".")
     assert(PaimonProfilerConf.outputSuffix(conf) == "html")
-    assert(PaimonProfilerConf.asyncProfilerArgs(conf).contains("event=wall"))
+    assert(PaimonProfilerConf.asyncProfilerArgs(conf) == "event=wall,interval=10ms")
   }
 
   test("builds stable profile file names for driver and executors") {
@@ -47,5 +47,14 @@ class PaimonProfilerConfSuite extends FunSuite {
     assert(
       PaimonProfilerConf.appAttemptDir("hdfs:///profiles", "application_1", Some("attempt_2")) ==
         "hdfs:///profiles/application_1_attempt_2")
+  }
+
+  test("builds async-profiler commands with output options only for dump and stop") {
+    val file = "/tmp/profile-exec-1.html"
+    val args = "event=wall,interval=10ms,alloc=2m,lock=10ms,chunktime=300s"
+
+    assert(PaimonProfilerCommands.start(file, args) == "start,file=" + file + "," + args)
+    assert(PaimonProfilerCommands.dump(file) == "dump,file=" + file)
+    assert(PaimonProfilerCommands.stop(file) == "stop,file=" + file)
   }
 }

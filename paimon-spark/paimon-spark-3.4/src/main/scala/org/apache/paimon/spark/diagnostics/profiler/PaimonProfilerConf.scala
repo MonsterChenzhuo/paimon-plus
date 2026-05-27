@@ -34,7 +34,7 @@ object PaimonProfilerConf {
   val DfsWriteIntervalKey = "spark.paimon.profiler.dfsWriteInterval"
   val OutputSuffixKey = "spark.paimon.profiler.outputSuffix"
 
-  private val DefaultAsyncProfilerArgs = "event=wall,interval=10ms,alloc=2m,lock=10ms,chunktime=300s"
+  private val DefaultAsyncProfilerArgs = "event=wall,interval=10ms"
   private val DefaultOutputSuffix = "html"
 
   def driverEnabled(conf: SparkConf): Boolean = {

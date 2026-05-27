@@ -44,10 +44,9 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
   private val writeInterval = PaimonProfilerConf.dfsWriteIntervalSeconds(conf)
   private val appendDfsOutput = outputSuffix.toLowerCase(Locale.ROOT) == "jfr"
 
-  private val startCommand = "start," + profilerArgs + ",file=" + profilePath
-  private val stopCommand = "stop," + profilerArgs + ",file=" + profilePath
-  private val dumpCommand = "dump," + profilerArgs + ",file=" + profilePath
-  private val resumeCommand = "resume," + profilerArgs + ",file=" + profilePath
+  private val startCommand = PaimonProfilerCommands.start(profilePath, profilerArgs)
+  private val stopCommand = PaimonProfilerCommands.stop(profilePath)
+  private val dumpCommand = PaimonProfilerCommands.dump(profilePath)
 
   private val UploadSize = 8 * 1024 * 1024
   private val dataBuffer = new Array[Byte](UploadSize)
@@ -60,25 +59,43 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
 
   private lazy val extractionDir = Files.createTempDirectory("paimonAsyncProfiler")
 
-  private val profiler: Option[AsyncProfiler] = {
-    Option(
-      if (AsyncProfilerLoader.isSupported) {
-        AsyncProfilerLoader.setExtractionDirectory(extractionDir)
-        AsyncProfilerLoader.load()
-      } else {
-        null
-      })
-  }
+  private val profiler: Option[AsyncProfiler] =
+    try {
+      Option(
+        if (AsyncProfilerLoader.isSupported) {
+          AsyncProfilerLoader.setExtractionDirectory(extractionDir)
+          AsyncProfilerLoader.load()
+        } else {
+          logWarning(
+            "Paimon async profiler is not supported on this platform. os.name=" +
+              System.getProperty("os.name") + ", os.arch=" + System.getProperty("os.arch") +
+              ", java.version=" + System.getProperty("java.version") +
+              ", availableVersions=" + AsyncProfilerLoader.getAvailableVersions)
+          null
+        })
+    } catch {
+      case t: Throwable =>
+        logWarning(
+          "Failed to load Paimon async profiler. os.name=" + System.getProperty("os.name") +
+            ", os.arch=" + System.getProperty("os.arch") +
+            ", java.version=" + System.getProperty("java.version"),
+          t)
+        None
+    }
 
   def start(): Unit = {
     if (!running) {
       try {
-        profiler.foreach { profiler =>
-          Files.createDirectories(Paths.get(profilerLocalDir))
-          profiler.execute(startCommand)
-          running = true
-          logInfo("Paimon async profiler started for " + executorId + ".")
-          startWriting()
+        profiler match {
+          case Some(profiler) =>
+            Files.createDirectories(Paths.get(profilerLocalDir))
+            logInfo("Starting Paimon async profiler for " + executorId + ": " + startCommand)
+            profiler.execute(startCommand)
+            running = true
+            logInfo("Paimon async profiler started for " + executorId + ".")
+            startWriting()
+          case None =>
+            logWarning("Skipping Paimon async profiler for " + executorId + " because it is not available.")
         }
       } catch {
         case e @ (_: IllegalArgumentException | _: IllegalStateException | _: IOException) =>
@@ -92,9 +109,12 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
   def stop(): Unit = {
     if (running) {
       try {
-        profiler.foreach(_.execute(stopCommand))
+        if (profilerDfsDir.isDefined && writing) {
+          finishWriting()
+        } else {
+          profiler.foreach(_.execute(stopCommand))
+        }
         running = false
-        finishWriting()
         logInfo("Paimon async profiler stopped for " + executorId + ".")
       } catch {
         case e @ (_: IllegalArgumentException | _: IllegalStateException | _: IOException) =>
@@ -129,20 +149,13 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
     }
 
     try {
-      profiler.foreach(_.execute(stopCommand))
-      profiler.foreach(_.execute(dumpCommand))
+      profiler.foreach(_.execute(if (lastChunk) stopCommand else dumpCommand))
       if (appendDfsOutput) {
         ensureInputStream()
         val remaining = inputStream.available()
-        if (!lastChunk) {
-          profiler.foreach(_.execute(resumeCommand))
-        }
         writeAppendedBytes(remaining)
       } else {
         writeSnapshot()
-        if (!lastChunk) {
-          profiler.foreach(_.execute(resumeCommand))
-        }
       }
     } catch {
       case e: IOException =>
@@ -262,6 +275,30 @@ class PaimonSparkAsyncProfiler(conf: SparkConf, executorId: String) extends Logg
         thread.setDaemon(true)
         thread
       }
+    }
+  }
+}
+
+private[profiler] object PaimonProfilerCommands {
+
+  def start(profilePath: String, profilerArgs: String): String = {
+    withArgs("start,file=" + profilePath, profilerArgs)
+  }
+
+  def dump(profilePath: String): String = {
+    "dump,file=" + profilePath
+  }
+
+  def stop(profilePath: String): String = {
+    "stop,file=" + profilePath
+  }
+
+  private def withArgs(command: String, profilerArgs: String): String = {
+    val args = profilerArgs.trim
+    if (args.isEmpty) {
+      command
+    } else {
+      command + "," + args
     }
   }
 }
