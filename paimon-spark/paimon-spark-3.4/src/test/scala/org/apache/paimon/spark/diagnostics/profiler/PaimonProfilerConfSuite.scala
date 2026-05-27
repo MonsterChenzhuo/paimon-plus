@@ -31,7 +31,7 @@ class PaimonProfilerConfSuite extends FunSuite {
     assert(!PaimonProfilerConf.executorEnabled(conf))
     assert(PaimonProfilerConf.executorFraction(conf) == 0.1D)
     assert(PaimonProfilerConf.localDir(conf) == ".")
-    assert(PaimonProfilerConf.outputSuffix(conf) == "jfr")
+    assert(PaimonProfilerConf.outputSuffix(conf) == "html")
     assert(PaimonProfilerConf.asyncProfilerArgs(conf).contains("event=wall"))
   }
 

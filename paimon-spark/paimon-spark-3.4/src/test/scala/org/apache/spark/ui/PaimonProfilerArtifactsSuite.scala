@@ -63,4 +63,18 @@ class PaimonProfilerArtifactsSuite extends FunSuite {
 
     assert(loaded == html)
   }
+
+  test("returns guidance instead of throwing when jfr conversion is unavailable on java 8") {
+    val outputDir = Files.createTempDirectory("paimon-profiler-jfr-java8")
+    val file = outputDir.resolve("profile-exec-1.jfr")
+    Files.write(file, Array[Byte](1, 2, 3))
+
+    val loaded =
+      PaimonProfilerArtifacts
+        .loadFlameGraphHtml(new SparkConf(false), file.toUri.toString, "1.8")
+
+    assert(loaded.isLeft)
+    assert(loaded.left.get.contains("Java 9+"))
+    assert(loaded.left.get.contains("spark.paimon.profiler.outputSuffix=html"))
+  }
 }

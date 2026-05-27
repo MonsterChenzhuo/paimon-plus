@@ -460,6 +460,7 @@ private[ui] object PaimonProfilerArtifacts extends Logging {
   case class Artifact(name: String, path: String, format: String, length: Long, modificationTime: Long)
 
   private val SupportedProfileFile = "^profile-(driver|exec-[A-Za-z0-9_.-]+)\\.(jfr|html)$".r
+  private val MinimumJfrConverterJavaMajor = 9
   private val ReadBufferSize = 64 * 1024
 
   def list(conf: org.apache.spark.SparkConf, outputDir: String): Either[String, Seq[Artifact]] = {
@@ -493,11 +494,38 @@ private[ui] object PaimonProfilerArtifacts extends Logging {
   def loadFlameGraphHtml(
       conf: org.apache.spark.SparkConf,
       profilePath: String): Either[String, String] = {
+    loadFlameGraphHtml(conf, profilePath, System.getProperty("java.specification.version", ""))
+  }
+
+  private[ui] def loadFlameGraphHtml(
+      conf: org.apache.spark.SparkConf,
+      profilePath: String,
+      javaSpecVersion: String): Either[String, String] = {
     val path = new Path(profilePath)
     format(path.getName) match {
       case Some("html") => readUtf8(conf, path)
-      case Some("jfr") => convertJfrToHtml(conf, path)
+      case Some("jfr") =>
+        if (javaMajorVersion(javaSpecVersion) < MinimumJfrConverterJavaMajor) {
+          Left(jfrConversionUnavailableMessage(javaSpecVersion))
+        } else {
+          convertJfrToHtml(conf, path)
+        }
       case _ => Left("Unsupported profiler output format for " + path.getName)
+    }
+  }
+
+  private[ui] def javaMajorVersion(javaSpecVersion: String): Int = {
+    val version = Option(javaSpecVersion).getOrElse("").trim
+    val major =
+      if (version.startsWith("1.")) {
+        version.stripPrefix("1.").takeWhile(_ != '.')
+      } else {
+        version.takeWhile(_ != '.')
+      }
+    try {
+      major.toInt
+    } catch {
+      case _: NumberFormatException => 0
     }
   }
 
@@ -552,6 +580,9 @@ private[ui] object PaimonProfilerArtifacts extends Logging {
           localHtml.toString))
       Right(new String(Files.readAllBytes(localHtml), StandardCharsets.UTF_8))
     } catch {
+      case e: LinkageError =>
+        Left(jfrConversionUnavailableMessage(System.getProperty("java.specification.version", "")) +
+          " Converter error: " + errorMessage(e))
       case NonFatal(e) => Left(errorMessage(e))
     } finally {
       deleteIfExists(localHtml)
@@ -583,6 +614,13 @@ private[ui] object PaimonProfilerArtifacts extends Logging {
         case NonFatal(e) => logWarning("Failed to delete temporary profiler file " + path, e)
       }
     }
+  }
+
+  private def jfrConversionUnavailableMessage(javaSpecVersion: String): String = {
+    "JFR flame graph conversion requires Java 9+ because async-profiler's JFR converter uses " +
+      "Java 9 ByteBuffer APIs. Current Java specification version is " + javaSpecVersion +
+      ". Start the application with --conf spark.paimon.profiler.outputSuffix=html to generate " +
+      "browser-viewable flame graphs, or convert this JFR offline on JDK 11+."
   }
 
   private def newHadoopConfiguration(conf: org.apache.spark.SparkConf): Configuration = {

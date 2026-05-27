@@ -35,7 +35,7 @@ object PaimonProfilerConf {
   val OutputSuffixKey = "spark.paimon.profiler.outputSuffix"
 
   private val DefaultAsyncProfilerArgs = "event=wall,interval=10ms,alloc=2m,lock=10ms,chunktime=300s"
-  private val DefaultOutputSuffix = "jfr"
+  private val DefaultOutputSuffix = "html"
 
   def driverEnabled(conf: SparkConf): Boolean = {
     conf.getBoolean(DriverEnabledKey, defaultValue = false)
