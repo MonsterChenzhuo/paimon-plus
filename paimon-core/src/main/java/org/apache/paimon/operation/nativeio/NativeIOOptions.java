@@ -69,6 +69,10 @@ public final class NativeIOOptions {
         return options.get(CoreOptions.NATIVE_IO_MAX_BATCH_BYTES);
     }
 
+    public boolean columnarEnabled() {
+        return options.get(CoreOptions.NATIVE_IO_COLUMNAR_ENABLED);
+    }
+
     public boolean engineSupportsNativeIO() {
         String engine = options.get(CoreOptions.NATIVE_IO_INTERNAL_ENGINE);
         return SPARK_ENGINE.equalsIgnoreCase(engine);

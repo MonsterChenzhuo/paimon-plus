@@ -175,6 +175,7 @@ pub struct ReaderConfig {
     row_index_column: String,
     target_columns: Option<Vec<String>>,
     object_store_options: HashMap<String, String>,
+    deleted_positions: HashMap<String, HashSet<i64>>,
     last_error: Option<CString>,
 }
 
@@ -190,6 +191,7 @@ pub struct Reader {
 struct FileBatchReader {
     reader: ParquetRecordBatchReader,
     row_offset: i64,
+    deleted_positions: HashSet<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,6 +273,7 @@ impl ReaderConfig {
             row_index_column: DEFAULT_ROW_INDEX_COLUMN.to_string(),
             target_columns: None,
             object_store_options: HashMap::new(),
+            deleted_positions: HashMap::new(),
             last_error: None,
         }
     }
@@ -303,8 +306,14 @@ impl Reader {
                 }
             };
 
+            let input_rows = batch.num_rows();
             let batch = append_row_index(batch, &self.row_index_column, file_reader.row_offset)?;
-            file_reader.row_offset += batch.num_rows() as i64;
+            file_reader.row_offset += input_rows as i64;
+            let batch = filter_deleted_positions(
+                batch,
+                &self.row_index_column,
+                &file_reader.deleted_positions,
+            )?;
             return Ok(Some(batch));
         }
     }
@@ -1123,6 +1132,7 @@ fn build_file_batch_reader<R: ChunkReader + 'static>(
         FileBatchReader {
             reader,
             row_offset: 0,
+            deleted_positions: HashSet::new(),
         },
     ))
 }
@@ -1228,7 +1238,7 @@ fn build_file_readers(config: &ReaderConfig) -> Result<(SchemaRef, Vec<FileBatch
     let mut schema: Option<SchemaRef> = None;
     let mut file_readers = Vec::new();
     for file in &config.files {
-        let (file_schema, file_reader) = if file.starts_with("obs://") {
+        let (file_schema, mut file_reader) = if file.starts_with("obs://") {
             build_file_batch_reader(
                 ObsObjectChunkReader::new(file, &config.object_store_options)?,
                 config.batch_size,
@@ -1243,6 +1253,11 @@ fn build_file_readers(config: &ReaderConfig) -> Result<(SchemaRef, Vec<FileBatch
                 config.target_columns.as_deref(),
             )?
         };
+        file_reader.deleted_positions = config
+            .deleted_positions
+            .get(file)
+            .cloned()
+            .unwrap_or_default();
         if let Some(schema) = &schema {
             if schema.as_ref() != file_schema.as_ref() {
                 return Err(format!("native reader file schema mismatch for {}", file));
@@ -1356,6 +1371,30 @@ pub unsafe extern "C" fn paimon_reader_config_set_object_store_option(
                 0
             }
             (Err(e), _) | (_, Err(e)) => config.set_error(e),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_reader_config_add_deleted_position(
+    config: *mut ReaderConfig,
+    file: *const c_char,
+    position: i64,
+) -> i32 {
+    catch_config_i32(config, |config| {
+        if position < 0 {
+            return config.set_error("deleted position must be non-negative");
+        }
+        match cstr_to_non_empty_string(file, "file path") {
+            Ok(file) => {
+                config
+                    .deleted_positions
+                    .entry(file)
+                    .or_default()
+                    .insert(position);
+                0
+            }
+            Err(e) => config.set_error(e),
         }
     })
 }
@@ -3148,6 +3187,28 @@ fn push_unique_column(columns: &mut Vec<String>, column: &str) {
     if !columns.iter().any(|existing| existing == column) {
         columns.push(column.to_string());
     }
+}
+
+fn filter_deleted_positions(
+    batch: RecordBatch,
+    row_index_column: &str,
+    deleted_positions: &HashSet<i64>,
+) -> Result<RecordBatch, String> {
+    if deleted_positions.is_empty() {
+        return Ok(batch);
+    }
+    let row_indexes = batch
+        .column_by_name(row_index_column)
+        .ok_or_else(|| format!("native row index column {} is missing", row_index_column))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| format!("native row index column {} is not int64", row_index_column))?;
+    let mut values = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        values.push(!deleted_positions.contains(&row_indexes.value(row)));
+    }
+    let mask = BooleanArray::from(values);
+    filter_record_batch(&batch, &mask).map_err(|e| e.to_string())
 }
 
 fn apply_export_filters(
@@ -5005,6 +5066,49 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(second_index.value(0), 2);
+        assert!(reader.next_batch().unwrap().is_none());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filters_reader_batches_with_deleted_positions() {
+        let path = write_i64_parquet(vec![10, 20, 30, 40]);
+        let mut config = ReaderConfig::new();
+        config.files.push(path.clone());
+        config.batch_size = 4;
+        config.row_index_column = "__row_index".to_string();
+        config
+            .deleted_positions
+            .entry(path.clone())
+            .or_default()
+            .extend([1_i64, 3_i64]);
+
+        let (schema, file_readers) = build_file_readers(&config).unwrap();
+        let mut reader = Reader {
+            schema,
+            file_readers,
+            current_file: 0,
+            row_index_column: config.row_index_column,
+            last_error: None,
+        };
+
+        let batch = reader.next_batch().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let indexes = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 10);
+        assert_eq!(indexes.value(0), 0);
+        assert_eq!(values.value(1), 30);
+        assert_eq!(indexes.value(1), 2);
         assert!(reader.next_batch().unwrap().is_none());
 
         std::fs::remove_file(path).unwrap();

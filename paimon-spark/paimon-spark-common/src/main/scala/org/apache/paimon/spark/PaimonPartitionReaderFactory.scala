@@ -23,19 +23,49 @@ import org.apache.paimon.table.source.ReadBuilder
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import java.util.Objects
+import java.util.{Objects, ServiceLoader}
+
+import scala.collection.JavaConverters._
 
 case class PaimonPartitionReaderFactory(
     readBuilder: ReadBuilder,
     metadataColumns: Seq[PaimonMetadataColumn] = Seq.empty,
-    blobAsDescriptor: Boolean)
+    blobAsDescriptor: Boolean,
+    nativeColumnarBatchReadProviders: Seq[NativeColumnarBatchReadProvider] =
+      PaimonPartitionReaderFactory.loadNativeColumnarBatchReadProviders())
   extends PartitionReaderFactory {
 
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     partition match {
       case paimonInputPartition: PaimonInputPartition =>
         PaimonPartitionReader(readBuilder, paimonInputPartition, metadataColumns, blobAsDescriptor)
+      case _ =>
+        throw new RuntimeException(s"It's not a Paimon input partition, $partition")
+    }
+  }
+
+  override def supportColumnarReads(partition: InputPartition): Boolean = {
+    partition match {
+      case paimonInputPartition: PaimonInputPartition =>
+        nativeColumnarBatchReadProviders.exists(
+          _.supportColumnarReads(readBuilder, paimonInputPartition, metadataColumns.asJava))
+      case _ => false
+    }
+  }
+
+  override def createColumnarReader(
+      partition: InputPartition): PartitionReader[ColumnarBatch] = {
+    partition match {
+      case paimonInputPartition: PaimonInputPartition =>
+        nativeColumnarBatchReadProviders
+          .find(
+            _.supportColumnarReads(readBuilder, paimonInputPartition, metadataColumns.asJava))
+          .map(_.createColumnarReader(readBuilder, paimonInputPartition, metadataColumns.asJava))
+          .getOrElse(
+            throw new RuntimeException(
+              s"No native columnar reader provider supports Paimon input partition $partition"))
       case _ =>
         throw new RuntimeException(s"It's not a Paimon input partition, $partition")
     }
@@ -54,5 +84,16 @@ case class PaimonPartitionReaderFactory(
 
   override def hashCode(): Int = {
     Objects.hash(readBuilder, metadataColumns, java.lang.Boolean.valueOf(blobAsDescriptor))
+  }
+}
+
+object PaimonPartitionReaderFactory {
+
+  def loadNativeColumnarBatchReadProviders(): Seq[NativeColumnarBatchReadProvider] = {
+    ServiceLoader
+      .load(classOf[NativeColumnarBatchReadProvider])
+      .iterator()
+      .asScala
+      .toSeq
   }
 }

@@ -233,6 +233,7 @@ public class NativeRawFileSplitRead implements SplitRead<InternalRow> {
         }
 
         FileRecordReader<InternalRow> fileRecordReader;
+        boolean nativeDvApplied = false;
         NativeApplicability indexApplicability =
                 SupportsNativeIO.checkFileIndexResult(fileIndexResult);
         NativeApplicability fileApplicability =
@@ -253,7 +254,9 @@ public class NativeRawFileSplitRead implements SplitRead<InternalRow> {
                             file.rowCount(),
                             context.nativeIOOptions().batchSize(),
                             context.nativeIOOptions().maxBatchBytes().getBytes(),
-                            context.nativeIOOptions().objectStoreOptions());
+                            context.nativeIOOptions().objectStoreOptions(),
+                            deletionVector);
+            nativeDvApplied = deletionVector != null && !deletionVector.isEmpty();
             CoreOptions coreOptions = context.coreOptions();
             fileRecordReader =
                     new DataFileRecordReader(
@@ -285,7 +288,9 @@ public class NativeRawFileSplitRead implements SplitRead<InternalRow> {
                             fileIndexResult);
         }
 
-        if (deletionVector != null && !deletionVector.isEmpty()) {
+        if (!nativeDvApplied
+                && deletionVector != null
+                && !deletionVector.isEmpty()) {
             return new ApplyDeletionVectorReader(fileRecordReader, deletionVector);
         }
         return fileRecordReader;

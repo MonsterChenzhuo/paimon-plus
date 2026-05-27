@@ -20,6 +20,7 @@ package org.apache.paimon.table.source;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.operation.nativeio.NativeSplitReadContext;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
@@ -178,4 +179,14 @@ public interface ReadBuilder extends Serializable {
 
     /** Create a {@link TableRead} to read {@link Split}s. */
     TableRead newRead();
+
+    /** Optional native IO context for engines that can consume native readers directly. */
+    default NativeSplitReadContext nativeSplitReadContext() {
+        return null;
+    }
+
+    /** Whether the current read configuration can be evaluated entirely by native columnar IO. */
+    default boolean supportsNativeColumnarRead() {
+        return false;
+    }
 }

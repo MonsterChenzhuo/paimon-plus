@@ -39,6 +39,8 @@ public interface LibPaimonNativeIO {
 
     int paimon_reader_config_set_object_store_option(Pointer config, String key, String value);
 
+    int paimon_reader_config_add_deleted_position(Pointer config, String file, long position);
+
     String paimon_reader_config_last_error(Pointer config);
 
     Pointer paimon_reader_new(Pointer config);

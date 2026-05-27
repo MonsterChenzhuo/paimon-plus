@@ -19,11 +19,13 @@
 package org.apache.paimon.table.source;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.operation.nativeio.NativeSplitReadContext;
 import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.predicate.TopN;
 import org.apache.paimon.table.InnerTable;
+import org.apache.paimon.table.PrimaryKeyFileStoreTable;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Filter;
 import org.apache.paimon.utils.Range;
@@ -244,6 +246,19 @@ public class ReadBuilderImpl implements ReadBuilder {
             read.withLimit(limit);
         }
         return read;
+    }
+
+    @Override
+    public NativeSplitReadContext nativeSplitReadContext() {
+        if (table instanceof PrimaryKeyFileStoreTable) {
+            return ((PrimaryKeyFileStoreTable) table).store().newNativeSplitReadContext();
+        }
+        return null;
+    }
+
+    @Override
+    public boolean supportsNativeColumnarRead() {
+        return filter == null && limit == null && topN == null && rowRangeIndex == null;
     }
 
     @Override

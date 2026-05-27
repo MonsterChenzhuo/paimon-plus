@@ -64,6 +64,9 @@ public class DeletionVectorTest {
             assertThat(deletionVector.isDeleted(i)).isFalse();
             assertThat(deserializedDeletionVector.isDeleted(i)).isFalse();
         }
+        HashSet<Long> iterated = new HashSet<>();
+        deserializedDeletionVector.forEachDeletedPosition(iterated::add);
+        assertThat(iterated).containsExactlyInAnyOrderElementsOf(toLongSet(toDelete));
     }
 
     @Test
@@ -101,6 +104,9 @@ public class DeletionVectorTest {
             assertThat(deletionVector.isDeleted(i)).isFalse();
             assertThat(deserializedDeletionVector.isDeleted(i)).isFalse();
         }
+        HashSet<Long> iterated = new HashSet<>();
+        deserializedDeletionVector.forEachDeletedPosition(iterated::add);
+        assertThat(iterated).containsExactlyInAnyOrderElementsOf(toDelete);
     }
 
     @Test
@@ -137,5 +143,13 @@ public class DeletionVectorTest {
             assertThat(deletionVector.isDeleted(i)).isFalse();
             assertThat(bitmap64DeletionVector.isDeleted(i)).isFalse();
         }
+    }
+
+    private static HashSet<Long> toLongSet(HashSet<Integer> values) {
+        HashSet<Long> longs = new HashSet<>();
+        for (Integer value : values) {
+            longs.add(value.longValue());
+        }
+        return longs;
     }
 }

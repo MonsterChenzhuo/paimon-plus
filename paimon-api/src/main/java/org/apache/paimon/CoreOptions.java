@@ -413,6 +413,14 @@ public class CoreOptions implements Serializable {
                     .defaultValue(MemorySize.ofMebiBytes(64))
                     .withDescription("The maximum memory size returned by one native IO batch.");
 
+    public static final ConfigOption<Boolean> NATIVE_IO_COLUMNAR_ENABLED =
+            key("native-io.columnar.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether to enable native IO Spark ColumnarBatch reads when native IO "
+                                    + "and the Spark execution engine support it.");
+
     public static final ConfigOption<Boolean> NATIVE_IO_EXPORT_ENABLED =
             key("native-io.export.enabled")
                     .booleanType()

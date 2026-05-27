@@ -18,10 +18,13 @@
 
 package org.apache.paimon.nativeio;
 
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.types.RowType;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Map;
@@ -34,6 +37,7 @@ public class NativeFormatReaderFactory implements FormatReaderFactory {
     private final int batchSize;
     private final long maxBatchBytes;
     private final Map<String, String> objectStoreOptions;
+    @Nullable private final DeletionVector deletionVector;
 
     public NativeFormatReaderFactory(
             RowType readRowType,
@@ -41,11 +45,22 @@ public class NativeFormatReaderFactory implements FormatReaderFactory {
             int batchSize,
             long maxBatchBytes,
             Map<String, String> objectStoreOptions) {
+        this(readRowType, fileRowCount, batchSize, maxBatchBytes, objectStoreOptions, null);
+    }
+
+    public NativeFormatReaderFactory(
+            RowType readRowType,
+            long fileRowCount,
+            int batchSize,
+            long maxBatchBytes,
+            Map<String, String> objectStoreOptions,
+            @Nullable DeletionVector deletionVector) {
         this.readRowType = readRowType;
         this.fileRowCount = fileRowCount;
         this.batchSize = batchSize;
         this.maxBatchBytes = maxBatchBytes;
         this.objectStoreOptions = objectStoreOptions;
+        this.deletionVector = deletionVector;
     }
 
     @Override
@@ -56,6 +71,7 @@ public class NativeFormatReaderFactory implements FormatReaderFactory {
                 fileRowCount,
                 batchSize,
                 maxBatchBytes,
-                objectStoreOptions);
+                objectStoreOptions,
+                deletionVector);
     }
 }

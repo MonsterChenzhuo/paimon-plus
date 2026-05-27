@@ -25,6 +25,8 @@ import org.apache.paimon.table.source.{ReadBuilder, StreamTableScan, TableRead, 
 import org.apache.paimon.types.RowType
 import org.apache.paimon.utils.{Filter, Range, RowRangeIndex}
 
+import org.apache.spark.sql.connector.read.PartitionReader
+import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.scalatest.FunSuite
 
 import java.util.{List => JList, Map => JMap, Objects}
@@ -56,6 +58,55 @@ class PaimonPartitionReaderFactoryTest extends FunSuite {
 
     assert(withoutMetadata != withMetadata)
     assert(withoutMetadata.hashCode() != withMetadata.hashCode())
+  }
+
+  test("reader factory delegates columnar reads to native provider") {
+    val readBuilder = new StubReadBuilder("t")
+    val partition = PaimonInputPartition(Seq.empty)
+    val reader = new StubColumnarReader
+    val provider = new StubNativeColumnarBatchReadProvider(reader)
+    val factory =
+      PaimonPartitionReaderFactory(
+        readBuilder,
+        Seq.empty,
+        blobAsDescriptor = false,
+        Seq(provider))
+
+    assert(factory.supportColumnarReads(partition))
+    assert(factory.createColumnarReader(partition).eq(reader))
+    assert(provider.supportCalls == 2)
+    assert(provider.createCalls == 1)
+  }
+
+  private class StubColumnarReader extends PartitionReader[ColumnarBatch] {
+    override def next(): Boolean = false
+
+    override def get(): ColumnarBatch = null
+
+    override def close(): Unit = {}
+  }
+
+  private class StubNativeColumnarBatchReadProvider(reader: PartitionReader[ColumnarBatch])
+    extends NativeColumnarBatchReadProvider {
+
+    var supportCalls: Int = 0
+    var createCalls: Int = 0
+
+    override def supportColumnarReads(
+        readBuilder: ReadBuilder,
+        partition: PaimonInputPartition,
+        metadataColumns: JList[PaimonMetadataColumn]): Boolean = {
+      supportCalls += 1
+      true
+    }
+
+    override def createColumnarReader(
+        readBuilder: ReadBuilder,
+        partition: PaimonInputPartition,
+        metadataColumns: JList[PaimonMetadataColumn]): PartitionReader[ColumnarBatch] = {
+      createCalls += 1
+      reader
+    }
   }
 
   private class StubReadBuilder(private val id: String) extends ReadBuilder {

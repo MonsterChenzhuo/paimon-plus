@@ -101,6 +101,13 @@ public class PaimonNativeReader implements NativeFileRecordReader.NativeBatchRea
         }
     }
 
+    public void addDeletedPosition(String file, long position) throws IOException {
+        ensureConfigOpen();
+        checkConfig(
+                lib.paimon_reader_config_add_deleted_position(config, file, position),
+                "add deleted position");
+    }
+
     public void initializeReader() throws IOException {
         ensureConfigOpen();
         reader = lib.paimon_reader_new(config);

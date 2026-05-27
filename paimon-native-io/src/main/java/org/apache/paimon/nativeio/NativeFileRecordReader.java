@@ -18,6 +18,7 @@
 
 package org.apache.paimon.nativeio;
 
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.arrow.reader.ArrowBatchReader;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.Path;
@@ -52,6 +53,8 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.ArrowType.ArrowTypeID;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -92,6 +95,18 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
             long maxBatchBytes,
             Map<String, String> objectStoreOptions)
             throws IOException {
+        this(file, readRowType, fileRowCount, batchSize, maxBatchBytes, objectStoreOptions, null);
+    }
+
+    public NativeFileRecordReader(
+            String file,
+            RowType readRowType,
+            long fileRowCount,
+            int batchSize,
+            long maxBatchBytes,
+            Map<String, String> objectStoreOptions,
+            @Nullable DeletionVector deletionVector)
+            throws IOException {
         this.filePath = new Path(file);
         this.readRowType = readRowType;
         this.rowIndexColumn = rowIndexColumn(readRowType);
@@ -104,6 +119,7 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
             reader.setRowIndexColumn(rowIndexColumn);
             reader.setTargetColumns(readRowType);
             reader.setObjectStoreOptions(objectStoreOptions);
+            addDeletionVector(reader, file, deletionVector);
             reader.initializeReader();
             validateSchema(reader.schema(), readRowType, rowIndexColumn);
             this.nativeReader = reader;
@@ -121,6 +137,29 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
             String file, RowType readRowType, int batchSize, Map<String, String> objectStoreOptions)
             throws IOException {
         this(file, readRowType, -1L, batchSize, objectStoreOptions);
+    }
+
+    public static void addDeletionVector(
+            PaimonNativeReader reader, String file, @Nullable DeletionVector deletionVector)
+            throws IOException {
+        if (deletionVector == null || deletionVector.isEmpty()) {
+            return;
+        }
+        IOException[] failure = new IOException[1];
+        deletionVector.forEachDeletedPosition(
+                position -> {
+                    if (failure[0] != null) {
+                        return;
+                    }
+                    try {
+                        reader.addDeletedPosition(file, position);
+                    } catch (IOException e) {
+                        failure[0] = e;
+                    }
+                });
+        if (failure[0] != null) {
+            throw failure[0];
+        }
     }
 
     NativeFileRecordReader(
@@ -291,7 +330,7 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
         }
     }
 
-    static void validateSchema(Schema schema, RowType readRowType, String rowIndexColumn)
+    public static void validateSchema(Schema schema, RowType readRowType, String rowIndexColumn)
             throws IOException {
         List<Field> fields = schema.getFields();
         if (fields.size() != readRowType.getFieldCount() + 1) {
