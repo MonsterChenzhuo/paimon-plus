@@ -28,6 +28,7 @@ import org.apache.paimon.spark.diagnostics.profiler.PaimonProfilerConf
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.status.api.v1.{ExecutorSummary, ThreadStackTrace}
+import org.json4s.JsonAST.JValue
 
 import java.io.{ByteArrayOutputStream, InputStream}
 import java.net.URLEncoder
@@ -166,6 +167,10 @@ private class PaimonDiagnosticsPage(tab: PaimonDiagnosticsTab, sparkUI: SparkUI)
       false)
   }
 
+  override def renderJson(request: HttpServletRequest): JValue = {
+    PaimonDiagnosticsJson.overview(sparkUI)
+  }
+
   private def executorTable(request: HttpServletRequest): Seq[Node] = {
     val executors = sparkUI.sc.map(_.statusStore.executorList(activeOnly = false)).getOrElse(Nil)
     Seq(
@@ -237,6 +242,12 @@ private class PaimonThreadDumpFlamegraphPage(tab: PaimonDiagnosticsTab, sparkUI:
       case None => Seq(Text("Thread dump flame graph is only available in a live Spark UI."))
     }
     UIUtils.headerSparkPage(request, title, nav(request) ++ content, tab, None, false, false)
+  }
+
+  override def renderJson(request: HttpServletRequest): JValue = {
+    val executorId = Option(request.getParameter("executorId")).map(UIUtils.decodeURLParameter)
+      .getOrElse(throw new IllegalArgumentException("Missing executorId parameter"))
+    PaimonDiagnosticsJson.threadDump(sparkUI, executorId)
   }
 
   private def renderThreadDump(
@@ -338,6 +349,10 @@ private class PaimonProfilerPage(tab: PaimonDiagnosticsTab, sparkUI: SparkUI)
           </table>
         </div>) ++ profilerArtifacts(request, conf, outputDirOption)
     UIUtils.headerSparkPage(request, "Paimon Profiler", content, tab, None, false, false)
+  }
+
+  override def renderJson(request: HttpServletRequest): JValue = {
+    PaimonDiagnosticsJson.profiler(sparkUI)
   }
 
   private def pluginConfigured(conf: org.apache.spark.SparkConf): String = {
