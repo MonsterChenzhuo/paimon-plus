@@ -1,6 +1,8 @@
 ---
 title: Paimon Diagnostics UI
 weight: 10
+bookToc: false
+plainPage: true
 ---
 <!--
 Licensed to the Apache Software Foundation (ASF) under one
@@ -21,126 +23,165 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Paimon Diagnostics UI
+<article class="pp-blog-page">
+<header class="pp-blog-hero">
+<nav class="pp-blog-nav" aria-label="Article navigation">
+<a href="../../">Paimon Plus</a>
+<a href="../">Engineering Notes</a>
+<a href="https://paimon.apache.org/docs/1.4/">Official Paimon Docs</a>
+</nav>
+<div class="pp-eyebrow">Engineering Note</div>
+<h1>Paimon Diagnostics UI</h1>
+<p class="pp-blog-lead">
+A Spark UI diagnostics layer for running Paimon jobs: executor stack aggregation,
+thread-dump flame graphs, async-profiler artifacts, and JSON evidence that AI agents can
+read without scraping screenshots.
+</p>
+<div class="pp-blog-meta">
+<span>Published as a Paimon Plus case study</span>
+<span>Spark 3.4</span>
+<span>Diagnostics</span>
+</div>
+</header>
 
-Paimon Diagnostics UI is a Spark UI extension for production Paimon jobs. It starts from a simple
-question: when a Spark application is still running but task metrics do not explain the stall, can an
-operator see the executor, the thread stack shape, and the profiler output without logging into every
-machine?
+<section class="pp-blog-section pp-blog-summary">
+<div>
+<span class="pp-blog-label">Why it exists</span>
+<h2>When Spark UI progress is not enough</h2>
+</div>
+<p>
+Some Paimon read or export jobs look stuck while the usual Spark Jobs and Stages pages
+do not explain the delay. Operators need lower-level runtime evidence before the
+application exits: which executor is still alive, what its Java threads are doing, and
+whether profiler output already points at CPU, wall-clock, lock, native, or object-storage
+time.
+</p>
+</section>
 
-## Scenario
+<section class="pp-blog-section">
+<h2>The incident loop this removes</h2>
+<div class="pp-blog-grid">
+<div class="pp-blog-card">
+<span>Before</span>
+<p>Open Spark UI, grep logs, ask for thread dumps, find the right executor, copy profiler files, then manually correlate stack traces with task progress.</p>
+</div>
+<div class="pp-blog-card">
+<span>After</span>
+<p>Open the Paimon diagnostics tab, pick an executor, inspect the aggregated thread-dump flame graph, then open async-profiler HTML artifacts from the same Spark UI surface.</p>
+</div>
+<div class="pp-blog-card">
+<span>For AI agents</span>
+<p>Read the JSON endpoints for executor state, top stack groups, flame graph data, profiler artifacts, and warnings. The agent no longer has to parse Spark UI HTML.</p>
+</div>
+</div>
+</section>
 
-Long-running Spark jobs that read or export large Paimon tables often fail slowly. The Spark SQL page
-shows stages and tasks, but it does not answer the operational questions that matter during an
-incident:
-
-- Which executor is still active?
-- Is the executor blocked in Spark scheduling, object storage, Netty, or user code?
-- Can we get a flame graph from the driver or executors before the evidence disappears?
-- Can an AI agent use the same evidence without scraping driver logs?
-
-The screenshots below show the workflow that Paimon Plus exposes directly inside Spark UI.
-
-<figure class="engineering-figure">
+<section class="pp-blog-media">
+<figure>
   <img src="../../img/engineering/paimon-diagnostics-executors.svg" alt="Paimon Diagnostics executor overview in Spark UI">
-  <figcaption>Paimon Diagnostics adds a Spark UI tab that lists executors, task counters, GC time, and one-click thread dump flame graph entry points.</figcaption>
+  <figcaption>The diagnostics tab starts with executor context: ids, host, task counters, GC time, and one-click links to thread-dump flame graphs.</figcaption>
 </figure>
+</section>
 
-## Problem
+<section class="pp-blog-section">
+<h2>The page family</h2>
+<div class="pp-blog-steps">
+<div>
+<span>01</span>
+<h3>Executor overview</h3>
+<p>Lists live executors and provides a stable path to inspect driver or executor thread dumps.</p>
+</div>
+<div>
+<span>02</span>
+<h3>Thread-dump flame graph</h3>
+<p>Groups stack traces into a compact flame graph so blocked Spark RPC, scheduler, Netty, object-storage, or user-code paths are visible quickly.</p>
+</div>
+<div>
+<span>03</span>
+<h3>Profiler artifacts</h3>
+<p>Lists async-profiler driver and executor output uploaded to DFS, then opens selected HTML flame graphs inside the same diagnostics tab.</p>
+</div>
+<div>
+<span>04</span>
+<h3>AI-readable JSON</h3>
+<p>Exposes overview, thread dump, and profiler payloads for spark-cli, Codex, Claude Code, and other tools that need structured evidence.</p>
+</div>
+</div>
+</section>
 
-The default Spark UI is excellent for stage-level progress, but Paimon incidents frequently require
-lower-level evidence:
-
-- Executor thread dumps are usually collected manually and too late.
-- Async-profiler output may exist on driver or executor disks, but users need a stable UI path to
-discover and open it.
-- Spark History Server cannot help when evidence only lives in ephemeral executor local files.
-- Java 8 deployments cannot rely on JFR-to-flame conversion in-process.
-
-The result is a noisy loop: check Spark UI, grep logs, ask for thread dumps, find the right executor,
-copy profiler files, then manually correlate everything.
-
-## Technical Design
-
-Paimon Plus keeps the feature inside Spark instead of building a separate diagnostics service.
-
-The design has three surfaces:
-
-- **Executors page**: enumerate Spark executors and link each executor to a live thread dump flame graph.
-- **Thread dump flame graph page**: render sampled thread stacks as a flame graph using inline UI assets.
-- **Profiler page**: list async-profiler artifacts from configured DFS output and embed selected HTML flame graphs.
-
-This keeps the security and lifecycle model aligned with Spark UI, while still giving operators a
-Paimon-specific diagnostic path.
-
-<figure class="engineering-figure">
+<section class="pp-blog-media">
+<figure>
   <img src="../../img/engineering/paimon-thread-dump-flamegraph.svg" alt="Paimon thread dump flame graph page">
-  <figcaption>The per-executor thread dump page turns stack traces into a compact flame graph, making blocked Netty, Spark RPC, scheduler, and user-code paths visible at a glance.</figcaption>
+  <figcaption>The thread-dump view turns live stack traces into an aggregate shape, making repeated waits or hot call paths easier to see than a raw thread list.</figcaption>
 </figure>
+</section>
 
-## Implementation
+<section class="pp-blog-section">
+<h2>How to enable it</h2>
+<p>
+The tab is installed by the Paimon Spark profiler plugin. For Java 8 clusters, prefer
+HTML profiler output so the Spark UI can open async-profiler flame graphs directly.
+</p>
 
-The implementation lives in the Spark 3.4 module:
-
-- `org.apache.spark.ui.PaimonDiagnosticsTabSupport` attaches the tab to Spark UI, including delayed
-  attachment when Spark UI is not ready at plugin startup.
-- `PaimonDiagnosticsPage` renders the executor overview and links to executor flame graphs.
-- `PaimonThreadDumpFlamegraphPage` collects live executor thread dumps and renders the flame graph.
-- `PaimonProfilerPage` lists async-profiler outputs and embeds selected HTML flame graphs.
-- `PaimonSparkAsyncProfiler` starts async-profiler from the Spark plugin and periodically uploads
-  snapshots to DFS.
-- `PaimonProfilerArtifacts` resolves safe profiler artifact names, lists output files, and loads HTML
-  or JFR artifacts for display.
-
-The profiler path is configurable through Spark conf:
-
-```properties
-spark.plugins=org.apache.paimon.spark.diagnostics.profiler.PaimonProfilerPlugin
+<div class="pp-code-panel">
+<pre><code>spark.plugins=org.apache.paimon.spark.diagnostics.profiler.PaimonProfilerPlugin
 spark.paimon.diagnostics.ui.enabled=true
 spark.paimon.profiler.executor.enabled=true
 spark.paimon.profiler.executor.fraction=0.2
 spark.paimon.profiler.dfsDir=obs://bucket/paimon-profiler
 spark.paimon.profiler.outputSuffix=html
-spark.paimon.profiler.asyncProfiler.args=event=wall,interval=10ms
-```
+spark.paimon.profiler.asyncProfiler.args=event=wall,interval=10ms</code></pre>
+</div>
+</section>
 
-<figure class="engineering-figure">
+<section class="pp-blog-media">
+<figure>
   <img src="../../img/engineering/paimon-diagnostics-profiler-output.svg" alt="Paimon async-profiler output file list and flame graph">
-  <figcaption>The profiler page lists uploaded driver and executor artifacts, then embeds the selected async-profiler HTML flame graph in the same Spark UI tab.</figcaption>
+  <figcaption>The profiler page shows uploaded artifacts and lets operators open the selected flame graph without logging into executor machines.</figcaption>
 </figure>
+</section>
 
-## PRs / Commits
+<section class="pp-blog-section">
+<h2>The JSON contract for spark-cli</h2>
+<p>
+The same evidence is available through Spark UI JSON routes, so tools can collect diagnostics
+while the application is still running.
+</p>
+<div class="pp-code-panel">
+<pre><code>/paimon-diagnostics/json
+/paimon-diagnostics/threadDump/json?executorId=&lt;driver|executorId&gt;
+/paimon-diagnostics/profiler/json</code></pre>
+</div>
+<p>
+AI agents should start with <code>thread_dump.facts.state_counts</code>,
+<code>thread_dump.facts.top_stacks</code>, <code>thread_dump.facts.flamegraph</code>,
+and <code>profiler.facts.artifacts</code>. Missing endpoints or empty profiler output are
+reported as warnings, not as ambiguous blank pages.
+</p>
+</section>
 
-The diagnostics UI work landed as a series of focused commits:
+<section class="pp-blog-section">
+<h2>spark-cli workflow</h2>
+<p>
+The companion command reads the Paimon diagnostics JSON through the YARN tracking or proxy
+URL. It does not need EventLog data and is useful while the job is still running.
+</p>
 
-| Commit | What changed |
-| --- | --- |
-| [`de1cb99`](https://github.com/MonsterChenzhuo/paimon-plus/commit/de1cb99) | Add the initial Paimon diagnostics profiler UI. |
-| [`f32b45e`](https://github.com/MonsterChenzhuo/paimon-plus/commit/f32b45e) | Attach the diagnostics UI from the Spark profiler plugin. |
-| [`8184cc9`](https://github.com/MonsterChenzhuo/paimon-plus/commit/8184cc9) | Inline diagnostics UI assets so the flame graph view works inside Spark UI. |
-| [`c87ef70`](https://github.com/MonsterChenzhuo/paimon-plus/commit/c87ef70) | Defer diagnostics tab attachment until Spark UI startup. |
-| [`8ec8248`](https://github.com/MonsterChenzhuo/paimon-plus/commit/8ec8248) | Show async-profiler artifacts in the diagnostics UI. |
-| [`f59c4e9`](https://github.com/MonsterChenzhuo/paimon-plus/commit/f59c4e9) | Upload HTML profiler snapshots after async-profiler dump. |
-| [`f6a8d8a`](https://github.com/MonsterChenzhuo/paimon-plus/commit/f6a8d8a) | Fix async-profiler snapshot commands. |
+<div class="pp-code-panel">
+<pre><code>spark-cli paimon-diagnostics application_1772605260987_20765 \
+  --yarn-base-urls http://rm-or-gateway/yarn \
+  --executor-id 7</code></pre>
+</div>
+</section>
 
-## Result
-
-The incident workflow becomes shorter and more deterministic:
-
-- Open Spark UI.
-- Click **Paimon-diagnostics**.
-- Identify active executors and open thread dump flame graphs.
-- Open profiler artifacts for driver or sampled executors.
-- Hand the same evidence to a human or AI agent without copying files from cluster machines.
-
-This does not replace Spark SQL, Stage, or Executor pages. It adds the missing Paimon-specific
-evidence layer on top of them.
-
-## Next
-
-The next diagnostics step is to connect this UI with structured APIs:
-
-- expose executor and profiler evidence as JSON;
-- connect thread dump and profiler artifacts to `spark-cli`;
-- let AI agents produce a root-cause summary from Spark UI and Paimon Diagnostics evidence;
-- fold Native IO phase events into the same page family when native export is enabled.
+<section class="pp-blog-section pp-blog-result">
+<span class="pp-blog-label">Result</span>
+<h2>A shorter path from stall to evidence</h2>
+<p>
+Paimon Diagnostics UI does not replace the Spark SQL, Stage, or Executor pages. It adds
+the missing Paimon-specific evidence layer: stack shape, profiler artifacts, and structured
+payloads that a human or AI agent can use immediately.
+</p>
+<a class="pp-button pp-button-primary" href="../">More Engineering Notes</a>
+</section>
+</article>

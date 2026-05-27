@@ -18,6 +18,7 @@ under the License.
 -->
 <!DOCTYPE html>
 <html lang="{{ .Site.Language.Lang }}" dir={{ .Site.Language.LanguageDirection }}>
+{{ $plainPage := or .Params.redocPage .Params.plainPage }}
 
 <head>
   {{ hugo.Generator }}
@@ -51,19 +52,19 @@ under the License.
 </head>
 
 <body dir={{ .Site.Language.LanguageDirection }}>
-  {{ if not .Params.redocPage }}
+  {{ if not $plainPage }}
     <input type="checkbox" class="hidden toggle" id="menu-control" />
     <input type="checkbox" class="hidden toggle" id="toc-control" />
   {{end}}
   <main class="container flex">
-    {{ if not .Params.redocPage }}
+    {{ if not $plainPage }}
       <aside class="book-menu">
         {{ template "menu" . }} <!-- Left menu Content -->
       </aside>
     {{end}}
 
     <div class="book-page">
-      {{ if not .Params.redocPage }}
+      {{ if not $plainPage }}
         <header class="book-header">
           {{ template "header" . }} <!-- Mobile layout header -->
         </header>
@@ -80,10 +81,12 @@ under the License.
 
       {{ template "comments" . }} <!-- Comments block -->
 
+      {{ if not $plainPage }}
       <label for="menu-control" class="hidden book-menu-overlay"></label>
+      {{end}}
     </div>
 
-    {{ if default true (default .Site.Params.BookToC .Params.BookToC) }}
+    {{ if and (not $plainPage) (default true (default .Site.Params.BookToC .Params.BookToC)) }}
     <aside class="book-toc">
       {{ template "toc" . }} <!-- Table of Contents -->
     </aside>

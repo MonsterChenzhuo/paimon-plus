@@ -2,6 +2,8 @@
 title: Engineering Notes
 weight: 1
 bookCollapseSection: true
+bookToc: false
+plainPage: true
 ---
 <!--
 Licensed to the Apache Software Foundation (ASF) under one
@@ -22,12 +24,49 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# Engineering Notes
+<div class="pp-blog-index">
+<section class="pp-blog-hero pp-blog-index-hero">
+<nav class="pp-blog-nav" aria-label="Engineering Notes navigation">
+<a href="../">Paimon Plus</a>
+<a href="https://github.com/MonsterChenzhuo/paimon-plus">GitHub</a>
+<a href="https://paimon.apache.org/docs/1.4/">Official Paimon Docs</a>
+</nav>
+<div class="pp-eyebrow">Engineering Notes</div>
+<h1>Production notes from Paimon Plus</h1>
+<p class="pp-blog-lead">
+Long-form articles about the Spark runtime work around Paimon Plus: what problem
+triggered the feature, how the design landed, and how operators or AI agents can use it.
+</p>
+</section>
 
-Engineering Notes explain Paimon Plus features as production case studies: the scenario, the
-technical design, the implementation path, the commits behind it, and the operational problem it
-solves.
+<section class="pp-blog-list">
+<a class="pp-blog-list-card" href="paimon-diagnostics-ui/">
+<span>Diagnostics</span>
+<h2>Paimon Diagnostics UI</h2>
+<p>
+Executor stack aggregation, thread-dump flame graphs, async-profiler artifacts, and
+AI-readable JSON for Spark jobs that are still running but no longer explain themselves
+through stage metrics.
+</p>
+<strong>Read article</strong>
+</a>
 
-Start with:
+<article class="pp-blog-list-card pp-blog-list-card-muted">
+<span>Coming next</span>
+<h2>Native IO Export</h2>
+<p>
+Driver preflight, raw Parquet split planning, delete-vector pushdown, compact output,
+and native fallback evidence for wide feature-table export.
+</p>
+</article>
 
-- [Paimon Diagnostics UI](paimon-diagnostics-ui/)
+<article class="pp-blog-list-card pp-blog-list-card-muted">
+<span>Coming next</span>
+<h2>spark-cli Analysis</h2>
+<p>
+How Spark History Server evidence, live Spark UI endpoints, and Paimon diagnostics JSON
+become a CLI workflow that AI agents can operate directly.
+</p>
+</article>
+</section>
+</div>
