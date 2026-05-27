@@ -36,9 +36,9 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.Decimal;
+import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarArray;
 import org.apache.spark.sql.vectorized.ColumnarMap;
-import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.unsafe.types.UTF8String;
 
 /** Spark {@link ColumnVector} wrapper over an Arrow {@link FieldVector}. */

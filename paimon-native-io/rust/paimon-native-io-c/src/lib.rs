@@ -1400,6 +1400,42 @@ pub unsafe extern "C" fn paimon_reader_config_add_deleted_position(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn paimon_reader_config_add_deleted_positions(
+    config: *mut ReaderConfig,
+    file: *const c_char,
+    positions: *const i64,
+    position_count: i32,
+) -> i32 {
+    catch_config_i32(config, |config| {
+        if position_count < 0 {
+            return config.set_error("deleted position count must be non-negative");
+        }
+        if position_count > 0 && positions.is_null() {
+            return config.set_error("deleted positions pointer must not be null");
+        }
+        let positions: &[i64] = if position_count == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(positions, position_count as usize)
+        };
+        if positions.iter().any(|position| *position < 0) {
+            return config.set_error("deleted position must be non-negative");
+        }
+        match cstr_to_non_empty_string(file, "file path") {
+            Ok(file) => {
+                config
+                    .deleted_positions
+                    .entry(file)
+                    .or_default()
+                    .extend(positions.iter().copied());
+                0
+            }
+            Err(e) => config.set_error(e),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn paimon_reader_config_last_error(
     config: *mut ReaderConfig,
 ) -> *const c_char {
@@ -5243,6 +5279,60 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert!(error.contains("batch size must be positive"));
+            paimon_reader_config_free(config);
+        }
+    }
+
+    #[test]
+    fn ffi_accepts_deleted_position_batches() {
+        unsafe {
+            let config = paimon_reader_config_new();
+            assert!(!config.is_null());
+            let file = CString::new("file:/tmp/data.parquet").unwrap();
+            let positions = [1_i64, 3_i64, 5_i64];
+
+            assert_eq!(
+                paimon_reader_config_add_deleted_positions(
+                    config,
+                    file.as_ptr(),
+                    positions.as_ptr(),
+                    positions.len() as i32,
+                ),
+                0
+            );
+            let deleted_positions = (*config)
+                .deleted_positions
+                .get("file:/tmp/data.parquet")
+                .unwrap();
+            assert_eq!(deleted_positions.len(), 3);
+            assert!(deleted_positions.contains(&1));
+            assert!(deleted_positions.contains(&3));
+            assert!(deleted_positions.contains(&5));
+
+            let negative = [-1_i64];
+            assert_eq!(
+                paimon_reader_config_add_deleted_positions(
+                    config,
+                    file.as_ptr(),
+                    negative.as_ptr(),
+                    negative.len() as i32,
+                ),
+                -1
+            );
+            let error = CStr::from_ptr(paimon_reader_config_last_error(config))
+                .to_str()
+                .unwrap();
+            assert!(error.contains("deleted position must be non-negative"));
+
+            assert_eq!(
+                paimon_reader_config_add_deleted_positions(config, file.as_ptr(), ptr::null(), 1),
+                -1
+            );
+            let error = CStr::from_ptr(paimon_reader_config_last_error(config))
+                .to_str()
+                .unwrap();
+            assert!(error.contains("deleted positions pointer must not be null"));
+
             paimon_reader_config_free(config);
         }
     }

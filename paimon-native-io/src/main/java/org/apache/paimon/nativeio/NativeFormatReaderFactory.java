@@ -18,8 +18,8 @@
 
 package org.apache.paimon.nativeio;
 
-import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.types.RowType;

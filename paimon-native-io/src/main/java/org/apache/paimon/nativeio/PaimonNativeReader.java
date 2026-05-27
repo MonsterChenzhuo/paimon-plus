@@ -102,10 +102,20 @@ public class PaimonNativeReader implements NativeFileRecordReader.NativeBatchRea
     }
 
     public void addDeletedPosition(String file, long position) throws IOException {
+        addDeletedPositions(file, new long[] {position}, 1);
+    }
+
+    public void addDeletedPositions(String file, long[] positions, int positionCount)
+            throws IOException {
         ensureConfigOpen();
+        if (positionCount < 0 || positionCount > positions.length) {
+            throw new NonCorruptFileReadException(
+                    "invalid deleted position count: " + positionCount);
+        }
         checkConfig(
-                lib.paimon_reader_config_add_deleted_position(config, file, position),
-                "add deleted position");
+                lib.paimon_reader_config_add_deleted_positions(
+                        config, file, positions, positionCount),
+                "add deleted positions");
     }
 
     public void initializeReader() throws IOException {

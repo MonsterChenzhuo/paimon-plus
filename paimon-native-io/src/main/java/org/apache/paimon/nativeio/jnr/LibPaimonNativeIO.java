@@ -41,6 +41,9 @@ public interface LibPaimonNativeIO {
 
     int paimon_reader_config_add_deleted_position(Pointer config, String file, long position);
 
+    int paimon_reader_config_add_deleted_positions(
+            Pointer config, String file, long[] positions, int positionCount);
+
     String paimon_reader_config_last_error(Pointer config);
 
     Pointer paimon_reader_new(Pointer config);

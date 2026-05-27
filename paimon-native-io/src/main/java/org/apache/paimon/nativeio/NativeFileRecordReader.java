@@ -18,9 +18,9 @@
 
 package org.apache.paimon.nativeio;
 
-import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.arrow.reader.ArrowBatchReader;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.NonCorruptFileReadException;
 import org.apache.paimon.reader.FileRecordIterator;
@@ -66,6 +66,7 @@ import java.util.Map;
 public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
 
     public static final String ROW_INDEX_COLUMN = "__paimon_native_row_index";
+    private static final int DELETED_POSITION_CHUNK_SIZE = 8192;
 
     private final NativeBatchReader nativeReader;
     private final Path filePath;
@@ -146,19 +147,38 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
             return;
         }
         IOException[] failure = new IOException[1];
+        long[] positions = new long[DELETED_POSITION_CHUNK_SIZE];
+        int[] positionCount = new int[1];
         deletionVector.forEachDeletedPosition(
                 position -> {
                     if (failure[0] != null) {
                         return;
                     }
-                    try {
-                        reader.addDeletedPosition(file, position);
-                    } catch (IOException e) {
-                        failure[0] = e;
+                    positions[positionCount[0]++] = position;
+                    if (positionCount[0] == positions.length) {
+                        flushDeletedPositions(reader, file, positions, positionCount, failure);
                     }
                 });
+        flushDeletedPositions(reader, file, positions, positionCount, failure);
         if (failure[0] != null) {
             throw failure[0];
+        }
+    }
+
+    private static void flushDeletedPositions(
+            PaimonNativeReader reader,
+            String file,
+            long[] positions,
+            int[] positionCount,
+            IOException[] failure) {
+        if (positionCount[0] == 0 || failure[0] != null) {
+            return;
+        }
+        try {
+            reader.addDeletedPositions(file, positions, positionCount[0]);
+            positionCount[0] = 0;
+        } catch (IOException e) {
+            failure[0] = e;
         }
     }
 
