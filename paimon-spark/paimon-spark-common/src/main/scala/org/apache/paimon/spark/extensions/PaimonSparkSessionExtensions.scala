@@ -48,6 +48,7 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     extensions.injectPostHocResolutionRule(spark => ReplacePaimonFunctions(spark))
     extensions.injectPostHocResolutionRule(spark => PaimonPostHocResolutionRules(spark))
+    extensions.injectPostHocResolutionRule(spark => PaimonDiagnosticsInstallRule(spark))
     extensions.injectPostHocResolutionRule(spark => NativeIODiagnosticsInstallRule(spark))
 
     extensions.injectPostHocResolutionRule(_ => PaimonUpdateTable)
@@ -77,6 +78,60 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
     // query stage preparation
     extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)
+  }
+}
+
+private object PaimonDiagnosticsInstallRule {
+
+  private val UIEnabledKey = "spark.paimon.diagnostics.ui.enabled"
+  private val DiagnosticsClass = "org.apache.paimon.spark.diagnostics.PaimonDiagnostics"
+
+  @volatile private var lookupDone = false
+  @volatile private var installMethod: Option[java.lang.reflect.Method] = None
+
+  def apply(spark: SparkSession): Rule[LogicalPlan] = {
+    new Rule[LogicalPlan] {
+      override def apply(plan: LogicalPlan): LogicalPlan = {
+        installIfEnabled(spark)
+        plan
+      }
+    }
+  }
+
+  private def installIfEnabled(spark: SparkSession): Unit = {
+    if (!confBoolean(spark, UIEnabledKey, defaultValue = true)) {
+      return
+    }
+
+    try {
+      diagnosticsInstallMethod().foreach(_.invoke(null, spark))
+    } catch {
+      case _: Throwable =>
+    }
+  }
+
+  private def confBoolean(spark: SparkSession, key: String, defaultValue: Boolean): Boolean = {
+    val default = spark.sparkContext.getConf.get(key, defaultValue.toString)
+    spark.sessionState.conf.getConfString(key, default).equalsIgnoreCase("true")
+  }
+
+  private def diagnosticsInstallMethod(): Option[java.lang.reflect.Method] = {
+    if (!lookupDone) {
+      synchronized {
+        if (!lookupDone) {
+          installMethod =
+            try {
+              val diagnostics =
+                Class.forName(DiagnosticsClass, true, Thread.currentThread().getContextClassLoader)
+              Some(diagnostics.getMethod("install", classOf[SparkSession]))
+            } catch {
+              case _: Throwable => None
+            }
+          lookupDone = true
+        }
+      }
+    }
+    installMethod
   }
 }
 
