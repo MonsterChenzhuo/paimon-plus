@@ -23,12 +23,15 @@ import org.apache.paimon.spark.diagnostics.{PaimonDiagnostics, PaimonFlamegraphN
 import org.apache.paimon.spark.diagnostics.profiler.PaimonProfilerConf
 
 import org.apache.spark.SparkContext
+import org.apache.spark.internal.Logging
 import org.apache.spark.status.api.v1.{ExecutorSummary, ThreadStackTrace}
 
 import java.net.URLEncoder
+import java.util.{Collections, WeakHashMap}
 import javax.servlet.http.HttpServletRequest
 
 import scala.xml.{Node, Text, Unparsed}
+import scala.util.control.NonFatal
 
 import PaimonDiagnosticsNav._
 
@@ -40,14 +43,104 @@ class PaimonDiagnosticsTab(parent: SparkUI)
   attachPage(new PaimonProfilerPage(this, parent))
 }
 
-object PaimonDiagnosticsTabSupport {
+object PaimonDiagnosticsTabSupport extends Logging {
 
   val TabPrefix = "paimon-diagnostics"
 
+  private val StartupAttachTimeoutMs = 10 * 60 * 1000L
+  private val StartupAttachPollMs = 100L
+  private val PendingAttachUis =
+    Collections.newSetFromMap(new WeakHashMap[SparkUI, java.lang.Boolean]())
+
   def attach(ui: Any): Unit = {
     val sparkUI = ui.asInstanceOf[SparkUI]
+    if (readyToAttach(sparkUI)) {
+      attachNow(sparkUI)
+    } else {
+      deferAttach(sparkUI)
+    }
+  }
+
+  private def attachNow(sparkUI: SparkUI): Unit = sparkUI.synchronized {
     if (!sparkUI.getTabs.exists(_.prefix == TabPrefix)) {
       sparkUI.attachTab(new PaimonDiagnosticsTab(sparkUI))
+    }
+  }
+
+  private def readyToAttach(sparkUI: SparkUI): Boolean = {
+    if (sparkUI.boundPort < 0) {
+      true
+    } else {
+      val handlers = uiHandlers(sparkUI)
+      handlers.nonEmpty && handlers.forall(_.isStarted)
+    }
+  }
+
+  private def deferAttach(sparkUI: SparkUI): Unit = {
+    val startupHandlers = uiHandlers(sparkUI).toList
+    if (!markPending(sparkUI)) {
+      return
+    }
+
+    val thread = new Thread("paimon-diagnostics-ui-attach") {
+      override def run(): Unit = {
+        try {
+          val deadline = System.currentTimeMillis() + StartupAttachTimeoutMs
+          while (
+            !sparkUI.getTabs.exists(_.prefix == TabPrefix) &&
+            !startupHandlersReady(startupHandlers) &&
+            System.currentTimeMillis() < deadline
+          ) {
+            Thread.sleep(StartupAttachPollMs)
+          }
+
+          if (!sparkUI.getTabs.exists(_.prefix == TabPrefix) &&
+              startupHandlersReady(startupHandlers)) {
+            Thread.sleep(StartupAttachPollMs)
+            attachNow(sparkUI)
+          } else if (!sparkUI.getTabs.exists(_.prefix == TabPrefix)) {
+            logWarning("Timed out waiting for Spark UI startup before attaching Paimon diagnostics tab.")
+          }
+        } catch {
+          case _: InterruptedException =>
+            Thread.currentThread().interrupt()
+          case NonFatal(e) =>
+            logWarning("Failed to attach Paimon diagnostics tab after Spark UI startup.", e)
+        } finally {
+          unmarkPending(sparkUI)
+        }
+      }
+    }
+    thread.setDaemon(true)
+    thread.start()
+  }
+
+  private def startupHandlersReady(handlers: Seq[UiHandler]): Boolean = {
+    handlers.nonEmpty && handlers.forall(_.isStarted)
+  }
+
+  private def uiHandlers(sparkUI: SparkUI): Seq[UiHandler] = {
+    val method = sparkUI.getClass.getMethod("getHandlers")
+    method.invoke(sparkUI).asInstanceOf[Seq[AnyRef]].map(UiHandler)
+  }
+
+  private def markPending(sparkUI: SparkUI): Boolean = PendingAttachUis.synchronized {
+    if (PendingAttachUis.contains(sparkUI) || sparkUI.getTabs.exists(_.prefix == TabPrefix)) {
+      false
+    } else {
+      PendingAttachUis.add(sparkUI)
+      true
+    }
+  }
+
+  private def unmarkPending(sparkUI: SparkUI): Unit = PendingAttachUis.synchronized {
+    PendingAttachUis.remove(sparkUI)
+  }
+
+  private case class UiHandler(handler: AnyRef) {
+
+    def isStarted: Boolean = {
+      handler.getClass.getMethod("isStarted").invoke(handler).asInstanceOf[Boolean]
     }
   }
 }

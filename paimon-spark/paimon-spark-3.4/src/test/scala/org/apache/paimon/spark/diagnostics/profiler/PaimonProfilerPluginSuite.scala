@@ -26,10 +26,34 @@ import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.sql.SparkSession
 import org.scalatest.FunSuite
+import org.scalatest.concurrent.Eventually
+import org.scalatest.time.{Millis, Seconds, Span}
 
 import java.util.{Collections, Map => JMap}
 
-class PaimonProfilerPluginSuite extends FunSuite {
+class PaimonProfilerPluginSuite extends FunSuite with Eventually {
+
+  test("spark context starts when profiler plugin installs diagnostics tab during UI startup") {
+    val spark =
+      SparkSession
+        .builder()
+        .master("local[1]")
+        .appName("paimon-profiler-plugin-startup")
+        .config("spark.ui.enabled", "true")
+        .config("spark.ui.port", "0")
+        .config("spark.plugins", classOf[PaimonProfilerPlugin].getName)
+        .getOrCreate()
+
+    try {
+      eventually(timeout(Span(5, Seconds)), interval(Span(50, Millis))) {
+        assert(tabPrefixes(spark).contains("paimon-diagnostics"))
+      }
+    } finally {
+      spark.stop()
+      SparkSession.clearActiveSession()
+      SparkSession.clearDefaultSession()
+    }
+  }
 
   test("driver plugin installs diagnostics tab without waiting for SQL extension rules") {
     val spark =
