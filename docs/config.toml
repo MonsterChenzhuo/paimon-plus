@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-baseURL = '//paimon.apache.org/docs/1.4'
+baseURL = '//monsterchenzhuo.github.io/paimon-plus/'
 languageCode = 'en-us'
-title = 'Apache Paimon'
+title = 'Paimon Plus'
 enableGitInfo = false
 theme = "book"
 pygmentsUseClasses = true
@@ -38,18 +38,18 @@ pygmentsUseClasses = true
 
   # For stable releases, leave the bugfix version out (e.g. 1.2). For snapshot
   # release this should be the same as the regular version
-  VersionTitle = "1.4"
+  VersionTitle = "plus-main"
 
-  # The branch for this version of Apache Paimon
-  Branch = "release-1.4"
+  # The branch for this version of Paimon Plus
+  Branch = "main"
 
   # The most recent supported Apache Flink version
   FlinkVersion = "1.20"
 
-  # The github repository for Apache Paimon
-  Repo = "//github.com/apache/paimon"
+  # The github repository for Paimon Plus
+  Repo = "//github.com/MonsterChenzhuo/paimon-plus"
 
-  GithubRepo = "https://github.com/apache/paimon.git"
+  GithubRepo = "https://github.com/MonsterChenzhuo/paimon-plus.git"
 
   TrinoGithubRepo = "https://github.com/apache/paimon-trino.git"
 
@@ -58,24 +58,19 @@ pygmentsUseClasses = true
   # This suffix is appended to the Scala-dependent Maven artifact names
   ScalaVersion = "_2.12"
 
-  ProjectHomepage = "//paimon.apache.org"
+  ProjectHomepage = "//monsterchenzhuo.github.io/paimon-plus/"
 
   # External links at the bottom
   # of the menu
   MenuLinks = [
-    ["Project Homepage", "//paimon.apache.org"],
-    ["JavaDocs", "//paimon.apache.org/docs/1.4/api/java/"],
+    ["Project Homepage", "//monsterchenzhuo.github.io/paimon-plus/"],
+    ["GitHub", "//github.com/MonsterChenzhuo/paimon-plus"],
+    ["spark-cli", "//github.com/MonsterChenzhuo/spark-cli"],
   ]
 
-  StableDocs = "https://paimon.apache.org/docs/1.3"
+  StableDocs = "https://monsterchenzhuo.github.io/paimon-plus/"
 
-  PreviousDocs = [
-    ["master", "https://paimon.apache.org/docs/master"],
-    ["stable", "https://paimon.apache.org/docs/1.3"],
-    ["1.3", "https://paimon.apache.org/docs/1.3"],
-    ["1.2", "https://paimon.apache.org/docs/1.2"],
-    ["1.1", "https://paimon.apache.org/docs/1.1"],
-  ]
+  PreviousDocs = []
 
   BookSection = '/'
 
