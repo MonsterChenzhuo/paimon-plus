@@ -26,6 +26,8 @@ import org.assertj.core.api.Assertions.assertThat
 import java.io.File
 import java.util.concurrent.ThreadLocalRandom
 
+import scala.io.Source
+
 class NativeIOBenchmarkProcedureTest extends PaimonSparkTestBase {
 
   test("Paimon native IO benchmark procedure: synthetic table writes reports") {
@@ -62,7 +64,28 @@ class NativeIOBenchmarkProcedureTest extends PaimonSparkTestBase {
             assertThat(new File(resultDir, "duration_bar.svg")).exists()
             assertThat(new File(resultDir, "speedup_bar.svg")).exists()
             assertThat(new File(resultDir, "summary.html")).exists()
+
+            assertThat(readFile(new File(resultDir, "env.json")))
+              .contains("\"measure_mode\"")
+              .contains("noop")
+            assertThat(readFile(new File(resultDir, "dataset.json")))
+              .contains("\"bucket\"")
+              .contains("\"planned_splits\"")
+            assertThat(readFile(new File(resultDir, "result.csv")))
+              .contains("checksum_available")
+              .contains("native_columnar_candidate")
+            assertThat(readFile(new File(resultDir, "summary.json")))
+              .contains("\"native_columnar\"")
         }
+    }
+  }
+
+  private def readFile(file: File): String = {
+    val source = Source.fromFile(file)
+    try {
+      source.mkString
+    } finally {
+      source.close()
     }
   }
 }

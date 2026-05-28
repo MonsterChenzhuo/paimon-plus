@@ -26,6 +26,8 @@ import org.apache.paimon.spark.SparkCatalog;
 import org.apache.paimon.spark.SparkTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.Split;
 import org.apache.paimon.utils.JsonSerdeUtil;
 import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.StringUtils;
@@ -78,7 +80,13 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
     private static final int DEFAULT_WARMUP = 1;
     private static final double DEFAULT_DV_DELETE_RATIO = 0.10D;
     private static final String DEFAULT_TARGET_FILE_SIZE = "128 mb";
+    private static final int DEFAULT_BUCKET = 4;
     private static final int DELETE_MODULUS = 10_000;
+    private static final String MEASURE_MODE_NOOP = "noop";
+    private static final String MEASURE_MODE_ROW_DIGEST = "row_digest";
+    private static final String DEFAULT_MEASURE_MODE = MEASURE_MODE_NOOP;
+    private static final long ROW_COUNT_UNAVAILABLE = -1L;
+    private static final String EXCLUDED_RULES_CONF = "spark.sql.optimizer.excludedRules";
 
     private static final ProcedureParameter[] PARAMETERS =
             new ProcedureParameter[] {
@@ -91,7 +99,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 ProcedureParameter.optional("dv_delete_ratio", DoubleType),
                 ProcedureParameter.optional("target_file_size", StringType),
                 ProcedureParameter.optional("fail_if_native_unavailable", BooleanType),
-                ProcedureParameter.optional("overwrite", BooleanType)
+                ProcedureParameter.optional("overwrite", BooleanType),
+                ProcedureParameter.optional("bucket", IntegerType),
+                ProcedureParameter.optional("measure_mode", StringType)
             };
 
     private static final StructType OUTPUT_TYPE =
@@ -145,6 +155,11 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         String targetFileSize = args.isNullAt(7) ? DEFAULT_TARGET_FILE_SIZE : args.getString(7);
         boolean failIfNativeUnavailable = args.isNullAt(8) || args.getBoolean(8);
         boolean overwrite = args.isNullAt(9) || args.getBoolean(9);
+        int bucket = args.isNullAt(10) ? DEFAULT_BUCKET : args.getInt(10);
+        String measureMode =
+                args.isNullAt(11)
+                        ? DEFAULT_MEASURE_MODE
+                        : normalizeMeasureMode(args.getString(11));
 
         Preconditions.checkArgument(
                 !StringUtils.isNullOrWhitespaceOnly(warehouse), "warehouse should not be empty.");
@@ -161,6 +176,11 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         Preconditions.checkArgument(
                 !StringUtils.isNullOrWhitespaceOnly(targetFileSize),
                 "target_file_size should not be empty.");
+        Preconditions.checkArgument(bucket > 0, "bucket should be greater than 0.");
+        Preconditions.checkArgument(
+                MEASURE_MODE_NOOP.equals(measureMode)
+                        || MEASURE_MODE_ROW_DIGEST.equals(measureMode),
+                "measure_mode should be 'noop' or 'row_digest'.");
 
         Identifier identifier = toIdentifier(tableName, PARAMETERS[2].name());
         validatePathParts(identifier);
@@ -182,7 +202,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 dvDeleteRatio,
                 targetFileSize,
                 failIfNativeUnavailable,
-                overwrite);
+                overwrite,
+                bucket,
+                measureMode);
     }
 
     private BenchmarkReport runBenchmark(Config config) throws Exception {
@@ -240,7 +262,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                                 + "' = 'id', "
                                 + "'"
                                 + CoreOptions.BUCKET.key()
-                                + "' = '4', "
+                                + "' = '"
+                                + config.bucket
+                                + "', "
                                 + "'"
                                 + CoreOptions.FILE_FORMAT.key()
                                 + "' = 'parquet', "
@@ -302,7 +326,7 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                                     + " "
                                     + (warmup ? "warmup" : "repeat"));
             long started = System.nanoTime();
-            QueryDigest digest = materialize(query.sql);
+            QueryDigest digest = materialize(query.sql, config.measureMode);
             long durationMs = (System.nanoTime() - started) / 1_000_000L;
             if (!warmup) {
                 results.add(
@@ -312,14 +336,22 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                                 results.size(),
                                 durationMs,
                                 digest.rows,
-                                digest.checksum));
+                                digest.checksum,
+                                digest.checksumAvailable,
+                                digest.planInfo));
             }
         }
         return results;
     }
 
-    private QueryDigest materialize(String sql) {
+    private QueryDigest materialize(String sql, String measureMode) {
         Dataset<Row> data = spark().sql(sql);
+        PlanInfo planInfo = PlanInfo.from(data.queryExecution().executedPlan().toString());
+        if (MEASURE_MODE_NOOP.equals(measureMode)) {
+            data.write().format("noop").mode("overwrite").save();
+            return new QueryDigest(ROW_COUNT_UNAVAILABLE, 0L, false, planInfo);
+        }
+
         List<QueryDigest> partitions =
                 data.javaRDD().mapPartitions(new DigestRowsFunction()).collect();
         long rows = 0L;
@@ -328,7 +360,7 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             rows += partition.rows;
             checksum += partition.checksum;
         }
-        return new QueryDigest(rows, checksum);
+        return new QueryDigest(rows, checksum, true, planInfo);
     }
 
     private static QueryDigest digest(Iterator<Row> rows) {
@@ -339,7 +371,7 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             rowCount++;
             checksum += rowDigest(row);
         }
-        return new QueryDigest(rowCount, checksum);
+        return new QueryDigest(rowCount, checksum, true, PlanInfo.EMPTY);
     }
 
     private static long rowDigest(Row row) {
@@ -388,7 +420,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                             speedup,
                             javaMedian.rows,
                             nativeMedian.rows,
-                            javaMedian.checksum == nativeMedian.checksum));
+                            checksumMatch(javaMedian, nativeMedian),
+                            javaMedian.planInfo.nativeColumnarCandidate,
+                            nativeMedian.planInfo.nativeColumnarCandidate));
         }
         return summaries;
     }
@@ -408,6 +442,13 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         List<RunResult> sorted = new ArrayList<>(results);
         Collections.sort(sorted, (left, right) -> Long.compare(left.durationMs, right.durationMs));
         return sorted.get(sorted.size() / 2);
+    }
+
+    private static Boolean checksumMatch(RunResult javaResult, RunResult nativeResult) {
+        if (!javaResult.checksumAvailable || !nativeResult.checksumAvailable) {
+            return null;
+        }
+        return javaResult.rows == nativeResult.rows && javaResult.checksum == nativeResult.checksum;
     }
 
     private void writeReports(BenchmarkReport report) throws IOException {
@@ -432,6 +473,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         env.put("application_id", report.applicationId);
         env.put("master", report.master);
         env.put("default_parallelism", report.defaultParallelism);
+        env.put("measure_mode", report.config.measureMode);
+        env.put("warnings", report.warnings);
         env.put("driver_native_io", report.driverNative.asMap());
         List<Map<String, Object>> executors = new ArrayList<>();
         for (NativeCheck check : report.executorNative) {
@@ -452,6 +495,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         dataset.put("table_path", config.tablePath.toString());
         dataset.put("rows_requested", config.rows);
         dataset.put("dv_delete_ratio", config.dvDeleteRatio);
+        dataset.put("bucket", config.bucket);
+        dataset.put("measure_mode", config.measureMode);
         dataset.put("delete_threshold", deleteThreshold(config.dvDeleteRatio));
         dataset.put(
                 "deleted_rows_estimate", estimatedDeletedRows(config.rows, config.dvDeleteRatio));
@@ -459,6 +504,10 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 "rows_after_delete_estimate",
                 config.rows - estimatedDeletedRows(config.rows, config.dvDeleteRatio));
         dataset.put("target_file_size", config.targetFileSize);
+        dataset.put("planned_splits", report.datasetStats.plannedSplits);
+        dataset.put("data_splits", report.datasetStats.dataSplits);
+        dataset.put("raw_convertible_splits", report.datasetStats.rawConvertibleSplits);
+        dataset.put("data_files", report.datasetStats.dataFiles);
         return dataset;
     }
 
@@ -484,7 +533,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
 
     private static String csvReport(List<RunResult> results) {
         StringBuilder builder = new StringBuilder();
-        builder.append("mode,query,iteration,duration_ms,rows,checksum\n");
+        builder.append("mode,query,iteration,duration_ms,rows,checksum")
+                .append(",checksum_available,columnar_to_row,batch_scan")
+                .append(",paimon_scan,native_columnar_candidate\n");
         for (RunResult result : results) {
             builder.append(result.mode)
                     .append(',')
@@ -497,6 +548,16 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                     .append(result.rows)
                     .append(',')
                     .append(result.checksum)
+                    .append(',')
+                    .append(result.checksumAvailable)
+                    .append(',')
+                    .append(result.planInfo.hasColumnarToRow)
+                    .append(',')
+                    .append(result.planInfo.hasBatchScan)
+                    .append(',')
+                    .append(result.planInfo.hasPaimonScan)
+                    .append(',')
+                    .append(result.planInfo.nativeColumnarCandidate)
                     .append('\n');
         }
         return builder.toString();
@@ -510,7 +571,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 .append("</title>\n")
                 .append("<style>")
                 .append(
-                        "body{font-family:Arial,sans-serif;margin:24px;background:#fff;color:#111;}")
+                        "body{font-family:Arial,sans-serif;margin:24px;"
+                                + "background:#fff;color:#111;}")
                 .append("h1{font-size:20px;margin:0 0 16px;}")
                 .append("section{margin:24px 0;}")
                 .append("table{border-collapse:collapse;font-size:13px;}")
@@ -518,13 +580,16 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 .append("td:first-child,th:first-child{text-align:left;}")
                 .append("</style>\n</head>\n<body>\n<h1>")
                 .append(xmlEscape(chartTitle(report)))
-                .append("</h1>\n<section>\n")
+                .append("</h1>\n")
+                .append(warningsHtml(report.warnings))
+                .append("<section>\n")
                 .append(durationChart(report))
                 .append("\n</section>\n<section>\n")
                 .append(speedupChart(report))
                 .append("\n</section>\n<section>\n<table>\n")
                 .append("<tr><th>query</th><th>java median ms</th><th>native median ms</th>")
-                .append("<th>speedup</th><th>checksum match</th></tr>\n");
+                .append("<th>speedup</th><th>checksum match</th>")
+                .append("<th>java columnar</th><th>native columnar</th></tr>\n");
         for (Summary summary : report.summaries) {
             builder.append("<tr><td>")
                     .append(xmlEscape(summary.query))
@@ -535,11 +600,27 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                     .append("</td><td>")
                     .append(formatDouble(summary.speedup))
                     .append("x</td><td>")
-                    .append(summary.checksumMatch)
+                    .append(displayBoolean(summary.checksumMatch))
+                    .append("</td><td>")
+                    .append(summary.javaColumnar)
+                    .append("</td><td>")
+                    .append(summary.nativeColumnar)
                     .append("</td></tr>\n");
         }
         builder.append("</table>\n</section>\n</body>\n</html>\n");
         return builder.toString();
+    }
+
+    private static String warningsHtml(List<String> warnings) {
+        if (warnings.isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("<section><table>\n<tr><th>warning</th></tr>\n");
+        for (String warning : warnings) {
+            builder.append("<tr><td>").append(xmlEscape(warning)).append("</td></tr>\n");
+        }
+        return builder.append("</table></section>\n").toString();
     }
 
     private static String durationChart(BenchmarkReport report) {
@@ -729,6 +810,10 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 + config.rows
                 + ", dv="
                 + formatDouble(config.dvDeleteRatio)
+                + ", bucket="
+                + config.bucket
+                + ", measure="
+                + config.measureMode
                 + ", file="
                 + config.targetFileSize
                 + ", parallelism="
@@ -739,6 +824,10 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
 
     private static String formatDouble(double value) {
         return String.format(Locale.ROOT, "%.2f", value);
+    }
+
+    private static String displayBoolean(Boolean value) {
+        return value == null ? "n/a" : value.toString();
     }
 
     private static String xmlEscape(String value) {
@@ -965,6 +1054,17 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         return result;
     }
 
+    private static String normalizeMeasureMode(String measureMode) {
+        String normalized = measureMode.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+        if ("scan".equals(normalized) || "scan_only".equals(normalized)) {
+            return MEASURE_MODE_NOOP;
+        }
+        if ("checksum".equals(normalized) || "digest".equals(normalized)) {
+            return MEASURE_MODE_ROW_DIGEST;
+        }
+        return normalized;
+    }
+
     private static int deleteThreshold(double deleteRatio) {
         return (int) Math.round(deleteRatio * DELETE_MODULUS);
     }
@@ -987,6 +1087,65 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 + Long.toString(System.currentTimeMillis(), 36)
                 + "_"
                 + Long.toString(hash, 36);
+    }
+
+    private DatasetStats datasetStats(Table table) {
+        List<Split> splits = table.newReadBuilder().newScan().plan().splits();
+        int dataSplits = 0;
+        int rawConvertibleSplits = 0;
+        int dataFiles = 0;
+        for (Split split : splits) {
+            if (split instanceof DataSplit) {
+                DataSplit dataSplit = (DataSplit) split;
+                dataSplits++;
+                if (dataSplit.rawConvertible()) {
+                    rawConvertibleSplits++;
+                }
+                dataFiles += dataSplit.dataFiles().size();
+            }
+        }
+        return new DatasetStats(splits.size(), dataSplits, rawConvertibleSplits, dataFiles);
+    }
+
+    private List<String> benchmarkWarnings(Config config) {
+        List<String> warnings = new ArrayList<>();
+        if (MEASURE_MODE_ROW_DIGEST.equals(config.measureMode)) {
+            warnings.add(
+                    "measure_mode=row_digest includes Spark row conversion and Java checksum "
+                            + "cost; use measure_mode=noop for scan-only timing.");
+        }
+        Option<String> excludedRules = spark().conf().getOption(EXCLUDED_RULES_CONF);
+        if (excludedRules.isDefined()) {
+            String rules = excludedRules.get();
+            if (containsRule(rules, "V2ScanRelationPushDown")) {
+                warnings.add(
+                        EXCLUDED_RULES_CONF
+                                + " excludes V2ScanRelationPushDown; Spark may not push "
+                                + "required columns to Paimon scans.");
+            }
+            if (containsRule(rules, "ColumnPruning")) {
+                warnings.add(
+                        EXCLUDED_RULES_CONF
+                                + " excludes ColumnPruning; projection benchmarks can read "
+                                + "more columns than requested.");
+            }
+            if (containsRule(rules, "SchemaPruning")) {
+                warnings.add(
+                        EXCLUDED_RULES_CONF
+                                + " excludes SchemaPruning; nested or projected schema pruning "
+                                + "can be disabled.");
+            }
+        }
+        return warnings;
+    }
+
+    private static boolean containsRule(String rules, String simpleName) {
+        for (String rule : rules.split(",")) {
+            if (rule.trim().endsWith(simpleName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static ProcedureBuilder builder() {
@@ -1019,6 +1178,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         private final String targetFileSize;
         private final boolean failIfNativeUnavailable;
         private final boolean overwrite;
+        private final int bucket;
+        private final String measureMode;
 
         private Config(
                 String warehouse,
@@ -1034,7 +1195,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 double dvDeleteRatio,
                 String targetFileSize,
                 boolean failIfNativeUnavailable,
-                boolean overwrite) {
+                boolean overwrite,
+                int bucket,
+                String measureMode) {
             this.warehouse = warehouse;
             this.resultPath = resultPath;
             this.tableName = tableName;
@@ -1049,6 +1212,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             this.targetFileSize = targetFileSize;
             this.failIfNativeUnavailable = failIfNativeUnavailable;
             this.overwrite = overwrite;
+            this.bucket = bucket;
+            this.measureMode = measureMode;
         }
     }
 
@@ -1069,10 +1234,63 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
 
         private final long rows;
         private final long checksum;
+        private final boolean checksumAvailable;
+        private final PlanInfo planInfo;
 
-        private QueryDigest(long rows, long checksum) {
+        private QueryDigest(
+                long rows, long checksum, boolean checksumAvailable, PlanInfo planInfo) {
             this.rows = rows;
             this.checksum = checksum;
+            this.checksumAvailable = checksumAvailable;
+            this.planInfo = planInfo;
+        }
+    }
+
+    private static class PlanInfo implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private static final PlanInfo EMPTY = new PlanInfo(false, false, false, false, "");
+
+        private final boolean hasColumnarToRow;
+        private final boolean hasBatchScan;
+        private final boolean hasPaimonScan;
+        private final boolean nativeColumnarCandidate;
+        private final String physicalPlan;
+
+        private PlanInfo(
+                boolean hasColumnarToRow,
+                boolean hasBatchScan,
+                boolean hasPaimonScan,
+                boolean nativeColumnarCandidate,
+                String physicalPlan) {
+            this.hasColumnarToRow = hasColumnarToRow;
+            this.hasBatchScan = hasBatchScan;
+            this.hasPaimonScan = hasPaimonScan;
+            this.nativeColumnarCandidate = nativeColumnarCandidate;
+            this.physicalPlan = physicalPlan;
+        }
+
+        private static PlanInfo from(String physicalPlan) {
+            boolean hasColumnarToRow = physicalPlan.contains("ColumnarToRow");
+            boolean hasBatchScan = physicalPlan.contains("BatchScan");
+            boolean hasPaimonScan = physicalPlan.contains("PaimonScan");
+            return new PlanInfo(
+                    hasColumnarToRow,
+                    hasBatchScan,
+                    hasPaimonScan,
+                    hasColumnarToRow && hasBatchScan && hasPaimonScan,
+                    physicalPlan);
+        }
+
+        private Map<String, Object> asMap() {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("columnar_to_row", hasColumnarToRow);
+            map.put("batch_scan", hasBatchScan);
+            map.put("paimon_scan", hasPaimonScan);
+            map.put("native_columnar_candidate", nativeColumnarCandidate);
+            map.put("physical_plan", physicalPlan);
+            return map;
         }
     }
 
@@ -1094,6 +1312,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         private final long durationMs;
         private final long rows;
         private final long checksum;
+        private final boolean checksumAvailable;
+        private final PlanInfo planInfo;
 
         private RunResult(
                 String mode,
@@ -1101,13 +1321,17 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 int iteration,
                 long durationMs,
                 long rows,
-                long checksum) {
+                long checksum,
+                boolean checksumAvailable,
+                PlanInfo planInfo) {
             this.mode = mode;
             this.query = query;
             this.iteration = iteration;
             this.durationMs = durationMs;
             this.rows = rows;
             this.checksum = checksum;
+            this.checksumAvailable = checksumAvailable;
+            this.planInfo = planInfo;
         }
 
         private Map<String, Object> asMap() {
@@ -1118,6 +1342,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             map.put("duration_ms", durationMs);
             map.put("rows", rows);
             map.put("checksum", checksum);
+            map.put("checksum_available", checksumAvailable);
+            map.put("plan", planInfo.asMap());
             return map;
         }
     }
@@ -1130,7 +1356,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         private final double speedup;
         private final long javaRows;
         private final long nativeRows;
-        private final boolean checksumMatch;
+        private final Boolean checksumMatch;
+        private final boolean javaColumnar;
+        private final boolean nativeColumnar;
 
         private Summary(
                 String query,
@@ -1139,7 +1367,9 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
                 double speedup,
                 long javaRows,
                 long nativeRows,
-                boolean checksumMatch) {
+                Boolean checksumMatch,
+                boolean javaColumnar,
+                boolean nativeColumnar) {
             this.query = query;
             this.javaMedianMs = javaMedianMs;
             this.nativeMedianMs = nativeMedianMs;
@@ -1147,6 +1377,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             this.javaRows = javaRows;
             this.nativeRows = nativeRows;
             this.checksumMatch = checksumMatch;
+            this.javaColumnar = javaColumnar;
+            this.nativeColumnar = nativeColumnar;
         }
 
         private Map<String, Object> asMap() {
@@ -1158,7 +1390,25 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             map.put("java_rows", javaRows);
             map.put("native_rows", nativeRows);
             map.put("checksum_match", checksumMatch);
+            map.put("java_columnar", javaColumnar);
+            map.put("native_columnar", nativeColumnar);
             return map;
+        }
+    }
+
+    private static class DatasetStats {
+
+        private final int plannedSplits;
+        private final int dataSplits;
+        private final int rawConvertibleSplits;
+        private final int dataFiles;
+
+        private DatasetStats(
+                int plannedSplits, int dataSplits, int rawConvertibleSplits, int dataFiles) {
+            this.plannedSplits = plannedSplits;
+            this.dataSplits = dataSplits;
+            this.rawConvertibleSplits = rawConvertibleSplits;
+            this.dataFiles = dataFiles;
         }
     }
 
@@ -1213,6 +1463,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
         private final List<NativeCheck> executorNative;
         private final List<RunResult> results;
         private final List<Summary> summaries;
+        private final DatasetStats datasetStats;
+        private final List<String> warnings;
         private final String sparkVersion;
         private final String applicationId;
         private final String master;
@@ -1231,6 +1483,8 @@ public class NativeIOBenchmarkProcedure extends BaseProcedure {
             this.executorNative = executorNative;
             this.results = results;
             this.summaries = summaries;
+            this.datasetStats = datasetStats(table);
+            this.warnings = benchmarkWarnings(config);
             this.sparkVersion = spark().version();
             this.applicationId = spark().sparkContext().applicationId();
             this.master = spark().sparkContext().master();
