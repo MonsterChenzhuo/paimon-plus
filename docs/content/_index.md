@@ -55,12 +55,12 @@ observability, structured diagnostics APIs, and a spark-cli workflow built for A
 <span class="pp-dot pp-dot-red"></span>
 <span class="pp-dot pp-dot-yellow"></span>
 <span class="pp-dot pp-dot-green"></span>
-<span class="pp-console-title">Native IO Control Plane</span>
+<span class="pp-console-title">Spark Export Control Plane</span>
 </div>
 <div class="pp-console-grid">
 <div class="pp-metric">
 <span>fast path</span>
-<strong>native</strong>
+<strong>java</strong>
 </div>
 <div class="pp-metric">
 <span>schema width</span>
@@ -76,7 +76,7 @@ observability, structured diagnostics APIs, and a spark-cli workflow built for A
 <i></i>
 <span>export_parquet</span>
 <i></i>
-<span>Rust Native IO</span>
+<span>Java export</span>
 <i></i>
 <span>AI diagnosis</span>
 </div>
@@ -97,7 +97,7 @@ target_file_size =&gt; '128 MB'
 <b style="width: 52%"></b>
 </div>
 <div>
-<span>Native write</span>
+<span>Java write</span>
 <b style="width: 64%"></b>
 </div>
 </div>
@@ -109,7 +109,7 @@ target_file_size =&gt; '128 MB'
 <div class="pp-proof">
 <span>01</span>
 <strong>Native execution where it matters</strong>
-<p>Move hot Spark read and export paths across the JVM boundary into a Rust native library.</p>
+<p>Move selected Spark read paths across the JVM boundary into a Rust native library.</p>
 </div>
 <div class="pp-proof">
 <span>02</span>
@@ -142,11 +142,11 @@ a Spark job stalls inside native or object-storage code.
 <div class="pp-feature-grid">
 <article class="pp-feature-card pp-feature-wide">
 <div class="pp-feature-kicker">Native IO</div>
-<h3>Rust powered read and export acceleration</h3>
+<h3>Rust powered read acceleration</h3>
 <p>
 The <code>paimon-native-io</code> module packages a Rust native library behind JNR, returns Arrow
 batches to Spark, and keeps OBS options flowing from Spark, Paimon options, or environment
-variables.
+variables for native read scenarios.
 </p>
 </article>
 <article class="pp-feature-card">
@@ -199,13 +199,13 @@ and turn diagnostics APIs into concrete tuning actions.
 </div>
 <div class="pp-pipeline-step">
 <span>2</span>
-<h3>Preflight native</h3>
-<p>Driver checks raw Parquet convertibility, compression, OBS configuration, memory limits, and fallback policy.</p>
+<h3>Preflight export</h3>
+<p>Driver validates table, projection, filters, output path, overwrite policy, and target file sizing.</p>
 </div>
 <div class="pp-pipeline-step">
 <span>3</span>
-<h3>Execute in Rust</h3>
-<p>Native workers read object storage, decode Parquet, apply delete vectors and filters, then write optimized output.</p>
+<h3>Execute in Java</h3>
+<p>Spark tasks run the standard Java export implementation, read Paimon splits, and write external Parquet files.</p>
 </div>
 <div class="pp-pipeline-step">
 <span>4</span>
@@ -228,7 +228,7 @@ wide schemas and operational exports less fragile in real Spark deployments.
 <div class="pp-capability-panel">
 <h3>Big themes</h3>
 <ul>
-<li>Native IO for Spark read and export hot paths.</li>
+<li>Native IO for selected Spark read hot paths.</li>
 <li>Wide feature-table export for downstream feature loading scenarios.</li>
 <li>Native IO UI and diagnostics APIs for live Spark UI and Spark History Server.</li>
 <li>Paimon diagnostics that can be consumed directly by spark-cli and AI agents.</li>
@@ -277,8 +277,8 @@ each feature actually removes.
 </a>
 <article class="pp-note-card">
 <span>Coming next</span>
-<h3>Native IO Export</h3>
-<p>Why wide feature-table export needs driver preflight, raw Parquet split planning, DV pushdown, and native fallback evidence.</p>
+<h3>Feature Export</h3>
+<p>Why wide feature-table export uses the standard Java implementation, driver preflight, split planning, and output manifests.</p>
 </article>
 </div>
 </section>

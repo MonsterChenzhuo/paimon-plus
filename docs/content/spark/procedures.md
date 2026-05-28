@@ -490,7 +490,7 @@ This section introduce all available spark procedures about paimon.
             <li>target_file_size: target Parquet file size, such as "128 MB". Left empty to keep one output file per Paimon split.</li>
             <li>partitioned_output: whether to write Paimon partitions under separate partition directories. Left empty for false.</li>
             <li>partition_job_parallelism: max concurrent partition export jobs when partitioned_output is true. Left empty to use the actual exported partition count.</li>
-            <li>Native IO: the default path is the Java export path. Setting spark.paimon.native-io.export.enabled=true attempts the native fast path and requires spark.paimon.native-io.enabled=true plus paimon-native-io on driver and executor classpaths. Driver preflight failures fall back to Java by default; set spark.paimon.native-io.export.fail-on-fallback=true to fail when native export is not applicable.</li>
+            <li>implementation: uses the standard Java export implementation.</li>
       </td>
       <td>
          CALL sys.export_parquet(table => "default.T", columns => "id,name", output_path => "s3://bucket/export/t", where => "dt = '2025-08-17' and id >= 10", parallelism => 100, compression => "zstd", overwrite => true, target_file_size => "128 MB")<br/>

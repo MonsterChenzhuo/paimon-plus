@@ -63,10 +63,10 @@ configuration, and the command sequence Codex can use to analyze online Spark jo
 
 <article class="pp-blog-list-card pp-blog-list-card-muted">
 <span>Coming next</span>
-<h2>Native IO Export</h2>
+<h2>Feature Export</h2>
 <p>
-Driver preflight, raw Parquet split planning, delete-vector pushdown, compact output,
-and native fallback evidence for wide feature-table export.
+Standard Java export implementation, driver preflight, raw Parquet split planning,
+compact output, and manifests for wide feature-table export.
 </p>
 </article>
 </section>
