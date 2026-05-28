@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">export_parquet standard Java implementation flow</title>
+  <desc id="desc">Spark calls the Paimon export_parquet procedure. The driver validates parameters, plans Paimon splits, Spark tasks read projected rows, Java writers emit Parquet files, and the driver writes manifest and success files.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#07100f"/>
+      <stop offset="0.52" stop-color="#112d25"/>
+      <stop offset="1" stop-color="#26331b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#66e2bc"/>
+      <stop offset="1" stop-color="#f5bf55"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#66e2bc"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <circle cx="1410" cy="130" r="230" fill="#66e2bc" opacity="0.08"/>
+  <circle cx="150" cy="775" r="280" fill="#f5bf55" opacity="0.07"/>
+
+  <text x="92" y="92" fill="#ffffff" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="800">export_parquet Java Export</text>
+  <text x="92" y="136" fill="#c7d9d1" font-family="Inter, Arial, sans-serif" font-size="23">A Spark procedure for feature-table snapshots without building a wide Spark SQL projection.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="92" y="214" width="328" height="220" rx="18" fill="#ffffff"/>
+    <text x="124" y="266" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800">Spark SQL call</text>
+    <text x="124" y="316" fill="#52635d" font-family="JetBrains Mono, Menlo, monospace" font-size="18">CALL sys.export_parquet</text>
+    <text x="124" y="350" fill="#52635d" font-family="JetBrains Mono, Menlo, monospace" font-size="18">columns, where, output_path</text>
+    <rect x="124" y="382" width="230" height="5" rx="2" fill="url(#accent)"/>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="520" y="190" width="390" height="270" rx="22" fill="#102720"/>
+    <text x="552" y="248" fill="#ffffff" font-family="Inter, Arial, sans-serif" font-size="31" font-weight="800">Driver preflight</text>
+    <text x="552" y="296" fill="#c7d9d1" font-family="Inter, Arial, sans-serif" font-size="20">Validate output path and overwrite policy</text>
+    <text x="552" y="332" fill="#c7d9d1" font-family="Inter, Arial, sans-serif" font-size="20">Build projection and predicate</text>
+    <text x="552" y="368" fill="#c7d9d1" font-family="Inter, Arial, sans-serif" font-size="20">Plan Paimon splits</text>
+    <text x="552" y="404" fill="#c7d9d1" font-family="Inter, Arial, sans-serif" font-size="20">Group partitioned output when enabled</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1012" y="214" width="388" height="220" rx="18" fill="#ffffff"/>
+    <text x="1044" y="266" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800">Spark tasks</text>
+    <text x="1044" y="314" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="20">Read Paimon splits with projection</text>
+    <text x="1044" y="350" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="20">Apply remaining predicate</text>
+    <text x="1044" y="386" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="20">Write Parquet through Java writers</text>
+  </g>
+
+  <path d="M430 324 C466 324 480 324 504 324" stroke="#66e2bc" stroke-width="5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M922 324 C958 324 972 324 996 324" stroke="#66e2bc" stroke-width="5" fill="none" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="168" y="594" width="300" height="154" rx="18" fill="#ffffff"/>
+    <text x="196" y="642" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">target_file_size</text>
+    <text x="196" y="682" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">Rolling writer controls file size</text>
+    <text x="196" y="716" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">without forcing one huge output file.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="520" y="594" width="300" height="154" rx="18" fill="#ffffff"/>
+    <text x="548" y="642" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">partitioned_output</text>
+    <text x="548" y="682" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">Partition directories mirror</text>
+    <text x="548" y="716" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">the planned Paimon partitions.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="872" y="594" width="300" height="154" rx="18" fill="#ffffff"/>
+    <text x="900" y="642" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">compact_output</text>
+    <text x="900" y="682" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">Row-group copy combines files</text>
+    <text x="900" y="716" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">without decoding wide rows again.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1224" y="594" width="300" height="154" rx="18" fill="#ffffff"/>
+    <text x="1252" y="642" fill="#07100f" font-family="Inter, Arial, sans-serif" font-size="25" font-weight="800">_manifest.json</text>
+    <text x="1252" y="682" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">Relative Parquet paths make</text>
+    <text x="1252" y="716" fill="#52635d" font-family="Inter, Arial, sans-serif" font-size="19">downstream loading deterministic.</text>
+  </g>
+
+  <path d="M1205 446 C1205 510 328 520 318 578" stroke="#f5bf55" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path d="M1205 446 C1205 510 680 520 670 578" stroke="#f5bf55" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path d="M1205 446 C1205 510 1032 520 1022 578" stroke="#f5bf55" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path d="M1205 446 C1205 510 1384 520 1374 578" stroke="#f5bf55" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+</svg>

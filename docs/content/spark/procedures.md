@@ -477,7 +477,7 @@ This section introduce all available spark procedures about paimon.
       </td>
    </tr>
    <tr>
-      <td>export_parquet</td>
+      <td id="export_parquet">export_parquet</td>
       <td>
          Export projected Paimon table rows to an external Parquet directory without building a Spark SQL wide projection. Arguments:
             <li>table: the target table identifier. Cannot be empty.</li>

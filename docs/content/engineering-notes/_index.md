@@ -61,13 +61,14 @@ configuration, and the command sequence Codex can use to analyze online Spark jo
 <strong>Read article</strong>
 </a>
 
-<article class="pp-blog-list-card pp-blog-list-card-muted">
-<span>Coming next</span>
-<h2>Feature Export</h2>
+<a class="pp-blog-list-card" href="export-parquet/">
+<span>Feature Export</span>
+<h2>export_parquet Java Export</h2>
 <p>
-Standard Java export implementation, driver preflight, raw Parquet split planning,
-compact output, and manifests for wide feature-table export.
+Standard Java export implementation, driver preflight, Paimon split planning,
+partitioned output, copy compaction, and manifests for wide feature-table export.
 </p>
-</article>
+<strong>Read article</strong>
+</a>
 </section>
 </div>

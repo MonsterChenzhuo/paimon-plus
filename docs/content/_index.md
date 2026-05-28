@@ -275,11 +275,12 @@ each feature actually removes.
 <p>How diagnostics APIs and Spark History Server evidence can become an AI-readable root-cause workflow.</p>
 <strong>Read the note</strong>
 </a>
-<article class="pp-note-card">
-<span>Coming next</span>
-<h3>Feature Export</h3>
+<a class="pp-note-card" href="engineering-notes/export-parquet/">
+<span>Feature Export</span>
+<h3>export_parquet Java Export</h3>
 <p>Why wide feature-table export uses the standard Java implementation, driver preflight, split planning, and output manifests.</p>
-</article>
+<strong>Read the note</strong>
+</a>
 </div>
 </section>
 </div>
