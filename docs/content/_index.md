@@ -37,7 +37,7 @@ operational layer for Spark: Rust powered Native IO, feature-table Parquet expor
 observability, structured diagnostics APIs, and a spark-cli workflow built for AI agents.
 </p>
 <div class="pp-actions">
-<a class="pp-button pp-button-primary" href="spark/quick-start/">Start with Spark</a>
+<a class="pp-button pp-button-primary" href="engineering-notes/">Start with Spark</a>
 <a class="pp-button pp-button-secondary" href="https://github.com/MonsterChenzhuo/paimon-plus">View GitHub</a>
 </div>
 <div class="pp-hero-tags" aria-label="Paimon Plus focus areas">
