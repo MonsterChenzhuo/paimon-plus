@@ -1124,6 +1124,51 @@ pre.chroma code {
     margin-top: 2rem;
 }
 
+.markdown .pp-blog-section table {
+    display: block;
+    width: 100%;
+    margin: 1.2rem 0 1.6rem;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.94rem;
+}
+
+.markdown .pp-blog-section th,
+.markdown .pp-blog-section td {
+    min-width: 13rem;
+    padding: 0.8rem 0.9rem;
+    border: 1px solid #dfe8e2;
+    vertical-align: top;
+}
+
+.markdown .pp-blog-section th {
+    color: #10201a;
+    background: #eef7f2;
+    font-weight: 800;
+}
+
+.markdown .pp-blog-page pre {
+    max-width: 100%;
+    margin: 1.2rem 0;
+    padding: 1.05rem 1.15rem;
+    border-radius: 8px;
+    color: #d9f7e8;
+    background: #07100f;
+    border: 1px solid rgba(13, 81, 63, 0.18);
+    overflow-x: auto;
+}
+
+.markdown .pp-blog-page pre code {
+    display: block;
+    padding: 0;
+    border: 0;
+    color: inherit;
+    background: transparent;
+    font-size: 0.86rem;
+    line-height: 1.58;
+    white-space: pre;
+}
+
 .pp-code-panel {
     margin: 1.2rem 0;
     border-radius: 8px;

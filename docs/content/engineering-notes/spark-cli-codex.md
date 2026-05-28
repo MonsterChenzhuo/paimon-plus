@@ -72,23 +72,23 @@ The installer downloads the latest release binary and puts <code>spark-cli</code
 PATH. Re-running the same command upgrades the binary.
 </p>
 
-<div class="pp-code-panel">
-<pre><code>curl -fsSL https://raw.githubusercontent.com/MonsterChenzhuo/spark-cli/main/scripts/install.sh | bash
-spark-cli version</code></pre>
-</div>
+```
+curl -fsSL https://raw.githubusercontent.com/MonsterChenzhuo/spark-cli/main/scripts/install.sh | bash
+spark-cli version
+```
 
 <p>
 For a non-sudo Codex workspace, install into <code>$HOME/.local/bin</code> and make sure that
 directory is on PATH.
 </p>
 
-<div class="pp-code-panel">
-<pre><code>curl -fsSL https://raw.githubusercontent.com/MonsterChenzhuo/spark-cli/main/scripts/install.sh \
+```
+curl -fsSL https://raw.githubusercontent.com/MonsterChenzhuo/spark-cli/main/scripts/install.sh \
   | PREFIX="$HOME/.local/bin" NO_SKILL=1 bash
 
 export PATH="$HOME/.local/bin:$PATH"
-spark-cli self-update --dry-run</code></pre>
-</div>
+spark-cli self-update --dry-run
+```
 </section>
 
 <section class="pp-blog-section">
@@ -108,8 +108,8 @@ fetches the EventLog zip through the SHS REST API.
 | YARN Web UI / RM gateway | `http://gateway.example.com/gateway/prod/yarn` | Stored in `yarn.base_urls`; spark-cli reads RM state, tracking URLs, thread dumps, and container log links. |
 | EventLog object-storage root | `obs://lake/spark-history` or `s3://lake/spark-history` | Configured in Spark History Server or mounted as `file://` / `hdfs://`; Codex does not need cloud credentials when SHS is used. |
 
-<div class="pp-code-panel">
-<pre><code>spark-cli config init
+```
+spark-cli config init
 
 spark-cli config cluster add prod \
   --log-dirs shs://history.example.com:18081 \
@@ -117,16 +117,16 @@ spark-cli config cluster add prod \
   --shs-timeout 10m \
   --activate
 
-spark-cli config show --format json</code></pre>
-</div>
+spark-cli config show --format json
+```
 
 <p>
 The generated config lives at <code>~/.config/spark-cli/config.yaml</code>. A production profile
 usually looks like this:
 </p>
 
-<div class="pp-code-panel">
-<pre><code>active_cluster: prod
+```
+active_cluster: prod
 clusters:
   prod:
     log_dirs:
@@ -140,8 +140,8 @@ timeout: 30s
 
 # The Spark History Server behind shs:// is configured with the real EventLog
 # root, for example obs://lake/spark-history or s3://lake/spark-history.
-# That keeps cloud credentials out of the Codex runtime.</code></pre>
-</div>
+# That keeps cloud credentials out of the Codex runtime.
+```
 </section>
 
 <section class="pp-blog-section">
@@ -153,8 +153,10 @@ checks live driver state before EventLog metrics are trusted. The remaining comm
 history data and fetch deeper evidence only when needed.
 </p>
 
-<div class="pp-code-panel">
-<pre><code>APP=application_1779838558973_1527
+<p><strong>First pass.</strong> Confirm config, inspect the live driver, then parse EventLog evidence.</p>
+
+```
+APP=application_1779838558973_1527
 
 spark-cli config show --format json
 
@@ -165,16 +167,19 @@ spark-cli --cluster prod driver-thread-dump "$APP" \
 spark-cli --cluster prod diagnose "$APP"
 spark-cli --cluster prod app-summary "$APP"
 spark-cli --cluster prod slow-stages "$APP" --top 5
+```
 
-# Use these when the first pass points at executor logs or Paimon runtime state.
+<p><strong>Deep dive.</strong> Fetch executor logs or Paimon runtime JSON only when the first pass points there.</p>
+
+```
 spark-cli --cluster prod yarn-logs "$APP" \
   --executor-id 7 \
   --yarn-log-types stderr,gc \
   --yarn-log-bytes 131072
 
 spark-cli --cluster prod paimon-diagnostics "$APP" \
-  --executor-id 7</code></pre>
-</div>
+  --executor-id 7
+```
 </section>
 
 <section class="pp-blog-section">
@@ -202,27 +207,27 @@ Keep the prompt operational. Give Codex the application id and cluster name, the
 to use spark-cli before making a judgment.
 </p>
 
-<div class="pp-code-panel">
-<pre><code>Use spark-cli to diagnose Spark application application_1779838558973_1527
+```
+Use spark-cli to diagnose Spark application application_1779838558973_1527
 on cluster prod.
 
 First run:
 1. spark-cli config show --format json
-2. spark-cli --cluster prod driver-thread-dump &lt;app&gt; --executor-id driver --thread-summary-only
-3. spark-cli --cluster prod diagnose &lt;app&gt;
-4. spark-cli --cluster prod app-summary &lt;app&gt;
+2. spark-cli --cluster prod driver-thread-dump <app> --executor-id driver --thread-summary-only
+3. spark-cli --cluster prod diagnose <app>
+4. spark-cli --cluster prod app-summary <app>
 
 If the app is still running or Paimon export looks stuck, also run:
-- spark-cli --cluster prod paimon-diagnostics &lt;app&gt; --executor-id &lt;executorId&gt;
-- spark-cli --cluster prod yarn-logs &lt;app&gt; --executor-id &lt;executorId&gt; --yarn-log-types stderr,gc
+- spark-cli --cluster prod paimon-diagnostics <app> --executor-id <executorId>
+- spark-cli --cluster prod yarn-logs <app> --executor-id <executorId> --yarn-log-types stderr,gc
 
 Return:
 - current application state
 - strongest evidence
 - likely root cause
 - what is not proven yet
-- next command or Spark UI check</code></pre>
-</div>
+- next command or Spark UI check
+```
 </section>
 
 <section class="pp-blog-section">
