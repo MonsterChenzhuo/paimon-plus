@@ -54,6 +54,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
         case "task" => operationsTable("Active Native IO Tasks", active, now)
         case "file" => grouped("File", active.groupBy(_.filePath.getOrElse("-")), now)
         case "timeline" => timelineTable(store.timeline)
+        case "completed" => operationsTable("Recent Completed Native IO Operations", completed, now)
         case "slow" => operationsTable("Slow Native IO Operations", stuck, now)
         case "stuck" => operationsTable("Stuck Native IO Operations", stuck, now)
         case _ => summary(now, active, stuck, completed)
@@ -72,6 +73,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
           <a href="task">Per Task</a> |
           <a href="file">Per File</a> |
           <a href="timeline">Timeline</a> |
+          <a href="completed">Completed Operations</a> |
           <a href="slow">Slow Operations</a> |
           <a href="stuck">Stuck Operations</a>
         </li>
@@ -101,7 +103,8 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       </table>
     </div>) ++
       operationsTable("Stuck Operations", stuck, now) ++
-      operationsTable("Active Operations", active, now)
+      operationsTable("Active Operations", active, now) ++
+      operationsTable("Recent Completed Operations", completed.take(100), now)
   }
 
   private def grouped(
@@ -185,7 +188,7 @@ class NativeIOPage(tab: NativeIOTab, store: NativeIOStore, pagePrefix: String, p
       <td>{taskName(state)}</td>
       <td>{state.executorId.getOrElse("-")}<br/><small>{state.host.getOrElse("-")}</small></td>
       <td>{state.phaseOrStatus}</td>
-      <td>{formatDuration(state.stuckElapsedMs(now))}</td>
+      <td>{formatDuration(state.displayElapsedMs(now))}</td>
       <td>{formatDuration(math.max(0L, now - state.lastEventTime))}</td>
       <td>{state.diagnosis}</td>
       <td>{runtimeDetails(state)}</td>

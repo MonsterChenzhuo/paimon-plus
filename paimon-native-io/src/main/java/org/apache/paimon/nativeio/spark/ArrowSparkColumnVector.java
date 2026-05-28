@@ -129,7 +129,8 @@ class ArrowSparkColumnVector extends ColumnVector {
 
     @Override
     public ColumnarArray getArray(int rowId) {
-        throw new UnsupportedOperationException("Array type is not supported by native columnar IO.");
+        throw new UnsupportedOperationException(
+                "Array type is not supported by native columnar IO.");
     }
 
     @Override
@@ -154,6 +155,7 @@ class ArrowSparkColumnVector extends ColumnVector {
 
     @Override
     public ColumnVector getChild(int ordinal) {
-        throw new UnsupportedOperationException("Nested type is not supported by native columnar IO.");
+        throw new UnsupportedOperationException(
+                "Nested type is not supported by native columnar IO.");
     }
 }

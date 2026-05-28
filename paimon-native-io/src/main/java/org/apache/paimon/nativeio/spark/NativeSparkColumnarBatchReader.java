@@ -22,8 +22,10 @@ import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.nativeio.NativeFileRecordReader;
+import org.apache.paimon.nativeio.NativeReadDiagnostics;
 import org.apache.paimon.nativeio.PaimonNativeReader;
 import org.apache.paimon.operation.nativeio.NativeSplitReadContext;
+import org.apache.paimon.operation.nativeio.diagnostics.NativeIOPhase;
 import org.apache.paimon.spark.SparkTypeUtils;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.Split;
@@ -71,7 +73,8 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
                     context.pathFactory()
                             .createDataFilePathFactory(dataSplit.partition(), dataSplit.bucket());
             for (DataFileMeta file : dataSplit.dataFiles()) {
-                this.files.add(new NativeFile(pathFactory.toPath(file).toString(), file, dvFactory));
+                this.files.add(
+                        new NativeFile(pathFactory.toPath(file).toString(), file, dvFactory));
             }
         }
     }
@@ -86,13 +89,13 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
                     return false;
                 }
 
-                VectorSchemaRoot root = currentReader.nextBatch();
+                VectorSchemaRoot root = nextNativeBatch();
                 if (root == null) {
                     closeCurrentReader();
                     continue;
                 }
 
-                ColumnarBatch batch = toColumnarBatch(root);
+                ColumnarBatch batch = toColumnarBatchWithDiagnostics(root);
                 if (batch.numRows() == 0) {
                     batch.close();
                     continue;
@@ -121,27 +124,95 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
         if (currentFile == null) {
             return false;
         }
-        PaimonNativeReader reader = new PaimonNativeReader();
+        currentFile.diagnostics.start();
+        PaimonNativeReader reader = null;
         try {
-            reader.addFile(currentFile.path);
-            reader.setBatchSize(context.nativeIOOptions().batchSize());
-            reader.setRowIndexColumn(NativeFileRecordReader.ROW_INDEX_COLUMN);
-            reader.setTargetColumns(readType);
-            reader.setObjectStoreOptions(context.nativeIOOptions().objectStoreOptions());
-            NativeFileRecordReader.addDeletionVector(
-                    reader, currentFile.path, currentFile.deletionVector());
-            reader.initializeReader();
-            NativeFileRecordReader.validateSchema(
-                    reader.schema(), readType, NativeFileRecordReader.ROW_INDEX_COLUMN);
+            NativeReadDiagnostics.PhaseTimer configureTimer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.CONFIGURE_READER);
+            try {
+                reader = new PaimonNativeReader();
+                reader.addFile(currentFile.path);
+                reader.setBatchSize(context.nativeIOOptions().batchSize());
+                reader.setRowIndexColumn(NativeFileRecordReader.ROW_INDEX_COLUMN);
+                reader.setTargetColumns(readType);
+                reader.setObjectStoreOptions(context.nativeIOOptions().objectStoreOptions());
+            } finally {
+                configureTimer.close();
+            }
+
+            DeletionVector deletionVector;
+            NativeReadDiagnostics.PhaseTimer dvLoadTimer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.LOAD_DELETION_VECTOR);
+            try {
+                deletionVector = currentFile.deletionVector();
+            } finally {
+                dvLoadTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer dvApplyTimer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.APPLY_DELETION_VECTOR);
+            try {
+                NativeFileRecordReader.addDeletionVector(reader, currentFile.path, deletionVector);
+            } finally {
+                dvApplyTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer openTimer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.OPEN_READER);
+            try {
+                reader.initializeReader();
+            } finally {
+                openTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer schemaTimer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.VALIDATE_SCHEMA);
+            try {
+                NativeFileRecordReader.validateSchema(
+                        reader.schema(), readType, NativeFileRecordReader.ROW_INDEX_COLUMN);
+            } finally {
+                schemaTimer.close();
+            }
             currentReader = reader;
             return true;
         } catch (IOException | RuntimeException e) {
-            try {
-                reader.close();
-            } catch (IOException closeException) {
-                e.addSuppressed(closeException);
+            currentFile.diagnostics.fail(e);
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException closeException) {
+                    e.addSuppressed(closeException);
+                }
             }
             throw e;
+        }
+    }
+
+    @Nullable
+    private VectorSchemaRoot nextNativeBatch() throws IOException {
+        NativeReadDiagnostics.PhaseTimer timer =
+                currentFile.diagnostics.startPhase(NativeIOPhase.READ_BATCH);
+        VectorSchemaRoot root = null;
+        try {
+            root = currentReader.nextBatch();
+            return root;
+        } catch (IOException | RuntimeException e) {
+            currentFile.diagnostics.fail(e);
+            throw e;
+        } finally {
+            Long rows = root == null ? 0L : (long) root.getRowCount();
+            Long bytes = root == null ? 0L : NativeReadDiagnostics.estimateBatchBytes(root);
+            timer.close(rows, bytes);
+        }
+    }
+
+    private ColumnarBatch toColumnarBatchWithDiagnostics(VectorSchemaRoot root) {
+        NativeReadDiagnostics.PhaseTimer timer =
+                currentFile.diagnostics.startPhase(NativeIOPhase.BUILD_COLUMNAR_BATCH);
+        try {
+            return toColumnarBatch(root);
+        } finally {
+            timer.close();
         }
     }
 
@@ -177,9 +248,25 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
 
     private void closeCurrentReader() throws IOException {
         if (currentReader != null) {
-            currentReader.close();
+            IOException failure = null;
+            NativeReadDiagnostics.PhaseTimer timer =
+                    currentFile.diagnostics.startPhase(NativeIOPhase.CLOSE);
+            try {
+                currentReader.close();
+            } catch (IOException e) {
+                failure = e;
+                currentFile.diagnostics.fail(e);
+            } finally {
+                timer.close();
+                if (failure == null) {
+                    currentFile.diagnostics.end();
+                }
+            }
             currentReader = null;
             currentFile = null;
+            if (failure != null) {
+                throw failure;
+            }
         }
     }
 
@@ -188,6 +275,7 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
         private final String path;
         private final DataFileMeta file;
         private final DeletionVector.Factory dvFactory;
+        private final NativeReadDiagnostics diagnostics;
         @Nullable private DeletionVector deletionVector;
         private boolean deletionVectorLoaded;
 
@@ -195,17 +283,14 @@ class NativeSparkColumnarBatchReader implements PartitionReader<ColumnarBatch> {
             this.path = path;
             this.file = file;
             this.dvFactory = dvFactory;
+            this.diagnostics = NativeReadDiagnostics.create("native-columnar-read", path);
         }
 
         @Nullable
-        private DeletionVector deletionVector() {
+        private DeletionVector deletionVector() throws IOException {
             if (!deletionVectorLoaded) {
-                try {
-                    Optional<DeletionVector> optional = dvFactory.create(file.fileName());
-                    deletionVector = optional.orElse(null);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
+                Optional<DeletionVector> optional = dvFactory.create(file.fileName());
+                deletionVector = optional.orElse(null);
                 deletionVectorLoaded = true;
             }
             return deletionVector;

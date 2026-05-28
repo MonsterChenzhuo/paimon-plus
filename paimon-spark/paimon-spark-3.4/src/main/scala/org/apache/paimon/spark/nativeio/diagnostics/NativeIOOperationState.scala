@@ -60,6 +60,14 @@ case class NativeIOOperationState(
 
   def elapsedMs(now: Long): Long = math.max(0L, now - startTime)
 
+  def displayElapsedMs(now: Long): Long = {
+    if (completed) {
+      elapsedMs(lastEventTime)
+    } else {
+      stuckElapsedMs(now)
+    }
+  }
+
   def stuckElapsedMs(now: Long): Long = {
     if (currentPhase.isDefined) {
       phaseElapsedMs(now)
@@ -69,7 +77,11 @@ case class NativeIOOperationState(
   }
 
   def phaseOrStatus: String = {
-    currentPhase.map(_.name()).getOrElse("NO_NATIVE_PHASE")
+    if (completed) {
+      "COMPLETED"
+    } else {
+      currentPhase.map(_.name()).getOrElse("NO_NATIVE_PHASE")
+    }
   }
 
   def diagnosis: String = {

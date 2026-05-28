@@ -288,9 +288,7 @@ public class NativeRawFileSplitRead implements SplitRead<InternalRow> {
                             fileIndexResult);
         }
 
-        if (!nativeDvApplied
-                && deletionVector != null
-                && !deletionVector.isEmpty()) {
+        if (!nativeDvApplied && deletionVector != null && !deletionVector.isEmpty()) {
             return new ApplyDeletionVectorReader(fileRecordReader, deletionVector);
         }
         return fileRecordReader;

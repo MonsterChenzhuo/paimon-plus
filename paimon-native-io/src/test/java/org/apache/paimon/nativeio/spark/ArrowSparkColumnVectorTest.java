@@ -73,8 +73,7 @@ class ArrowSparkColumnVectorTest {
             ColumnVector tsColumn =
                     new ArrowSparkColumnVector(DataTypes.TimestampType, ts, closeAction);
             ColumnarBatch batch =
-                    new ColumnarBatch(
-                            new ColumnVector[] {idColumn, nameColumn, tsColumn}, 2);
+                    new ColumnarBatch(new ColumnVector[] {idColumn, nameColumn, tsColumn}, 2);
 
             assertThat(idColumn.hasNull()).isTrue();
             assertThat(idColumn.numNulls()).isEqualTo(1);

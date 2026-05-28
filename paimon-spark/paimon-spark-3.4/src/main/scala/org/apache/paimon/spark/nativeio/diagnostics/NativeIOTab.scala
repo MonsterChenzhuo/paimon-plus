@@ -29,6 +29,7 @@ class NativeIOTab(parent: SparkUI, store: NativeIOStore) extends SparkUITab(pare
   attachPage(new NativeIOPage(this, store, "task", "Per Task"))
   attachPage(new NativeIOPage(this, store, "file", "Per File"))
   attachPage(new NativeIOPage(this, store, "timeline", "Timeline"))
+  attachPage(new NativeIOPage(this, store, "completed", "Completed Operations"))
   attachPage(new NativeIOPage(this, store, "slow", "Slow Operations"))
   attachPage(new NativeIOPage(this, store, "stuck", "Stuck Operations"))
 }

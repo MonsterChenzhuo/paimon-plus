@@ -53,7 +53,8 @@ public class NativeSparkColumnarBatchReadProvider implements NativeColumnarBatch
         if (context == null) {
             return false;
         }
-        NativeApplicability applicability = supportApplicability(readBuilder, partition, context, metadataColumns);
+        NativeApplicability applicability =
+                supportApplicability(readBuilder, partition, context, metadataColumns);
         context.reporter().report(applicability);
         return applicability.applicable();
     }
@@ -141,7 +142,8 @@ public class NativeSparkColumnarBatchReadProvider implements NativeColumnarBatch
                 }
                 DataFilePathFactory pathFactory =
                         context.pathFactory()
-                                .createDataFilePathFactory(dataSplit.partition(), dataSplit.bucket());
+                                .createDataFilePathFactory(
+                                        dataSplit.partition(), dataSplit.bucket());
                 Path actualDataPath = pathFactory.toPath(file);
                 NativeApplicability fileApplicability =
                         SupportsNativeIO.checkNativePhysicalFile(

@@ -23,6 +23,7 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.NonCorruptFileReadException;
+import org.apache.paimon.operation.nativeio.diagnostics.NativeIOPhase;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.types.DataField;
@@ -74,6 +75,7 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
     private final String rowIndexColumn;
     private final long fileRowCount;
     private final long maxBatchBytes;
+    private final NativeReadDiagnostics diagnostics;
     private final List<NativeFileRecordIterator> outstandingBatches = new ArrayList<>();
     private long lastRowIndex = -1L;
     private boolean closed;
@@ -113,22 +115,55 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
         this.rowIndexColumn = rowIndexColumn(readRowType);
         this.fileRowCount = fileRowCount;
         this.maxBatchBytes = maxBatchBytes;
-        PaimonNativeReader reader = new PaimonNativeReader();
+        this.diagnostics = NativeReadDiagnostics.create("native-row-read", file);
+        this.diagnostics.start();
+        PaimonNativeReader reader = null;
         try {
-            reader.addFile(file);
-            reader.setBatchSize(batchSize);
-            reader.setRowIndexColumn(rowIndexColumn);
-            reader.setTargetColumns(readRowType);
-            reader.setObjectStoreOptions(objectStoreOptions);
-            addDeletionVector(reader, file, deletionVector);
-            reader.initializeReader();
-            validateSchema(reader.schema(), readRowType, rowIndexColumn);
+            NativeReadDiagnostics.PhaseTimer configureTimer =
+                    diagnostics.startPhase(NativeIOPhase.CONFIGURE_READER);
+            try {
+                reader = new PaimonNativeReader();
+                reader.addFile(file);
+                reader.setBatchSize(batchSize);
+                reader.setRowIndexColumn(rowIndexColumn);
+                reader.setTargetColumns(readRowType);
+                reader.setObjectStoreOptions(objectStoreOptions);
+            } finally {
+                configureTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer dvApplyTimer =
+                    diagnostics.startPhase(NativeIOPhase.APPLY_DELETION_VECTOR);
+            try {
+                addDeletionVector(reader, file, deletionVector);
+            } finally {
+                dvApplyTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer openTimer =
+                    diagnostics.startPhase(NativeIOPhase.OPEN_READER);
+            try {
+                reader.initializeReader();
+            } finally {
+                openTimer.close();
+            }
+
+            NativeReadDiagnostics.PhaseTimer schemaTimer =
+                    diagnostics.startPhase(NativeIOPhase.VALIDATE_SCHEMA);
+            try {
+                validateSchema(reader.schema(), readRowType, rowIndexColumn);
+            } finally {
+                schemaTimer.close();
+            }
             this.nativeReader = reader;
         } catch (IOException | RuntimeException e) {
-            try {
-                reader.close();
-            } catch (IOException closeException) {
-                e.addSuppressed(closeException);
+            diagnostics.fail(e);
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException closeException) {
+                    e.addSuppressed(closeException);
+                }
             }
             throw e;
         }
@@ -199,6 +234,7 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
         this.rowIndexColumn = rowIndexColumn(readRowType);
         this.fileRowCount = fileRowCount;
         this.maxBatchBytes = maxBatchBytes;
+        this.diagnostics = NativeReadDiagnostics.noop("native-row-read", filePath.toString());
     }
 
     @Override
@@ -206,26 +242,55 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
         if (closed) {
             throw nativeReadException("native file record reader is closed");
         }
-        VectorSchemaRoot root = nativeReader.nextBatch();
-        if (root == null) {
-            return null;
-        }
+        VectorSchemaRoot root = null;
         BigIntVector rowIndexVector;
         try {
-            rowIndexVector = validateBatch(root);
+            NativeReadDiagnostics.PhaseTimer readTimer =
+                    diagnostics.startPhase(NativeIOPhase.READ_BATCH);
+            try {
+                root = nativeReader.nextBatch();
+            } finally {
+                Long rows = root == null ? 0L : (long) root.getRowCount();
+                Long bytes = root == null ? 0L : NativeReadDiagnostics.estimateBatchBytes(root);
+                readTimer.close(rows, bytes);
+            }
+            if (root == null) {
+                return null;
+            }
+
+            NativeReadDiagnostics.PhaseTimer validateTimer =
+                    diagnostics.startPhase(NativeIOPhase.VALIDATE_BATCH);
+            try {
+                rowIndexVector = validateBatch(root);
+            } finally {
+                validateTimer.close();
+            }
         } catch (IOException | RuntimeException e) {
-            root.close();
+            if (root != null) {
+                root.close();
+            }
+            diagnostics.fail(e);
             throw e;
         }
-        NativeFileRecordIterator iterator =
-                new NativeFileRecordIterator(
-                        new ArrowBatchReader(readRowType, true).readBatch(root).iterator(),
-                        rowIndexVector,
-                        filePath,
-                        root,
-                        outstandingBatches);
-        outstandingBatches.add(iterator);
-        return iterator;
+        NativeReadDiagnostics.PhaseTimer buildTimer =
+                diagnostics.startPhase(NativeIOPhase.BUILD_ROW_BATCH);
+        try {
+            NativeFileRecordIterator iterator =
+                    new NativeFileRecordIterator(
+                            new ArrowBatchReader(readRowType, true).readBatch(root).iterator(),
+                            rowIndexVector,
+                            filePath,
+                            root,
+                            outstandingBatches);
+            outstandingBatches.add(iterator);
+            return iterator;
+        } catch (RuntimeException e) {
+            root.close();
+            diagnostics.fail(e);
+            throw e;
+        } finally {
+            buildTimer.close();
+        }
     }
 
     @Override
@@ -234,10 +299,25 @@ public class NativeFileRecordReader implements FileRecordReader<InternalRow> {
             return;
         }
         closed = true;
-        for (NativeFileRecordIterator iterator : new ArrayList<>(outstandingBatches)) {
-            iterator.releaseBatch();
+        IOException failure = null;
+        NativeReadDiagnostics.PhaseTimer closeTimer = diagnostics.startPhase(NativeIOPhase.CLOSE);
+        try {
+            for (NativeFileRecordIterator iterator : new ArrayList<>(outstandingBatches)) {
+                iterator.releaseBatch();
+            }
+            nativeReader.close();
+        } catch (IOException e) {
+            failure = e;
+            diagnostics.fail(e);
+        } finally {
+            closeTimer.close();
+            if (failure == null) {
+                diagnostics.end();
+            }
         }
-        nativeReader.close();
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     private BigIntVector validateBatch(VectorSchemaRoot root) throws IOException {

@@ -7,23 +7,18 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package org.apache.paimon.spark.nativeio.diagnostics
 
-import org.apache.paimon.operation.nativeio.diagnostics.{
-  NativeIOEvent,
-  NativeIOEventType,
-  NativeIOPhase
-}
+import org.apache.paimon.operation.nativeio.diagnostics.{NativeIOEvent, NativeIOEventType, NativeIOPhase}
 
 import org.scalatest.FunSuite
 
@@ -80,14 +75,32 @@ class NativeIOStoreSuite extends FunSuite {
     val store = new NativeIOStore(maxEvents = 2, stuckThresholdMs = 30000L)
 
     store.record(event("op-1", 1000L, NativeIOEventType.OPERATION_START).build())
-    store.record(event("op-1", 2000L, NativeIOEventType.PHASE_START).withPhase(NativeIOPhase.READ).build())
-    store.record(event("op-1", 3000L, NativeIOEventType.OPERATION_END).withRows(10L).withBytes(2048L).build())
+    store.record(
+      event("op-1", 2000L, NativeIOEventType.PHASE_START).withPhase(NativeIOPhase.READ).build())
+    store.record(
+      event("op-1", 2500L, NativeIOEventType.PHASE_END)
+        .withPhase(NativeIOPhase.READ_BATCH)
+        .withDurationMs(500L)
+        .withRows(10L)
+        .withBytes(2048L)
+        .build())
+    store.record(
+      event("op-1", 3000L, NativeIOEventType.OPERATION_END)
+        .withRows(10L)
+        .withBytes(2048L)
+        .withMetricsJson("""{"read_batch_ms":500,"read_batch_count":1}""")
+        .build())
 
     assert(store.activeOperations(60000L).isEmpty)
     assert(store.completedOperations.size == 1)
     assert(store.completedOperations.head.rows.contains(10L))
     assert(store.completedOperations.head.bytes.contains(2048L))
-    assert(store.timeline.map(_.eventTime()) == Seq(2000L, 3000L))
+    assert(
+      store.completedOperations.head.metricsJson
+        .contains("""{"read_batch_ms":500,"read_batch_count":1}"""))
+    assert(store.completedOperations.head.phaseOrStatus == "COMPLETED")
+    assert(store.completedOperations.head.displayElapsedMs(60000L) == 2000L)
+    assert(store.timeline.map(_.eventTime()) == Seq(2500L, 3000L))
   }
 
   test("marks active spark task without native phase as stuck") {
