@@ -269,15 +269,16 @@ each feature actually removes.
 <p>How Paimon Plus adds Spark UI pages for executors, thread dump flame graphs, and async-profiler outputs.</p>
 <strong>Read the note</strong>
 </a>
+<a class="pp-note-card" href="engineering-notes/spark-cli-codex/">
+<span>AI workflow</span>
+<h3>spark-cli Analysis</h3>
+<p>How diagnostics APIs and Spark History Server evidence can become an AI-readable root-cause workflow.</p>
+<strong>Read the note</strong>
+</a>
 <article class="pp-note-card">
 <span>Coming next</span>
 <h3>Native IO Export</h3>
 <p>Why wide feature-table export needs driver preflight, raw Parquet split planning, DV pushdown, and native fallback evidence.</p>
-</article>
-<article class="pp-note-card">
-<span>Coming next</span>
-<h3>spark-cli Analysis</h3>
-<p>How diagnostics APIs and Spark History Server evidence can become an AI-readable root-cause workflow.</p>
 </article>
 </div>
 </section>

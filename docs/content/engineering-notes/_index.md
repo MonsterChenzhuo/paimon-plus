@@ -51,21 +51,22 @@ through stage metrics.
 <strong>Read article</strong>
 </a>
 
+<a class="pp-blog-list-card" href="spark-cli-codex/">
+<span>AI Ops</span>
+<h2>spark-cli with Codex</h2>
+<p>
+One-click install, cluster profile initialization, Spark History Server and YARN gateway
+configuration, and the command sequence Codex can use to analyze online Spark jobs.
+</p>
+<strong>Read article</strong>
+</a>
+
 <article class="pp-blog-list-card pp-blog-list-card-muted">
 <span>Coming next</span>
 <h2>Native IO Export</h2>
 <p>
 Driver preflight, raw Parquet split planning, delete-vector pushdown, compact output,
 and native fallback evidence for wide feature-table export.
-</p>
-</article>
-
-<article class="pp-blog-list-card pp-blog-list-card-muted">
-<span>Coming next</span>
-<h2>spark-cli Analysis</h2>
-<p>
-How Spark History Server evidence, live Spark UI endpoints, and Paimon diagnostics JSON
-become a CLI workflow that AI agents can operate directly.
 </p>
 </article>
 </section>
