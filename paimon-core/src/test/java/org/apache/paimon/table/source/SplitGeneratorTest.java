@@ -170,6 +170,15 @@ public class SplitGeneratorTest {
         assertThat(toNamesAndRawConvertible(splitGeneratorWithDVEnabled.splitForBatch(files4)))
                 .containsExactlyInAnyOrder(Pair.of(Arrays.asList("1", "2"), true));
 
+        // Deletion vectors make deleted rows applicable at raw-file read time, so deleteRowCount
+        // must not prevent raw conversion when DV is enabled.
+        List<DataFileMeta> filesWithDVDeletes =
+                Arrays.asList(newFile("1", 1, 0, 10, 10L, 1L), newFile("2", 2, 10, 20, 20L, 2L));
+        assertThat(
+                        toNamesAndRawConvertible(
+                                splitGeneratorWithDVEnabled.splitForBatch(filesWithDVDeletes)))
+                .containsExactlyInAnyOrder(Pair.of(Arrays.asList("1", "2"), true));
+
         // Not all in one level but with first row merge engine, should be rawConvertible
         MergeTreeSplitGenerator splitGeneratorWithFirstRow =
                 new MergeTreeSplitGenerator(comparator, 100, 2, false, FIRST_ROW);

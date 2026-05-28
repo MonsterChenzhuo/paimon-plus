@@ -67,8 +67,7 @@ public class MergeTreeSplitGenerator implements SplitGenerator {
 
     @Override
     public List<SplitGroup> splitForBatch(List<DataFileMeta> files) {
-        boolean rawConvertible =
-                files.stream().allMatch(file -> file.level() != 0 && withoutDeleteRow(file));
+        boolean rawConvertible = files.stream().allMatch(this::canReadRawFileInRawGroup);
         boolean oneLevel =
                 files.stream().map(DataFileMeta::level).collect(Collectors.toSet()).size() == 1;
 
@@ -108,7 +107,7 @@ public class MergeTreeSplitGenerator implements SplitGenerator {
         return packSplits(sections).stream()
                 .map(
                         f ->
-                                f.size() == 1 && withoutDeleteRow(f.get(0))
+                                f.size() == 1 && canReadSingleRawFile(f.get(0))
                                         ? SplitGroup.rawConvertibleGroup(f)
                                         : SplitGroup.nonRawConvertibleGroup(f))
                 .collect(Collectors.toList());
@@ -151,5 +150,17 @@ public class MergeTreeSplitGenerator implements SplitGenerator {
     private boolean withoutDeleteRow(DataFileMeta dataFileMeta) {
         // null to true to be compatible with old version
         return dataFileMeta.deleteRowCount().map(count -> count == 0L).orElse(true);
+    }
+
+    private boolean canReadRawFileInRawGroup(DataFileMeta dataFileMeta) {
+        return dataFileMeta.level() != 0 && canReadDeletesAtRawFile(dataFileMeta);
+    }
+
+    private boolean canReadSingleRawFile(DataFileMeta dataFileMeta) {
+        return canReadDeletesAtRawFile(dataFileMeta);
+    }
+
+    private boolean canReadDeletesAtRawFile(DataFileMeta dataFileMeta) {
+        return deletionVectorsEnabled || withoutDeleteRow(dataFileMeta);
     }
 }
