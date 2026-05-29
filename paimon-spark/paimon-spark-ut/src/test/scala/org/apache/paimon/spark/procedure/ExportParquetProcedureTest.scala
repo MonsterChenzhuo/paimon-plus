@@ -22,7 +22,7 @@ import org.apache.paimon.spark.PaimonSparkTestBase
 import org.apache.paimon.utils.JsonSerdeUtil
 
 import org.apache.spark.sql.Row
-import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.{assertThat, assertThatThrownBy}
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -166,7 +166,7 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
     }
   }
 
-  test("Paimon export parquet procedure: partitioned output compacts each partition") {
+  test("Paimon export parquet procedure: partitioned output writes each partition") {
     val random = ThreadLocalRandom.current().nextInt(100000)
     withTable(s"tbl_part$random") {
       sql(s"""
@@ -200,10 +200,8 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
                          |  where => "dt >= '2026-05-01' and dt <= '2026-05-06'",
                          |  parallelism => 2,
                          |  overwrite => true,
-                         |  target_file_size => '1 b',
                          |  partitioned_output => true,
-                         |  partition_job_parallelism => 2,
-                         |  compact_output => true)
+                         |  partition_job_parallelism => 2)
                          |""".stripMargin),
             Row(true, 4L) :: Nil
           )
@@ -218,7 +216,7 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
             dt =>
               val partitionDir = new File(output, s"dt=$dt")
               assertThat(partitionDir.listFiles().filter(_.getName.endsWith(".parquet")).length)
-                .isEqualTo(1)
+                .isGreaterThan(0)
               assertThat(new File(partitionDir, "_SUCCESS")).exists()
           }
           val manifest = readManifest(output)
@@ -235,7 +233,10 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
               assertThat(path).doesNotStartWith(output)
           }
 
-          val exported = spark.read.option("basePath", output).parquet(output)
+          val exported = spark.read
+            .option("basePath", output)
+            .parquet(output)
+            .selectExpr("id", "name", "cast(dt as string) as dt")
           assertThat(exported.schema.fieldNames).containsExactly("id", "name", "dt")
           checkAnswer(
             exported.orderBy("id"),
@@ -243,6 +244,76 @@ class ExportParquetProcedureTest extends PaimonSparkTestBase {
               Row(2, "b", "2026-05-01") ::
               Row(3, "c", "2026-05-03") ::
               Row(4, "d", "2026-05-06") :: Nil)
+      }
+    }
+  }
+
+  test("Paimon export parquet procedure: compact_output argument is not supported") {
+    val random = ThreadLocalRandom.current().nextInt(100000)
+    withTable(s"tbl_no_compact$random") {
+      sql(s"""
+             |CREATE TABLE tbl_no_compact$random (
+             |  id INT,
+             |  name STRING
+             |)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO tbl_no_compact$random VALUES
+             |  (1, 'a'), (2, 'b')
+             |""".stripMargin)
+
+      withTempDir {
+        dir =>
+          val output = new File(dir, "export-no-compact").getAbsolutePath
+
+          assertThatThrownBy(() =>
+            spark.sql(s"""
+                         |CALL sys.export_parquet(
+                         |  table => 'tbl_no_compact$random',
+                         |  columns => '*',
+                         |  output_path => '$output',
+                         |  compact_output => true)
+                         |""".stripMargin).collect())
+            .hasMessageContaining("compact_output")
+      }
+    }
+  }
+
+  test("Paimon export parquet procedure: removed native export configs do not affect Java export") {
+    val random = ThreadLocalRandom.current().nextInt(100000)
+    withTable(s"tbl_native_config$random") {
+      sql(s"""
+             |CREATE TABLE tbl_native_config$random (
+             |  id INT,
+             |  name STRING
+             |)
+             |""".stripMargin)
+
+      sql(s"""
+             |INSERT INTO tbl_native_config$random VALUES
+             |  (1, 'a'), (2, 'b')
+             |""".stripMargin)
+
+      withTempDir {
+        dir =>
+          val output = new File(dir, "export-native-config").getAbsolutePath
+          withSparkSQLConf(
+            "spark.paimon.native-io.export.enabled" -> "true",
+            "spark.paimon.native-io.export.fail-on-fallback" -> "true") {
+            checkAnswer(
+              spark.sql(s"""
+                           |CALL sys.export_parquet(
+                           |  table => 'tbl_native_config$random',
+                           |  columns => '*',
+                           |  output_path => '$output')
+                           |""".stripMargin),
+              Row(true, 2L) :: Nil
+            )
+          }
+
+          val exported = spark.read.parquet(output)
+          checkAnswer(exported.orderBy("id"), Row(1, "a") :: Row(2, "b") :: Nil)
       }
     }
   }

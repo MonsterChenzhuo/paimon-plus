@@ -63,21 +63,6 @@ copy_jar() {
     echo "Copied ${label}: $(basename "${candidates[0]}")"
 }
 
-verify_jar_contains() {
-    local jar_path="$1"
-    local entry="$2"
-    local expected="$3"
-    local label="$4"
-
-    if ! unzip -p "${jar_path}" "${entry}" | LC_ALL=C grep -a -q "${expected}"; then
-        echo "Verification failed for ${label}: ${jar_path}" >&2
-        echo "Expected ${entry} to contain: ${expected}" >&2
-        echo "This usually means the jar was built from stale classes." >&2
-        exit 1
-    fi
-    echo "Verified ${label}: ${expected}"
-}
-
 DOCKER_RUN_ARGS=(--rm --entrypoint /bin/bash)
 if [ -n "${DOCKER_PLATFORM}" ]; then
     DOCKER_RUN_ARGS+=(--platform "${DOCKER_PLATFORM}")
@@ -104,26 +89,5 @@ find "${OUTPUT_DIR}" -maxdepth 1 -type f -name "*.jar" -exec rm -f {} +
 copy_jar "paimon-spark/paimon-spark-3.4" "paimon-spark-3.4_2.12-*.jar" "Spark 3.4 connector"
 copy_jar "paimon-filesystems/paimon-obs" "paimon-obs-*.jar" "OBS plugin"
 copy_jar "paimon-native-io" "paimon-native-io-*.jar" "Native IO"
-
-SPARK_CONNECTOR_JAR="$(find "${OUTPUT_DIR}" -maxdepth 1 -type f -name "paimon-spark-3.4_2.12-*.jar" | head -n 1)"
-NATIVE_IO_JAR="$(find "${OUTPUT_DIR}" -maxdepth 1 -type f -name "paimon-native-io-*.jar" | head -n 1)"
-
-verify_jar_contains \
-    "${SPARK_CONNECTOR_JAR}" \
-    "org/apache/paimon/spark/procedure/ExportParquetProcedure.class" \
-    "Native export requested for sys.export_parquet" \
-    "Spark connector native export routing"
-
-verify_jar_contains \
-    "${SPARK_CONNECTOR_JAR}" \
-    "org/apache/paimon/spark/procedure/ExportParquetProcedure.class" \
-    "NATIVE_IO_EXPORT_ENABLED" \
-    "Spark connector native export option lookup"
-
-verify_jar_contains \
-    "${NATIVE_IO_JAR}" \
-    "META-INF/services/org.apache.paimon.operation.nativeio.export.NativeExportProviderFactory" \
-    "org.apache.paimon.nativeio.export.NativeExportProviderFactoryImpl" \
-    "Native export ServiceLoader registration"
 
 echo "Native IO jars are ready under ${OUTPUT_DIR}"

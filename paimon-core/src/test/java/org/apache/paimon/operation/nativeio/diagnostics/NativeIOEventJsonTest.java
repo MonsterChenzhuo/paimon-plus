@@ -32,7 +32,7 @@ class NativeIOEventJsonTest {
                                 1000L,
                                 NativeIOEventType.FILE_START,
                                 "op-1",
-                                "export_parquet")
+                                "native-columnar-read")
                         .withPhase(NativeIOPhase.OPEN_READER)
                         .withSqlExecutionId(17L)
                         .withStageId(3)
@@ -44,7 +44,6 @@ class NativeIOEventJsonTest {
                         .withHost("10.0.0.2")
                         .withThreadId(45L)
                         .withFilePath("obs://bucket/table/file.parquet")
-                        .withOutputPath("obs://bucket/export")
                         .withRows(123L)
                         .withBytes(456L)
                         .build();
@@ -71,11 +70,11 @@ class NativeIOEventJsonTest {
                                 2000L,
                                 NativeIOEventType.OBJECT_REQUEST_END,
                                 "op-2",
-                                "export_parquet")
-                        .withPhase(NativeIOPhase.WRITE)
+                                "native-columnar-read")
+                        .withPhase(NativeIOPhase.READ_BATCH)
                         .withObjectRequestId("req-7")
-                        .withObjectOperation("upload_part")
-                        .withFilePath("obs://bucket/export/part.parquet")
+                        .withObjectOperation("read_range")
+                        .withFilePath("obs://bucket/table/part.parquet")
                         .withDurationMs(321L)
                         .withBytes(67108864L)
                         .withQueueDepth(5)
@@ -88,9 +87,9 @@ class NativeIOEventJsonTest {
 
         assertThat(parsed.eventType()).isEqualTo(NativeIOEventType.OBJECT_REQUEST_END);
         assertThat(parsed.operationId()).isEqualTo("op-2");
-        assertThat(parsed.phase()).isEqualTo(NativeIOPhase.WRITE);
+        assertThat(parsed.phase()).isEqualTo(NativeIOPhase.READ_BATCH);
         assertThat(parsed.objectRequestId()).isEqualTo("req-7");
-        assertThat(parsed.objectOperation()).isEqualTo("upload_part");
+        assertThat(parsed.objectOperation()).isEqualTo("read_range");
         assertThat(parsed.durationMs()).isEqualTo(321L);
         assertThat(parsed.bytes()).isEqualTo(67108864L);
         assertThat(parsed.queueDepth()).isEqualTo(5);

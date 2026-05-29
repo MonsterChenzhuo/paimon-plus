@@ -118,7 +118,7 @@ class NativeIOStoreSuite extends FunSuite {
     assert(active.head.phaseOrStatus == "NO_NATIVE_PHASE")
     assert(active.head.stuckElapsedMs(32000L) == 31000L)
     assert(active.head.diagnosis.contains("no native phase event"))
-    assert(active.head.diagnosis.contains("legacy paimon_exporter_export_parquet"))
+    assert(active.head.diagnosis.contains("legacy entrypoint"))
 
     val stuck = store.stuckOperations(32000L)
     assert(stuck.map(_.operationId) == Seq("task-1"))
@@ -128,7 +128,7 @@ class NativeIOStoreSuite extends FunSuite {
       operationId: String,
       eventTime: Long,
       eventType: NativeIOEventType,
-      operationName: String = "native-export-parquet"): NativeIOEvent.Builder = {
+      operationName: String = "native-columnar-read"): NativeIOEvent.Builder = {
     NativeIOEvent
       .builder(operationId + "-" + eventTime, eventTime, eventType, operationId, operationName)
   }

@@ -90,9 +90,8 @@ case class NativeIOOperationState(
     } else if (operationName == "spark-task") {
       "Spark task is active, but no native phase event has been received yet. " +
         "The task may be blocked before diagnostics are emitted, or the deployed " +
-        "paimon-native-io jar/native library may still be using the legacy " +
-        "paimon_exporter_export_parquet entrypoint without diagnostics callbacks. " +
-        "Check the executor stack for the exact FFI symbol."
+        "paimon-native-io jar/native library may still be using a legacy entrypoint " +
+        "without diagnostics callbacks. Check the executor stack for the exact FFI symbol."
     } else {
       "Native operation is active, but no phase event has been received yet. " +
         "Check whether diagnostics callbacks are registered and emitted by the deployed native library."

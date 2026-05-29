@@ -154,8 +154,8 @@ variables for native read scenarios.
 <h3>Feature wide-table export</h3>
 <p>
 <code>CALL sys.export_parquet</code> writes Paimon tables into external Parquet directories with
-projection, filtering, partitioned output, compact output, manifests, and target file
-sizing for downstream feature loading.
+projection, filtering, partitioned output, manifests, and target file sizing for downstream
+feature loading.
 </p>
 </article>
 <article class="pp-feature-card">
@@ -240,10 +240,8 @@ wide schemas and operational exports less fragile in real Spark deployments.
 <span>wide schema validation cache</span>
 <span>wide-row page-size checks</span>
 <span>OBS config propagation</span>
-<span>native fallback reasons</span>
 <span>export manifests</span>
 <span>partitioned output</span>
-<span>compact output</span>
 <span>target file sizing</span>
 <span>delete-vector pushdown</span>
 <span>predicate JSON bridge</span>

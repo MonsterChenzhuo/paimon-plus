@@ -44,7 +44,6 @@ CALL sys.export_parquet(
 - Spark 读路径可通过动态参数启用 native IO。
 - Native reader 通过 Arrow batch 返回数据，降低 JVM row-by-row 读取开销。
 - OBS 相关配置可从 Spark Hadoop conf、Paimon options 或环境变量透传。
-- `export_parquet` 已接入 native fast path 的 SPI、配置校验、Spark split 到 raw Parquet source file 的规划、DV position 下沉、predicate JSON 转换、JNR FFI 和 Rust 读写 pipeline。
 
 常用开关：
 
@@ -54,27 +53,12 @@ SET spark.paimon.native-io.batch-size=4096;
 SET spark.paimon.native-io.max-batch-bytes='64 MB';
 ```
 
-`export_parquet` native fast path 相关配置：
-
-```sql
-SET spark.paimon.native-io.enabled=true;
-SET spark.paimon.native-io.export.enabled=true;
-SET spark.paimon.native-io.export.metrics.enabled=true;
-SET spark.paimon.native-io.export.max-projected-fields=5000;
-SET spark.paimon.native-io.export.memory-limit='512 MB';
-SET spark.paimon.native-io.export.fail-on-fallback=true;
-```
-
-默认 `spark.paimon.native-io.export.fallback.enabled=true`，driver preflight 不适用时会回退 Java export。压测或验收 native fast path 时建议设置 `spark.paimon.native-io.export.fail-on-fallback=true`，这样未命中 native 会直接抛出 reject reason，便于确认是否真正走到 native。
-
-对于 5000 列以上的超宽投影，native export 默认会在 driver preflight 阶段以 `EXPORT_WIDE_SCHEMA` 拒绝，并回退到 Java `RecordReader` 流式 export 路径，避免 Rust Arrow/Parquet reader 在单个超宽 row group 上长时间 materialize 列向量。该阈值可通过 `spark.paimon.native-io.export.max-projected-fields` 调整。
+`export_parquet` 现在只保留 Java 导出实现，不再提供 native export fast path 或 `spark.paimon.native-io.export.*` 配置。
 
 Native IO 设计入口：
 
 - `docs/superpowers/specs/2026-05-16-paimon-native-io-poc-design.md`
-- `docs/superpowers/specs/2026-05-19-paimon-export-parquet-native-fast-path-design.md`
 - `docs/superpowers/plans/2026-05-18-paimon-native-io-core-spark.md`
-- `docs/superpowers/plans/2026-05-19-paimon-export-parquet-native-fast-path.md`
 
 ### 宽 schema 校验优化
 

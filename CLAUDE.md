@@ -30,11 +30,8 @@
 
 - 设计文档放在 `docs/superpowers/specs/`。
 - 实施计划放在 `docs/superpowers/plans/`。
-- `export_parquet` native fast path 当前设计入口：
-  - `docs/superpowers/specs/2026-05-19-paimon-export-parquet-native-fast-path-design.md`
-  - `docs/superpowers/plans/2026-05-19-paimon-export-parquet-native-fast-path.md`
-
-维护这些文档时，需要同步检查 spec 和 plan，避免设计和实施步骤不一致。
+- Native export fast path 已移除；不要继续维护或引用旧的 native export spec/plan 作为当前实现依据。
+- 维护这些文档时，需要同步检查 spec 和 plan，避免设计和实施步骤不一致。
 
 ## 构建与测试
 
@@ -87,7 +84,7 @@ paimon-spark/paimon-spark-3.4/target/paimon-spark-3.4_2.12-1.4-SNAPSHOT.jar
 
 ## Native IO 设计注意事项
 
-- Spark 侧只负责规划、调度和语义兜底；native fast path 的适用性必须在 driver preflight 阶段明确。
-- Rust native export 需要关注 OBS/object_store 兼容、multipart 写出、row group pruning、DV 过滤、predicate literal 编码、内存上限和指标可观测。
+- Spark 侧只负责规划、调度和语义兜底；native read fast path 的适用性必须在 driver preflight 阶段明确。
+- Native export fast path 已移除；`export_parquet` 只保留 Java 导出实现。
 - native library 加载应复用现有 `PaimonJnrLoader`，不要新增独立 loader。
-- 出现不支持的 schema evolution、credential provider、predicate 或 DV 表达时，应给出稳定 reject reason，并按配置回退 Java 路径或 fail fast。
+- 出现不支持的 schema evolution、credential provider、predicate 或 DV 表达时，应给出稳定 reject reason，并按配置回退 Java 读路径或 fail fast。

@@ -38,7 +38,7 @@ class NativeIOEventLogSuite extends FunSuite {
     val nativeEvent =
       NativeIOEvent
         .builder("op-1-1000", 1000L, NativeIOEventType.JNI_CALL_START, "op-1",
-          "native-export-parquet")
+          "native-columnar-read")
         .withPhase(NativeIOPhase.JNI)
         .build()
     val sparkEvent = SparkListenerNativeIOEvent(NativeIOEventJson.toJson(nativeEvent))
@@ -124,7 +124,7 @@ class NativeIOEventLogSuite extends FunSuite {
     val nativeEvent =
       NativeIOEvent
         .builder("op-4-1000", 1000L, NativeIOEventType.JNI_CALL_START, "op-4",
-          "native-export-parquet")
+          "native-columnar-read")
         .withPhase(NativeIOPhase.JNI)
         .build()
     val nativeJson = NativeIOEventJson.toJson(nativeEvent)

@@ -79,7 +79,7 @@ result into an external Parquet layout.
 </div>
 <div class="pp-blog-card">
 <span>Operational control</span>
-<p>Use <code>parallelism</code>, <code>target_file_size</code>, <code>partitioned_output</code>, and <code>compact_output</code> to keep output count and partition layout predictable.</p>
+<p>Use <code>parallelism</code>, <code>target_file_size</code>, and <code>partitioned_output</code> to keep output count and partition layout predictable.</p>
 </div>
 </div>
 </section>
@@ -149,7 +149,6 @@ loader expects Hive-style partition paths and wants to load a date range increme
   partitioned_output => true,
   partition_job_parallelism => 4,
   target_file_size => '256 MB',
-  compact_output => true,
   overwrite => true
 );</code></pre>
 </div>
@@ -161,18 +160,13 @@ produce placeholder directories, which keeps the manifest aligned with the actua
 </section>
 
 <section class="pp-blog-section">
-<h2>File sizing and compaction</h2>
+<h2>File sizing</h2>
 <p>
 Without <code>target_file_size</code>, a non-empty Paimon split usually produces one Parquet file.
 With <code>target_file_size</code>, each Spark partition uses a rolling writer and opens a new
 <code>part-*.parquet</code> file when the current writer reaches the target. The value is a target,
 not a strict promise, because row groups, compression ratio, and split distribution still
 shape the final size.
-</p>
-<p>
-When <code>compact_output => true</code>, the procedure performs a post-export Parquet row-group
-copy. It groups existing files toward the target size and copies row groups into new files
-without decoding the wide rows and without rewriting the source Paimon table.
 </p>
 </section>
 
@@ -255,7 +249,6 @@ test entry points are:
 | Procedure registration | [`SparkProcedures.java`](https://github.com/MonsterChenzhuo/paimon-plus/blob/main/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/SparkProcedures.java) |
 | Export procedure | [`ExportParquetProcedure.java`](https://github.com/MonsterChenzhuo/paimon-plus/blob/main/paimon-spark/paimon-spark-common/src/main/java/org/apache/paimon/spark/procedure/ExportParquetProcedure.java) |
 | Spark SQL behavior tests | [`ExportParquetProcedureTest.scala`](https://github.com/MonsterChenzhuo/paimon-plus/blob/main/paimon-spark/paimon-spark-ut/src/test/scala/org/apache/paimon/spark/procedure/ExportParquetProcedureTest.scala) |
-| Row-group copy compaction tests | [`ExportParquetProcedureCopyCompactTest.java`](https://github.com/MonsterChenzhuo/paimon-plus/blob/main/paimon-spark/paimon-spark-common/src/test/java/org/apache/paimon/spark/procedure/ExportParquetProcedureCopyCompactTest.java) |
 | User-facing procedure docs | [`spark/procedures.md`](https://github.com/MonsterChenzhuo/paimon-plus/blob/main/docs/content/spark/procedures.md) |
 </section>
 
@@ -269,11 +262,8 @@ numbers. These are the main Java export changes to inspect when reviewing the fe
 | Change | Why it matters |
 | --- | --- |
 | [`d6b9bbb`](https://github.com/MonsterChenzhuo/paimon-plus/commit/d6b9bbb) Add export parquet manifest | Adds the manifest contract used by downstream loaders. |
-| [`1e7f360`](https://github.com/MonsterChenzhuo/paimon-plus/commit/1e7f360) Support partitioned parquet export compaction | Adds partition-aware export and compaction behavior. |
-| [`02d6ce3`](https://github.com/MonsterChenzhuo/paimon-plus/commit/02d6ce3) Copy compact exported parquet files | Adds post-export row-group copy compaction. |
+| [`1e7f360`](https://github.com/MonsterChenzhuo/paimon-plus/commit/1e7f360) Support partitioned parquet export output | Adds partition-aware export behavior. |
 | [`673fed1`](https://github.com/MonsterChenzhuo/paimon-plus/commit/673fed1) Auto parallelize partitioned parquet export | Lets partitioned output submit independent partition jobs concurrently. |
-| [`200ecb5`](https://github.com/MonsterChenzhuo/paimon-plus/commit/200ecb5) Parallelize export parquet compaction | Parallelizes compaction work for larger outputs. |
-| [`fe2edd1`](https://github.com/MonsterChenzhuo/paimon-plus/commit/fe2edd1) Use shaded parquet for export compact | Keeps compaction aligned with Paimon's shaded Parquet dependency. |
 </section>
 
 <section class="pp-blog-section pp-blog-result">
@@ -281,8 +271,8 @@ numbers. These are the main Java export changes to inspect when reviewing the fe
 <h2>A direct export surface for feature artifacts</h2>
 <p>
 <code>export_parquet</code> turns a Paimon table into a controlled Parquet artifact: projected
-columns, pushed filters, optional partition directories, target file sizing, copy
-compaction, a manifest, and a success marker. For feature-loading pipelines, that is the
+columns, pushed filters, optional partition directories, target file sizing, a manifest,
+and a success marker. For feature-loading pipelines, that is the
 important contract.
 </p>
 <a class="pp-button pp-button-primary" href="../">More Engineering Notes</a>

@@ -22,14 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class ExportParquetProcedureNativeTest {
-
-    @Test
-    void nativeTaskCountDoesNotApplyTargetFileSizeCoalescing() {
-        assertThat(ExportParquetProcedure.nativeTaskCount(32, 11)).isEqualTo(11);
-        assertThat(ExportParquetProcedure.nativeTaskCount(32, 100)).isEqualTo(32);
-        assertThat(ExportParquetProcedure.nativeTaskCount(1, 100)).isEqualTo(1);
-    }
+class ExportParquetProcedurePartitionTest {
 
     @Test
     void defaultPartitionJobParallelismUsesAllPartitions() {

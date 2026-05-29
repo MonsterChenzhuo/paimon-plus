@@ -66,7 +66,7 @@ configuration, and the command sequence Codex can use to analyze online Spark jo
 <h2>export_parquet Java Export</h2>
 <p>
 Standard Java export implementation, driver preflight, Paimon split planning,
-partitioned output, copy compaction, and manifests for wide feature-table export.
+partitioned output, target file sizing, and manifests for wide feature-table export.
 </p>
 <strong>Read article</strong>
 </a>
